@@ -81,8 +81,11 @@ across a cycle costs time proportional to its size.
   threads it ran at 682 MB/s on the table rows and on one at 250 and 778 MB/s, measured on
   2026-11-12 on a machine other work was sharing. Changes later that day copied the table rows a
   tenth faster on one thread and about a sixth faster on 8 and 16 threads, measured on that machine
-  while other work kept it busy. On 16 threads it gains about a tenth more on table rows at best,
-  and on 32 it is slower than on 8, because one thread walks the log and writes its entries.
+  while other work kept it busy, and checking many hashes at once then copied them in 36% less time
+  on one thread and 11% less on 8, and the values in half the time on one thread, as described under
+  [Checking many hashes at once](../internals/reclamation.md#checking-many-hashes-at-once). On 16
+  threads it gains about a tenth more on table rows at best, and on 32 it is slower than on 8,
+  because one thread walks the log and writes its entries.
 - A held `Snapshot` or `Map` keeps the file it was read from open. If a cycle has replaced that file
   since, its disk space comes back only when the last such handle is dropped.
 - Without retention the file only grows.

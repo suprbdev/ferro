@@ -1995,6 +1995,24 @@ fn batch_stored(
     })
 }
 
+/// Writes the body of `record`, the bytes of the record at `at` that [`stored_within`] or
+/// [`Store::read_stored`] found to hold `stored`, into `out`, which is as long as the body once
+/// decompressed, decompressing a compressed body straight into it.
+///
+/// # Errors
+///
+/// `Error::Corrupt` if a compressed body does not decompress to its length.
+pub(crate) fn fill_body(record: &[u8], stored: &Stored, at: u64, out: &mut [u8]) -> Result<()> {
+    let payload = &record[stored.payload.clone()];
+    match stored.packed {
+        true => unpack_slice(payload, out, at),
+        false => {
+            out.copy_from_slice(payload);
+            Ok(())
+        }
+    }
+}
+
 /// Seals the file of a new generation: syncs its log, writes a superblock naming `head` at `seq`
 /// with the log ending at `log_end`, anchored at itself with `basis`, to both slots, and syncs
 /// again.

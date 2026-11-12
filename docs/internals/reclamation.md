@@ -363,10 +363,11 @@ table or from a tree it copies itself, it reads first, and hands out only if non
 a log entry, pruned history or offset 0; otherwise it copies the tree itself and treats its links
 the same way. A node of the branch table links each branch's tip, so it stays with the walk, and the
 current tree it links goes out. A thread discovers a unit: it reads each record, checks its hash
-before following its links, and lists the records the unit copies in the order one thread writes
-them, children first. Every object a unit reaches is claimed for it by hash, its slot numbered in a
-table any thread reads without a lock or found in a table of the hashes the thread met lately, as
-described under [Fewer locks and allocations past eight
+before following its links, or since [Checking many hashes at once](#checking-many-hashes-at-once)
+queues it to be checked with others, and lists the records the unit copies in the order one thread
+writes them, children first. Every object a unit reaches is claimed for it by hash, its slot
+numbered in a table any thread reads without a lock or found in a table of the hashes the thread
+met lately, as described under [Fewer locks and allocations past eight
 threads](#fewer-locks-and-allocations-past-eight-threads), with the unit's key, which orders units
 as one thread reaches them: the order the walk handed them out in, then the index of each link a
 unit was split at. The smaller key keeps the claim, so of two units that reach one object, the one
@@ -406,7 +407,8 @@ A unit stops at anything the walk treats otherwise: a link to a log entry or to 
 link at offset 0, or a record that fails to read, parse or check. It is tainted, and the walk copies
 it itself, with the code it uses on one thread, when its turn comes in the order. So a failure is
 reported in walk order with the error one thread gives, the threads follow no link of a record they
-have not checked, and the walk checks what it reads itself before following it, so a cycle on
+have not checked, which [Checking many hashes at once](#checking-many-hashes-at-once) bounds
+instead, and the walk checks what it reads itself before following it, so a cycle on
 several threads no longer follows damage into the batches of 256 KiB above. Checking the walk's own
 reads in those batches on more threads, alongside the units, put a later error first on the damaged
 file in `fuzzed.rs`, so the walk checks them itself. With the branch table read by the walk, a unit
@@ -897,6 +899,105 @@ threads identical to the one the build before made on one, keeping everything an
 90 to 97 MiB at 8 threads and from 96 to 102 MiB at 16, for the tables of numbers and the ones they
 outgrew.
 
+### Checking many hashes at once
+
+After those changes BLAKE3 still took 53% of one thread's user time copying the table rows, and 37%
+of every thread's samples at 8 threads, on 2026-11-12. It compresses each 64-byte block of an input
+after the one before, so a record checked on its own waits on every block in turn, and only the
+whole chunks of an input of several chunks go through SIMD together. `verify` already checks the
+hashes of objects of up to one 1 KiB chunk 16 at a time, as [Verifying a file](verify.md) describes,
+but in the table rows 69% of the records hash up to 1 KiB, 31% hash 1 to 4 KiB and under 1% more,
+and in the 320 byte values 32%, 48% and 21%.
+
+`Checks` in `reclaim/checks.rs` queues the bytes each record's hash is taken over, decompressing a
+compressed body straight into them, and once it holds enough checks them all: the chunks of every
+queued record that share a chunk counter and a number of blocks go 16 at a time through
+`Platform::hash_many`, a whole chunk that is not a record's last at once and a last chunk up to its
+last block, then the last block of each such chunk, with the root flag on a record's only chunk,
+and then the parent nodes that join a record's chunks, as BLAKE3 builds them. A record whose bytes
+take more than 16 chunks is hashed at once, as BLAKE3 hashes its chunks many at a time itself. Each
+gives the hash `hash_parts` gives, which a unit test checks at every length up to past 16 KiB on
+every SIMD level the machine has. On one thread a call compressed 10 to 12 chunks at once on these
+two files, and on several threads 6 to 7.
+
+The copy follows a record's links before its hash is checked, the way `verify` does:
+
+- On one thread the walk queues every record it reads except log entries, which it decodes as soon
+  as it reads them and so checks at once, and checks the queue once it holds 1 MiB, before it reads
+  past the frames written so far, which could wait for a frame being written, before it reads a
+  record of more than 64 KiB, which damage could make claim most of the file, before it checks at
+  once a record too large to queue, whose body it decompresses whole and whose length damage could
+  set, and at the end of every pass, so nothing it copied reaches the rename unchecked. The queue
+  names the first record queued whose hash differs, and an error the walk meets itself gives way
+  to that one, so a damaged file fails with the error it gave when each record was checked as it
+  was read: following a damaged record's links can only lead to records read after it. A damaged
+  link leads the walk at most 1 MiB of records further than before, and a loop in damaged links
+  fills the queue.
+- On several threads each copy thread queues the records it discovers in units and checks ahead,
+  256 KiB at most, and holds each unit it discovers until every record it queued before the unit
+  is checked. It then publishes the units, as tainted if any record failed, so the walk copies them
+  itself with its own checks where they fall in the order and reports the error one thread gives,
+  and hands out the units a split made only once the root they came from is checked. It marks a
+  slot checked only for a record that passed, so no other thread takes an unchecked record as
+  checked, and a thread checking ahead hands others only the links of records already checked, and
+  stops at a failure. A thread checks what it holds at the same points as the walk, at 64 units,
+  before it takes work other than a unit while it holds units, and before it would wait. The walk
+  on several threads still checks its own reads at once, and so do the threads that read the chains
+  ahead.
+
+Holding units makes placing them come in bursts, and each burst closes many write jobs at once,
+which the threads took up together while the file wrote one at a time. Their buffers, counted
+against the budget at twice their length, then filled it: in `reclaim_damage.rs` four threads
+peaked at up to 22 MB of heap, against 14.7 MB before over 40 runs of each, past the 12 MiB above
+one thread that the test allows. A thread now takes a job only while fewer jobs than there are
+threads are being built or wait for the file, and a job written wakes a thread if more wait.
+
+`reclaim_threads.rs` damages twelve records next to each other in the file that only history
+reaches, log entries left out, in their bodies, the hashes of their links or the offsets of their
+links, in eight rounds, and expects the same error at 1, 2, 4 and 8 threads. It fails when the
+queue names the last record whose hash differs rather than the first, when the walk returns its
+own error before the queue's, and when a thread publishes units whose records failed. The first
+version checked a record too large to queue without checking the queue first, so a thread that
+followed the links of the small record linking garbage in `reclaim_damage.rs` could decompress a
+body as long as the garbage claimed. With the queue checked first and the jobs limited, over 40
+runs the two files damaged to land on garbage peak at 5.5 MB on one thread and at most 12.8 MB on
+four, against 4.3 and 14.7 MB before, the one whose link claims 16 MiB at 38.5 and 47.9 MB against
+37.3 and 46.0 before, and the other reclamation tests pass unchanged. The `reclaim` fuzz target,
+which compares the copies and errors of one thread and four, ran its 8,649 seeds and 107,187 runs
+in ten minutes without a failure.
+
+`ferro-bench --bin reclaim copy`, one copy per run, alternating with the build before on
+2026-11-12, pinned to cores 0-15 of a machine other work was sharing, medians of 16 runs for the
+table rows at a load average of 11 to 14 and of 12 for the values at 10 to 11, with the
+instructions and cycles of the whole process in user space, in billions, the copy of the file aside
+included:
+
+| File | Threads | Before | After | Instructions before and after | Cycles before and after |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 189 MB of table rows, 383,364 objects | 1 | 0.837 s | 0.532 s | 4.98 and 3.82 | 2.82 and 1.60 |
+| | 4 | 0.307 s | 0.271 s | 6.08 and 5.15 | 3.79 and 2.78 |
+| | 8 | 0.204 s | 0.182 s | 6.32 and 5.43 | 4.27 and 3.32 |
+| | 16 | 0.214 s | 0.177 s | 6.71 and 5.89 | 5.03 and 3.98 |
+| 331 MB of 320 byte values, 124,939 objects | 1 | 0.450 s | 0.225 s | 1.97 and 0.94 | 1.59 and 0.52 |
+| | 4 | 0.164 s | 0.107 s | 2.07 and 1.19 | 1.75 and 0.79 |
+| | 8 | 0.127 s | 0.105 s | 2.08 and 1.19 | 1.83 and 0.87 |
+| | 16 | 0.144 s | 0.112 s | 2.11 and 1.20 | 1.95 and 0.85 |
+
+The fastest runs of the table rows took 0.143 s at 8 threads against 0.159 before, 1,327 against
+1,193 MB/s, and of the values 0.088 against 0.122 s. Ten alternating runs at a load of 6 to 8 of
+the build with the jobs limited and the one without took 0.458 and 0.489 s on one thread, 0.215
+and 0.244 s at 4, 0.177 and 0.183 s at 8 and 0.173 and 0.170 s at 16, against 0.754, 0.260, 0.193
+and 0.217 s before. On one thread BLAKE3 now takes 20% of the user time, against 53%. From 8
+threads the walk sets the time, as under [Past eight threads again](#past-eight-threads-again), so
+the CPU saved shows more in cycles than in seconds.
+
+The copy is the same bytes: `cmp` found the copies of both files made at 1, 2, 3, 4, 8, 16 and 32
+threads identical to the one the build before made on one, keeping everything and keeping the last
+1,000 versions, and the copies at 1, 4 and 8 threads of a file a cycle wrote, keeping the last
+3,000. Peak RSS copying the table rows rose from 86 to 87 MiB on one thread, from 96 to 98 MiB at
+8 threads and from 104 to 112 MiB at 16, for the queues, and copying the values it fell from 45 to
+36 MiB at 4 threads and from 46 to 42 MiB at 8, with fewer jobs at once.
+
 ### Measured and left out
 
 - Reading a node's children in one read. When the children still to copy lay within 256 KiB and
@@ -980,11 +1081,11 @@ outgrew.
 - The table of copies filled up to three quarters. On one thread it peaked at 156 MiB of RSS,
   below the `HashMap`'s 160, in the same time, but at 32 threads, where most of the walk's lookups
   miss, it took 0.253 s against 0.244 at five eighths and 0.239 before, medians of 12.
-- Hashing several records at once. Not built into the copy. A prototype that hashed 16 inputs at
-  once with AVX-512 took 28 to 48 ns for each 64-byte block where BLAKE3 takes 87 to 107 ns on one
-  input. But the walk checks a record before it follows its links, and most records of history lie
-  on one version's path, each found from the one above, so it rarely holds two unchecked records
-  at once, and on several threads the checks already run on other cores.
+- Hashing several records at once, while the walk still checked each record before it followed
+  its links. A prototype that hashed 16 inputs at once with AVX-512 took 28 to 48 ns for each
+  64-byte block where BLAKE3 takes 87 to 107 ns on one input, but most records of history lie on
+  one version's path, each found from the one above, so the walk rarely held two unchecked records
+  at once. [Checking many hashes at once](#checking-many-hashes-at-once) follows links first.
 - Reading around each record a unit discovers, so that one read serves the records near it. A unit
   of an old version holds the nodes later versions replaced, which the commits that last changed
   them wrote all over the file, so mostly only a record and the one below it lie together. Reading
@@ -1183,8 +1284,12 @@ thread against 753, as described under [Checking and looking up with less
 work](#checking-and-looking-up-with-less-work). Later that day, with other work at a load average of
 15 to 26, the table rows copied at 215 MB/s on one thread, 517 on 4, 756 on 8, 738 on 16 and 675 on
 32, against 194, 462, 639, 647 and 553 MB/s before in the same runs, as described under [Fewer locks
-and allocations past eight threads](#fewer-locks-and-allocations-past-eight-threads). So a 10 GB
-database of table rows takes about 9 seconds and needs 10 GB free. The trigger keeps that to one
+and allocations past eight threads](#fewer-locks-and-allocations-past-eight-threads). Checking many
+hashes at once then made the table rows copy in 0.532 s against 0.837 on one thread, 0.271 against
+0.307 on 4, 0.182 against 0.204 on 8 and 0.177 against 0.214 on 16, at a load average of 11 to 14,
+and the values in 0.225 against 0.450 s on one thread, as described under [Checking many hashes at
+once](#checking-many-hashes-at-once). So a 10 GB database of table rows takes about 9 seconds and
+needs 10 GB free. The trigger keeps that to one
 extra byte copied per byte written, at worst. Past 8 threads the copy of table rows gains about a
 tenth at 16 threads, 1,136 MB/s with them spread over all 32 CPUs, and runs at 828 MB/s at 32, since
 the walk down the chains and the writing of the entries after every tree stay on one thread, the
@@ -1198,8 +1303,9 @@ walk down the chains read, counted at what their buffer and map allocate, until 
 up to 16 MiB more of entries read ahead of it while it goes down a chain, the lists of the trees
 waiting to be placed, 24 bytes a record and 4 a link, and 16 MiB of records and decompressed bodies
 the threads and the walk hold at once, or one larger record alone, besides a buffer of up to 1 MiB,
-a compressed record of up to 4 KiB with its body and a table of 4,096 hashes on each thread and the
-one record the walk is copying.
+a compressed record of up to 4 KiB with its body, a table of 4,096 hashes and up to 256 KiB of
+records waiting for their hashes to be checked on each thread, or 1 MiB of those on one thread, and
+the one record the walk is copying.
 
 The pause copies what the last pass left, so it depends on how much reachable data changed in that
 pass, not on the size of the database. Writers that outrun the copier for all six passes make the

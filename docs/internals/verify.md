@@ -145,5 +145,6 @@ the power they save, should remove it; that was not tried here.
   object before it knows which are reachable.
 - A set without locks, by offset with the hash beside it, would save most of the lock traffic left
   on eight threads, about a fifth of their cycles, at the cost of a fixed table sized up front.
-- Batching the hashes of a reclamation cycle's copy, where BLAKE3 took 44% of the time, would use
-  the same `HashBatch`.
+- Objects of more than one chunk, 4% of this file's. A reclamation cycle's copy checks its hashes
+  in batches that take objects of up to 16 chunks, as [Checking many hashes at
+  once](reclamation.md#checking-many-hashes-at-once) describes, and `verify` could share them.

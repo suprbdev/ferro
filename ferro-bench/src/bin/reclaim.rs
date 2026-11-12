@@ -19,8 +19,9 @@
 //!   moving the spans of live data sparser than a range of densities would move and leave.
 //! - `copy <path> <rounds> <threads>...` copies the file aside and times a `compact` that keeps
 //!   everything, with each `copy_threads` count in turn, `rounds` times. `RECLAIM_KEEP` keeps only
-//!   that many versions instead, and `RECLAIM_AGAIN=1` times a second `compact` of the file the
-//!   first one wrote.
+//!   that many versions instead, `RECLAIM_AGAIN=1` times a second `compact` of the file the
+//!   first one wrote, and `RECLAIM_OUT` names a directory to keep each copy in, as
+//!   `copy-<threads>`, for `cmp` to compare across builds and thread counts.
 //!
 //! `live` commits with `Durability::Fsync` unless `RECLAIM_BUFFERED=1` is set. `RECLAIM_READERS`
 //! starts that many reader threads, of which only `table`'s read anything, `RECLAIM_ROWS` and
@@ -729,7 +730,14 @@ fn copy(path: &Path, rounds: u64, threads: &[usize]) {
                 done.pause.as_secs_f64() * 1e3
             );
             drop(db);
-            let _ = fs::remove_file(&work);
+            match std::env::var_os("RECLAIM_OUT") {
+                Some(dir) => {
+                    fs::rename(&work, Path::new(&dir).join(format!("copy-{count}"))).unwrap()
+                }
+                None => {
+                    let _ = fs::remove_file(&work);
+                }
+            }
         }
     }
 }

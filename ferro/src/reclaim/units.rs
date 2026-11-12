@@ -15,9 +15,10 @@
 //! are all placed before it. Workers then write placed records in jobs of at least 256 KiB, reading
 //! each one again, records that lie next to each other in the file in one read, and hand each job
 //! to whichever thread holds the file, which writes every job waiting before it lets the file go,
-//! so no thread waits for another's write. A unit that reaches anything the walk treats
-//! differently, such as a log entry, a pruned hash or a link at offset 0, or whose discovery fails,
-//! is tainted, and the walk copies it itself where it falls in the order.
+//! so no thread waits for another's write. No more jobs are built or wait for the file at once than
+//! there are threads. A unit that reaches anything the walk treats differently, such as a log
+//! entry, a pruned hash or a link at offset 0, or whose discovery fails, is tainted, and the walk
+//! copies it itself where it falls in the order.
 //!
 //! While the walk goes down the chains before it hands out any unit, it passes the root of each
 //! entry to [`Units::check_ahead`], and workers with nothing else to do check the hashes of the
@@ -25,6 +26,17 @@
 //! hash, so discovery takes a record checked at the offset it reaches as checked, and only reads
 //! and parses it. Before that walk goes down a chain, [`Units::read_ahead`] has threads read the
 //! chain's entries ahead of it, as [`Ahead`] describes.
+//!
+//! A thread checks the hashes of the records it reads many at once, in [`Checks`], so it follows
+//! the links of a record before that record is checked. It holds the units it discovers until
+//! every record it queued before them is checked, and publishes them then, as tainted if any
+//! failed, so a unit split into others hands them out only once its root is checked, and no
+//! record reaches a write job unchecked. It marks a slot checked only once its record passed. It
+//! checks what it holds before it reads past the frames written so far or a record of more than 64
+//! KiB, before it checks at once a record too large to queue, which it decompresses whole, when
+//! what it holds reaches 256 KiB or 64 units, before it takes work other than a unit while it holds
+//! units, and before it would wait for work. A thread checking ahead hands other threads only links
+//! of records already checked, and stops at a failure.
 //!
 //! A slot is numbered by hash in [`Ids`], which any thread reads without a lock, and each thread
 //! remembers the numbers of the hashes it met lately. A thread numbers every link of a record it
@@ -46,17 +58,16 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex};
 
-use super::ByHash;
 use super::ahead::{Ahead, Read};
+use super::checks::Checks;
 use super::ids::Ids;
+use super::{ByHash, CHECK_PAST};
 use crate::codec::{HASH_BYTES, Hash, Ptr, Staged};
 use crate::error::{Error, Result};
 use crate::log::Chain;
 use crate::map::prefetch;
 use crate::platform::start_writeback;
-use crate::store::{
-    Store, Traced, Unpacked, append_staged, stored_within, varint_len, verify_stored, zigzag,
-};
+use crate::store::{Store, Traced, append_staged, stored_within, varint_len, zigzag};
 
 /// Where a unit falls in the order one thread copies in: the unit's place among those the walk
 /// dispatched in the high 32 bits, then one byte for each level it was split at, the child's
@@ -84,6 +95,10 @@ const CHECKS: usize = 1 << 16;
 const CHECKING: u64 = u64::MAX;
 /// How many records a thread checks ahead between looks at the queue.
 const SHARE: usize = 64;
+/// The bytes of records a thread queues to check at once.
+const CHECK_BYTES: usize = 256 << 10;
+/// The most units a thread holds discovered while their records wait to be checked.
+const HOLD_UNITS: usize = 64;
 
 enum Failure {
     Failed(Error),
@@ -392,8 +407,15 @@ enum Item {
     Job(Job),
     Check(Ptr),
     Read(Read),
+    Flush,
 }
 
+/// The work waiting for the copy's threads.
+///
+/// `writing` counts the write jobs closed and not yet written, those waiting in `jobs` among
+/// them, and a thread takes a job only while fewer than `building` others are being built or
+/// waiting for the file, so that a burst of units placed at once does not fill the budget with
+/// jobs.
 #[derive(Default)]
 struct Queue {
     units: BinaryHeap<Queued>,
@@ -401,11 +423,14 @@ struct Queue {
     checks: VecDeque<Ptr>,
     reads: VecDeque<Read>,
     writing: usize,
+    building: usize,
 }
 
 impl Queue {
     fn work(&mut self) -> Option<Item> {
-        if let Some(job) = self.jobs.pop_front() {
+        if self.writing - self.jobs.len() < self.building
+            && let Some(job) = self.jobs.pop_front()
+        {
             return Some(Item::Job(job));
         }
         self.units.pop().map(|queued| Item::Unit(queued.1))
@@ -452,11 +477,43 @@ struct Scratch {
     links: Vec<Ptr>,
     new: Vec<Ptr>,
     out: Vec<u8>,
-    unpacked: Unpacked,
     spare: Vec<Vec<Ptr>>,
     ids: Vec<Vec<u32>>,
     checks: Vec<Ptr>,
     seen: Seen,
+    unchecked: Unchecked,
+}
+
+/// A slot to mark checked once the record read under it passes: its number, the offset of the
+/// record, and whether the thread holds the slot as checking it.
+type Mark = (u32, u64, bool);
+
+/// What a thread has read and not yet checked: the records queued in `checks`, the slot each of
+/// them marks checked once it passes, and the units discovered from them, which the thread
+/// publishes only once every record queued before them is checked. `failed` records that a check
+/// failed since a thread checking ahead last cleared it.
+struct Unchecked {
+    checks: Checks,
+    marks: Vec<Mark>,
+    units: Vec<(Arc<Unit>, Found)>,
+    failed: bool,
+}
+
+impl Default for Unchecked {
+    fn default() -> Unchecked {
+        Unchecked {
+            checks: Checks::new(CHECK_BYTES),
+            marks: Vec::new(),
+            units: Vec::new(),
+            failed: false,
+        }
+    }
+}
+
+impl Unchecked {
+    fn holds(&self) -> bool {
+        !self.checks.is_empty() || !self.units.is_empty()
+    }
 }
 
 impl Scratch {
@@ -615,25 +672,20 @@ impl Shared {
         s: &mut Scratch,
     ) -> Option<Node> {
         let mut taken = None;
-        let slot = self.claims.slot(id);
-        let checked = slot.checked.load(Ordering::Acquire) == ptr.offset;
-        let node = self.fetch(ptr, checked, taint, s, &mut taken);
+        let checked = self.claims.slot(id).checked.load(Ordering::Acquire) == ptr.offset;
+        let mark = (!checked).then_some((id, ptr.offset, false));
+        let node = self.fetch(ptr, mark, taint, s, &mut taken);
         if s.bytes.capacity() > KEEP_BYTES {
             s.bytes = Vec::new();
         }
         drop(taken);
-        if !checked && node.is_some() {
-            let _ =
-                slot.checked
-                    .compare_exchange(0, ptr.offset, Ordering::AcqRel, Ordering::Relaxed);
-        }
         node
     }
 
     fn fetch<'a>(
         &'a self,
         ptr: Ptr,
-        checked: bool,
+        mark: Option<Mark>,
         taint: &HashSet<Hash, ByHash>,
         s: &mut Scratch,
         taken: &mut Option<Taken<'a>>,
@@ -641,8 +693,20 @@ impl Shared {
         if ptr.offset == 0 {
             return None;
         }
+        if ptr.offset >= self.source.written()
+            && !s.unchecked.checks.is_empty()
+            && !self.flush(&mut s.unchecked)
+        {
+            return None;
+        }
         let mut links = s.spare.pop().unwrap_or_default();
+        let unchecked = &mut s.unchecked;
         let claims = |claim: usize| {
+            if claim > CHECK_PAST && !unchecked.checks.is_empty() && !self.flush(unchecked) {
+                return Err(Error::Corrupt(
+                    "a record read before failed its check".into(),
+                ));
+            }
             *taken = Some(self.budget.take(claim as u64));
             Ok(())
         };
@@ -650,12 +714,25 @@ impl Shared {
             .source
             .read_stored(ptr, &mut s.bytes, &mut links, claims)
             .ok()?;
-        if !checked {
+        if let Some(mark) = mark {
+            if !Checks::queues(stored.raw, links.len())
+                && !s.unchecked.checks.is_empty()
+                && !self.flush(&mut s.unchecked)
+            {
+                return None;
+            }
             if stored.packed && stored.raw > record.len() && record.len() + stored.raw > UNCOUNTED {
                 *taken = None;
                 *taken = Some(self.budget.take((record.len() + stored.raw) as u64));
             }
-            verify_stored(record, &stored, &links, ptr, &mut s.unpacked).ok()?;
+            let unchecked = &mut s.unchecked;
+            match unchecked.checks.queue(record, &stored, &links, ptr).ok()? {
+                true => self.mark(mark),
+                false => unchecked.marks.push(mark),
+            }
+            if unchecked.checks.full() && !self.flush(unchecked) {
+                return None;
+            }
         }
         let len = u32::try_from(stored.len).ok()?;
         if links
@@ -684,23 +761,43 @@ impl Shared {
         let mut stack = mem::take(&mut s.checks);
         stack.push(root);
         let mut count = 0;
+        let mut safe = 0;
+        s.unchecked.failed = false;
         while let Some(ptr) = stack.pop() {
             if !self.checking.load(Ordering::Relaxed) || self.cancel.load(Ordering::Relaxed) {
                 stack.clear();
                 break;
             }
+            safe = safe.min(stack.len());
             self.check_one(ptr, &mut stack, s);
             count += 1;
+            if s.unchecked.failed {
+                stack.clear();
+                break;
+            }
+            if s.unchecked.checks.is_empty() {
+                safe = stack.len();
+            }
             if stack.len() >= 2 * SHARE || count % SHARE == 0 {
                 let mut queue = self.queue.lock();
                 let busy =
                     !queue.jobs.is_empty() || !queue.units.is_empty() || !queue.reads.is_empty();
+                if busy {
+                    drop(queue);
+                    if !self.flush(&mut s.unchecked) {
+                        stack.clear();
+                        break;
+                    }
+                    safe = stack.len();
+                    queue = self.queue.lock();
+                }
                 let share = match busy {
                     true => stack.len(),
-                    false => stack.len() / 2,
+                    false => (stack.len() / 2).min(safe),
                 };
-                if queue.checks.len() + share <= CHECKS {
+                if share > 0 && queue.checks.len() + share <= CHECKS {
                     queue.checks.extend(stack.drain(..share));
+                    safe -= share;
                     self.wake(share);
                 }
                 if busy {
@@ -716,24 +813,78 @@ impl Shared {
         if ptr.offset == 0 {
             return;
         }
-        let slot = self.claims.slot(self.claims.id(&ptr.hash, &mut s.seen));
-        let started =
-            slot.checked
-                .compare_exchange(0, CHECKING, Ordering::AcqRel, Ordering::Relaxed);
+        let id = self.claims.id(&ptr.hash, &mut s.seen);
+        let started = self.claims.slot(id).checked.compare_exchange(
+            0,
+            CHECKING,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         if started.is_err() {
             return;
         }
         let mut taken = None;
-        let node = self.fetch(ptr, false, &self.clean, s, &mut taken);
+        let mark = Some((id, ptr.offset, true));
+        let node = self.fetch(ptr, mark, &self.clean, s, &mut taken);
         if s.bytes.capacity() > KEEP_BYTES {
             s.bytes = Vec::new();
         }
         drop(taken);
         if let Some(node) = node {
-            slot.checked.store(ptr.offset, Ordering::Release);
             stack.extend(node.links.iter().rev());
             s.recycle(node.links, Vec::new());
         }
+    }
+
+    fn mark(&self, (id, offset, own): Mark) {
+        let checked = &self.claims.slot(id).checked;
+        match own {
+            true => checked.store(offset, Ordering::Release),
+            false => {
+                let _ = checked.compare_exchange(0, offset, Ordering::AcqRel, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Checks the records `unchecked` holds, marks the slot of each that passed as checked, and
+    /// publishes its units, as discovered if every record passed and as tainted otherwise, handing
+    /// out the units they were split into only in the first case. Returns whether every record
+    /// passed.
+    fn flush(&self, unchecked: &mut Unchecked) -> bool {
+        let Unchecked {
+            checks,
+            marks,
+            units,
+            failed,
+        } = unchecked;
+        let checked = panic::catch_unwind(AssertUnwindSafe(|| {
+            checks.check(|index| self.mark(marks[index]))
+        }));
+        let passed = matches!(checked, Ok(Ok(())));
+        if checked.is_err() {
+            *checks = Checks::new(CHECK_BYTES);
+        }
+        marks.clear();
+        *failed |= !passed;
+        if units.is_empty() {
+            return passed;
+        }
+        for (unit, found) in units.drain(..) {
+            let found = match passed {
+                true => found,
+                false => Found::Tainted,
+            };
+            if let Found::Copied { children, .. } = &found
+                && !children.is_empty()
+            {
+                let mut queue = self.queue.lock();
+                queue.units.extend(children.iter().cloned().map(Queued::of));
+                self.wake(children.len());
+            }
+            let _ = unit.found.set(found);
+        }
+        self.try_place();
+        passed
     }
 
     fn split(&self, unit: &Unit, node: &Node, ids: &[u32]) -> Option<Vec<Arc<Unit>>> {
@@ -964,6 +1115,14 @@ impl Shared {
         Ok(())
     }
 
+    fn written_one(&self) {
+        let mut queue = self.queue.lock();
+        queue.writing -= 1;
+        if !queue.jobs.is_empty() {
+            self.ready.notify_one();
+        }
+    }
+
     fn write_out(&self) {
         while let Some(file) = self.writing.try_lock() {
             loop {
@@ -984,7 +1143,7 @@ impl Shared {
                         outbox.spare.push(bytes);
                     }
                 }
-                self.queue.lock().writing -= 1;
+                self.written_one();
             }
             drop(file);
             if self.outbox.lock().filled.is_empty() {
@@ -1085,7 +1244,7 @@ impl Shared {
         }
     }
 
-    fn next(&self) -> Option<Item> {
+    fn next(&self, holding: bool) -> Option<Item> {
         let mut queue = self.queue.lock();
         loop {
             if self.cancel.load(Ordering::Acquire) {
@@ -1093,6 +1252,9 @@ impl Shared {
             }
             if let Some(item) = queue.take() {
                 return Some(item);
+            }
+            if holding {
+                return Some(Item::Flush);
             }
             self.ready.wait(&mut queue);
         }
@@ -1107,20 +1269,31 @@ impl Shared {
     }
 
     fn run(&self, item: Item, s: &mut Scratch) {
+        let flush = match item {
+            Item::Unit(_) => false,
+            Item::Flush => true,
+            _ => !s.unchecked.units.is_empty(),
+        };
+        if flush {
+            self.flush(&mut s.unchecked);
+        }
         match item {
             Item::Unit(unit) => {
                 let found = panic::catch_unwind(AssertUnwindSafe(|| self.discover(&unit, s)));
                 let found = found.ok().flatten().unwrap_or(Found::Tainted);
-                if let Found::Copied { children, .. } = &found
-                    && !children.is_empty()
+                let split =
+                    matches!(&found, Found::Copied { children, .. } if !children.is_empty());
+                let unchecked = &mut s.unchecked;
+                unchecked.units.push((unit, found));
+                if split
+                    || unchecked.checks.is_empty()
+                    || unchecked.checks.full()
+                    || unchecked.units.len() >= HOLD_UNITS
                 {
-                    let mut queue = self.queue.lock();
-                    queue.units.extend(children.iter().cloned().map(Queued::of));
-                    self.wake(children.len());
+                    self.flush(unchecked);
                 }
-                let _ = unit.found.set(found);
-                self.try_place();
             }
+            Item::Flush => {}
             Item::Job(job) => {
                 let failure = match panic::catch_unwind(AssertUnwindSafe(|| self.write(&job, s))) {
                     Ok(Ok(())) => None,
@@ -1129,7 +1302,7 @@ impl Shared {
                 };
                 if let Some(failure) = failure {
                     self.fail(failure);
-                    self.queue.lock().writing -= 1;
+                    self.written_one();
                 }
             }
             Item::Check(ptr) => {
@@ -1164,6 +1337,10 @@ impl Shared {
             return;
         }
         drop(queue);
+        if scratch.unchecked.holds() {
+            self.flush(&mut scratch.unchecked);
+            return;
+        }
         let mut moving = self.moving.lock();
         self.watching.fetch_add(1, Ordering::SeqCst);
         if self.events.load(Ordering::SeqCst) == seen {
@@ -1215,7 +1392,10 @@ impl Units {
                 placed: AtomicU64::new(0),
                 writing: Mutex::new(()),
                 outbox: Mutex::default(),
-                queue: Mutex::default(),
+                queue: Mutex::new(Queue {
+                    building: threads,
+                    ..Queue::default()
+                }),
                 ready: Condvar::new(),
                 moving: Mutex::new(()),
                 moved: Condvar::new(),
@@ -1372,7 +1552,7 @@ impl Units {
                 .name("ferro-copy".to_string())
                 .spawn(move || {
                     let mut scratch = Scratch::default();
-                    while let Some(item) = shared.next() {
+                    while let Some(item) = shared.next(scratch.unchecked.holds()) {
                         shared.run(item, &mut scratch);
                     }
                 });
@@ -1454,6 +1634,14 @@ impl Units {
     ///
     /// [`Error::Interrupted`] once `stop` is set, and the first error a write job met.
     pub(super) fn settle(&mut self, stop: Option<&AtomicBool>, until: usize) -> Result<Settled> {
+        let settled = self.placing(stop, until);
+        if self.scratch.unchecked.holds() {
+            self.shared.flush(&mut self.scratch.unchecked);
+        }
+        settled
+    }
+
+    fn placing(&mut self, stop: Option<&AtomicBool>, until: usize) -> Result<Settled> {
         self.publish();
         let shared = self.shared.clone();
         loop {

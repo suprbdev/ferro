@@ -33,10 +33,12 @@ use crate::store::{
     compressed, seal, staged, stored_within, verify_stored,
 };
 use ahead::Ahead;
+use checks::Checks;
 use copies::Copies;
 use units::{Key, PENDING, Reserved, Settled, Units};
 
 mod ahead;
+mod checks;
 mod copies;
 mod ids;
 mod units;
@@ -48,6 +50,8 @@ const COPY_THREADS: usize = 8;
 const AHEAD: usize = 16384;
 const KEEP_BYTES: usize = 16 << 20;
 const RESERVE: u64 = 1 << 16;
+const CHECK_BYTES: usize = 1 << 20;
+const CHECK_PAST: usize = 64 << 10;
 
 type ByHash = BuildHasherDefault<Prehashed>;
 type ByOffset = BuildHasherDefault<Spread>;
@@ -301,6 +305,7 @@ struct CopySink<'a> {
     units: Option<Units>,
     fallback: Option<Key>,
     stale: bool,
+    checks: Checks,
 }
 
 #[derive(Clone, Copy)]
@@ -862,8 +867,15 @@ impl CopySink<'_> {
             self.prefetch(&self.old);
             return Ok(Step::Descend(pending));
         }
-        let (units, reserved) = (&self.units, &mut self.reserved);
+        let batched = self.units.is_none();
+        if batched && ptr.offset >= self.source.written() {
+            self.checks.finish()?;
+        }
+        let (units, reserved, checks) = (&self.units, &mut self.reserved, &mut self.checks);
         let large = |claim: usize| {
+            if batched && claim > CHECK_PAST {
+                checks.finish()?;
+            }
             *reserved = None;
             *reserved = units.as_ref().map(|units| units.reserve(claim as u64));
             Ok(())
@@ -874,7 +886,18 @@ impl CopySink<'_> {
         let (record, stored) = read?;
         self.prefetch(&self.old);
         if !entry || self.walked.get(&ptr.offset) != Some(&ptr.hash) {
-            verify_stored(record, &stored, &self.old, ptr, &mut self.scratch)?;
+            if batched && !Checks::queues(stored.raw, self.old.len()) {
+                self.checks.finish()?;
+            }
+            match batched && !entry {
+                true => {
+                    self.checks.queue(record, &stored, &self.old, ptr)?;
+                    if self.checks.full() {
+                        self.checks.finish()?;
+                    }
+                }
+                false => verify_stored(record, &stored, &self.old, ptr, &mut self.scratch)?,
+            }
         }
         let entry = match entry {
             true => {
@@ -1214,11 +1237,21 @@ impl<'a> Copier<'a> {
                 reserved: None,
                 fallback: None,
                 stale: true,
+                checks: Checks::new(CHECK_BYTES),
             },
         })
     }
 
     fn encode(&mut self, refs: &Refs, genesis: Option<Ptr>) -> Result<Ptr> {
+        let head = self.copy_all(refs, genesis);
+        let checks = &mut self.sink.checks;
+        match head {
+            Ok(head) => checks.finish().map(|()| head),
+            Err(error) => Err(checks.first(error)),
+        }
+    }
+
+    fn copy_all(&mut self, refs: &Refs, genesis: Option<Ptr>) -> Result<Ptr> {
         let sink = &mut self.sink;
         let source = sink.source.clone();
         let mut retained: HashSet<Hash, ByHash> = HashSet::default();

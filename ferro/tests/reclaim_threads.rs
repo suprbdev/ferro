@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use common::{Rng, text};
+use ferro::codec::HASH_BYTES;
 use ferro::db::Clock;
 use ferro::store::{Store, StoreOptions, record_len};
 use ferro::{Db, Durability, Error, Keep, Map, Options, Reclaim, admin};
@@ -325,6 +326,62 @@ fn a_hash_mismatch_found_while_copying_fails_the_cycle_and_leaves_the_file() {
         assert!(matches!(outcome, Err(Error::Corrupt(_))), "{outcome:?}");
         assert_eq!(fs::read(&offline).unwrap(), damaged);
         assert!(!temp_of(&offline).exists());
+    }
+}
+
+#[test]
+fn many_damaged_records_fail_alike_at_every_thread_count() {
+    let _turn = serial();
+    let dir = dir();
+    let source = dir.path().join("source.ferro");
+    build(&source, 2000, 600, 300);
+    let spared: HashSet<u64> = admin::layout(&source, Keep::Last(50))
+        .unwrap()
+        .extents
+        .iter()
+        .map(|extent| extent.0)
+        .chain(entries_by_version(&source).into_iter().map(|entry| entry.1))
+        .collect();
+    let history: Vec<usize> = admin::layout(&source, Keep::All)
+        .unwrap()
+        .extents
+        .iter()
+        .filter(|extent| !spared.contains(&extent.0))
+        .map(|extent| extent.0 as usize)
+        .collect();
+    let bytes = fs::read(&source).unwrap();
+    let mut rng = Rng::new(0x5eed);
+    for round in 0..8 {
+        let mut damaged = bytes.clone();
+        let first = rng.below(history.len() as u64 - 12) as usize;
+        for &at in &history[first..first + 12] {
+            let (links, end) = common::link_slots(&bytes, at);
+            let link = (!links.is_empty()).then(|| &links[rng.below(links.len() as u64) as usize]);
+            let byte = match (rng.below(3), link) {
+                (1, Some(link)) => link.hash_at + rng.below(HASH_BYTES as u64) as usize,
+                (2, Some(link)) => link.at,
+                _ => links.first().map_or(end, |link| link.hash_at) - 1,
+            };
+            damaged[byte] ^= 0x01;
+        }
+        let mut outcomes = Vec::new();
+        for threads in [1, 2, 4, 8] {
+            let path = dir.path().join(format!("damaged-{threads}.ferro"));
+            fs::write(&path, &damaged).unwrap();
+            let db: Db<Root> = options(threads).open(&path).unwrap();
+            let outcome = db.compact(Keep::All).map(|_| ());
+            assert!(outcome.is_err(), "round {round}, {threads} threads");
+            drop(db);
+            assert!(!temp_of(&path).exists(), "round {round}, {threads} threads");
+            outcomes.push((threads, format!("{outcome:?}")));
+        }
+        for pair in outcomes.windows(2) {
+            assert_eq!(
+                pair[0].1, pair[1].1,
+                "round {round}: {} against {} threads",
+                pair[0].0, pair[1].0
+            );
+        }
     }
 }
 
