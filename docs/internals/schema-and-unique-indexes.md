@@ -668,9 +668,25 @@ that lacks the key ran 95,000.
 `a.and(b).and(c)` built a node over `a.and(b)` and `c`, so the order it was written in decided the
 plan: with `b` the smallest, `a.and(b)` was planned alone, and `c` met it through the smaller of
 their lengths, an upper bound. Now `and` called on a combination that is itself an `and` not yet
-read adds the new side to that node, up to eight sides, past which it builds a node over the eight
-and the new one. The node keeps the left side, whose rows and covered fields it yields, apart from
-the others, which it only asks about keys, and finds a side by its number through a `match`.
+read adds the new side to that node, and when the side it is given is an `and` not yet read, it
+adds each of that node's sides instead, so `a.and(b.and(c))` builds the node `a.and(b).and(c)`
+builds. A node holds up to 64 sides, past which `and` builds a node over the 64 and the next. The
+node keeps the left side, whose rows and covered fields it yields, apart from the others, which it
+only asks about keys, and finds a side by its number through a `match`. It keeps the order of its
+plan in an array of 64 bytes, and in the 64 bits of a word whether each side reads the table and
+version of its left side.
+
+A node given to `and` has already handed out its finders: each range took the finder of the lookup
+it came with, and its left side the one its `Matches` read rows through, which `and` hands it
+before taking the node apart. Every side but the left one only answers about keys, so those finders
+are all a side needs, and the source numbers its sides carry, counted from that node's own left
+side, are never asked: the node that takes the sides in asks its own left side alone which finder
+reads a row. The given node's left side joins wrapped in `Blind`, as any side given to `and` is, so
+it yields no covered fields. Each side keeps its flag only when the given node reads one table at
+one version, the one the receiving node's left side reads, since a node records for each side
+whether it reads its own left side's table and version and nothing else. A node already planned or
+ordered is not taken apart, and one read from has already become a sorted list. `Blind`, which
+`uncovered` wraps around a node, passes both the joining and the taking apart to the node inside.
 
 Its plan comes from the sides' lengths when it is first read. They are sorted, fewest first; the
 first leads, and a side with less than four times the lead's keys is walked beside it, as two sides
@@ -697,11 +713,12 @@ that side took it and both sides read one version of one table, to a range on th
 none, and a plan whose lead is a range hands the lead's finder, which a walked range no longer
 needs, to a range it looks keys up in. A walked `or` hands on the finder of any range among its
 sides, all of which it walks, and a walked `and` plans itself first and hands on that of a range its
-own plan walks, so a range written before `r.or(x)` or `r.and(s)`, where `r` took that side's
-finder, borrows `r`'s when that side is walked. The finder travels as a `Spare`, which a stream
-takes without asking its source number, so `and` offers it only between sides it compared with
-`Finder::same_map` when it was built. Since that comparison costs a few dozen instructions, `and`
-makes it only when a side holds a range not yet read.
+own plan walks, so a range written before `r.or(x)`, where `r` took that side's finder, borrows
+`r`'s when that side is walked, and one written before `r.and(s)` when `r`, which joins the same
+chain, is. The finder travels as a `Spare`, which a stream takes without asking its source number,
+so `and` offers it only between sides it compared with `Finder::same_map` when it was built. Since
+that comparison costs a few dozen instructions, `and` makes it only when a side holds a range not
+yet read.
 
 `Matches::explain` walks the streams without changing them and reports, for each, its length and how
 it will be read: walked, looked up, tested or collected first. A node not yet planned reports the
@@ -1078,6 +1095,13 @@ the stream types, though its code did not change. The cold cases came within 1% 
 instructions, and the warm ones within 1.8%, the most for 10 keys, once tests and reads from the
 file kept apart counts, as above.
 
+Taking an `and` apart when it is given to another, and growing a node from eight sides to 64, left
+the plans and the work for each key as they were. Built with one codegen unit, every `and` ran 30
+to 100 instructions more for the call that finds nothing to take apart, at most 0.7% of two lookups
+of 20 keys and 0.07% or less from 100 keys up, and planning the chain of three lookups above ran
+about 250 more, 0.3% of the 91,000 it ran. The chains with a tested range moved by up to 0.6%,
+less than the 4% one build moved between two runs of different lengths.
+
 ### Left out
 
 - The index map in every equality `IndexIter`, so that `by_x` itself could combine. A clone of the
@@ -1171,9 +1195,10 @@ file kept apart counts, as above.
   tests cost as much. An iterator does not tell how many keys it will be asked for, and a
   combination read to the end would take up to twice as long wherever collecting is the better
   plan, which the factor of four decides.
-- Planning `a.and(b.and(c))` as one chain. `b.and(c)` has handed its finders to its own streams and
-  numbers its sources from its own left side, so joining its sides to `a`'s would mean taking both
-  back.
+- Holding a chain's plan in vectors, so that a chain could hold any number of sides. Sorting the
+  sides into a vector and splitting the walked ones from those looked up took four allocations, and
+  planning the chain of three lookups above ran about 700 instructions more than with arrays of
+  eight, where arrays of 64 run about 250 more.
 
 ### What is left
 
@@ -1191,7 +1216,11 @@ file kept apart counts, as above.
 - A chain plans once, from counts and from an estimate that its lookups match independently. When
   two walked lookups share most of their keys, a range tested against what they agree on stops at
   about what collecting it costs, so it takes up to about twice as long as collecting it would
-  have. A chain holds eight lookups, past which `and` builds a node over the eight and the next.
+  have. A chain holds 64 lookups, past which `and` builds a node over the 64 and the next.
+- A lookup of an `and` nested on the right lends its finder to a range elsewhere in the chain only
+  when the nested `and`'s left side reads the chain's table and version, since its node kept for
+  each side only whether the side reads what that left side reads. Written as one chain from the
+  left, the same lookups lend whenever the lookup and the range read one table at one version.
 - A tested key costs a row read, so `keys()` and `covered()` read rows they did not before. Rows
   read from the file stop the testing once they cost about what collecting would, but a range
   whose entries are cached while its rows are not still takes up to 3.5 times as long as

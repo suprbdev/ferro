@@ -1448,9 +1448,7 @@ struct Spread {
     tags: Counted,
 }
 
-#[test]
-fn a_chain_of_ands_drives_from_its_smallest_side_whatever_the_order() {
-    let mut rng = Rng::new(83);
+fn spread_table(rng: &mut Rng) -> (Table<Spread>, Vec<Spread>) {
     let mut table: Table<Spread> = Table::new();
     let mut rows = Vec::new();
     for id in 0..6_000 {
@@ -1464,11 +1462,21 @@ fn a_chain_of_ands_drives_from_its_smallest_side_whatever_the_order() {
         table.insert(row.clone());
         rows.push(row);
     }
-    let wanted: Vec<u32> = rows
-        .iter()
+    (table, rows)
+}
+
+fn spread_wanted(rows: &[Spread]) -> Vec<u32> {
+    rows.iter()
         .filter(|row| row.wide == 0 && row.mid == 4 && row.narrow == 5 && row.tags.0[0] < 70)
         .map(|row| row.id)
-        .collect();
+        .collect()
+}
+
+#[test]
+fn a_chain_of_ands_drives_from_its_smallest_side_whatever_the_order() {
+    let mut rng = Rng::new(83);
+    let (table, rows) = spread_table(&mut rng);
+    let wanted = spread_wanted(&rows);
     let narrow = table.by_narrow(&5).len() as u64;
     let find = table.find();
     let lookup = |side: usize| match side {
@@ -1516,6 +1524,256 @@ fn a_chain_of_ands_drives_from_its_smallest_side_whatever_the_order() {
         costs.insert(tested);
     }
     assert_eq!(costs.len(), 1, "tests by order: {costs:?}");
+}
+
+#[derive(Clone, Debug)]
+enum Tree {
+    Side(usize),
+    And(Box<Tree>, Box<Tree>),
+}
+
+impl Tree {
+    fn every(sides: &[usize]) -> Vec<Tree> {
+        if let [side] = sides {
+            return vec![Tree::Side(*side)];
+        }
+        let mut out = Vec::new();
+        for at in 1..sides.len() {
+            for left in Tree::every(&sides[..at]) {
+                for right in Tree::every(&sides[at..]) {
+                    out.push(Tree::And(Box::new(left.clone()), Box::new(right)));
+                }
+            }
+        }
+        out
+    }
+
+    fn right(sides: &[usize]) -> Tree {
+        match sides {
+            [side] => Tree::Side(*side),
+            [side, rest @ ..] => {
+                Tree::And(Box::new(Tree::Side(*side)), Box::new(Tree::right(rest)))
+            }
+            [] => unreachable!("a tree of no sides"),
+        }
+    }
+
+    fn any(sides: &[usize], rng: &mut Rng) -> Tree {
+        if let [side] = sides {
+            return Tree::Side(*side);
+        }
+        let at = 1 + rng.below(sides.len() as u64 - 1) as usize;
+        Tree::And(
+            Box::new(Tree::any(&sides[..at], rng)),
+            Box::new(Tree::any(&sides[at..], rng)),
+        )
+    }
+
+    fn build(&self, lookup: &impl Fn(usize) -> Matches<Spread>) -> Matches<Spread> {
+        match self {
+            Tree::Side(side) => lookup(*side),
+            Tree::And(left, right) => left.build(lookup).and(right.build(lookup)),
+        }
+    }
+}
+
+fn walked_sides(plan: &Explain) -> Vec<usize> {
+    plan.sides
+        .iter()
+        .enumerate()
+        .filter(|(_, side)| side.read == Read::Walked)
+        .map(|(at, _)| at)
+        .collect()
+}
+
+#[test]
+fn an_and_nested_on_the_right_joins_the_chain_as_its_sides() {
+    let mut rng = Rng::new(89);
+    let (table, rows) = spread_table(&mut rng);
+    let wanted = spread_wanted(&rows);
+    let reversed: Vec<u32> = wanted.iter().rev().copied().collect();
+    let narrow = table.by_narrow(&5).len() as u64;
+    let find = table.find();
+    let lookup = |side: usize| match side % 4 {
+        0 => find.by_wide(&0),
+        1 => find.by_mid(&4),
+        2 => find.by_narrow(&5),
+        _ => table.by_tags_range(..70).into_matches(),
+    };
+    let flat = |order: &[usize]| {
+        order[1..]
+            .iter()
+            .fold(lookup(order[0]), |all, side| all.and(lookup(*side)))
+    };
+    for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 3, 0, 1], [1, 3, 0, 2]] {
+        let plan = flat(&order).explain();
+        assert_eq!(plan.sides.len(), 4, "{order:?}: {plan}");
+        let lead = order.iter().position(|side| *side == 2).unwrap();
+        assert_eq!(walked_sides(&plan), [lead], "{order:?}: {plan}");
+        let (keys, tested) = counted(|| flat(&order).keys().collect::<Vec<_>>());
+        assert_eq!(keys, wanted, "{order:?}");
+        assert!(tested <= narrow, "{order:?}: {tested} tests");
+        for tree in Tree::every(&order) {
+            let nested = || tree.build(&lookup);
+            let what = format!("{tree:?}");
+            assert_eq!(nested().explain(), plan, "{what}:\n{}", nested().explain());
+            let (keys, again) = counted(|| nested().keys().collect::<Vec<_>>());
+            assert_eq!((keys, again), (wanted.clone(), tested), "{what}");
+            let (back, again) = counted(|| nested().rev().map(|row| row.id).collect::<Vec<_>>());
+            assert_eq!((back, again), (reversed.clone(), tested), "{what}");
+            let (both, again) = counted(|| alternate(nested().keys()));
+            assert_eq!((both, again), (wanted.clone(), tested), "{what}");
+            let covered: Vec<u32> = nested().covered().map(|(key, ())| key).collect();
+            assert_eq!(covered, wanted, "{what}");
+        }
+    }
+
+    for count in [12, 64] {
+        let sides: Vec<usize> = (0..count).collect();
+        let plan = flat(&sides).explain();
+        assert_eq!(plan.sides.len(), count, "{plan}");
+        let narrows: Vec<usize> = sides.iter().copied().filter(|side| side % 4 == 2).collect();
+        assert_eq!(walked_sides(&plan), narrows, "{plan}");
+        let (keys, tested) = counted(|| flat(&sides).keys().collect::<Vec<_>>());
+        assert_eq!(keys, wanted);
+        let ranges = count as u64 / 4;
+        assert!(
+            tested <= narrow * ranges,
+            "{tested} tests by {ranges} ranges"
+        );
+        let mut trees = vec![Tree::right(&sides)];
+        for _ in 0..12 {
+            trees.push(Tree::any(&sides, &mut rng));
+        }
+        for tree in &trees {
+            let nested = || tree.build(&lookup);
+            let what = format!("{tree:?}");
+            assert_eq!(nested().explain(), plan, "{what}:\n{}", nested().explain());
+            let (keys, again) = counted(|| nested().keys().collect::<Vec<_>>());
+            assert_eq!((keys, again), (wanted.clone(), tested), "{what}");
+            let back: Vec<u32> = nested().rev().map(|row| row.id).collect();
+            assert_eq!(back, reversed, "{what}");
+        }
+    }
+
+    let sides: Vec<usize> = (0..70).collect();
+    let plan = flat(&sides).explain();
+    assert_eq!(plan.sides.len(), 7, "{plan}");
+    assert_eq!(
+        (plan.sides[0].step, plan.sides[0].sides.len()),
+        (Step::And, 64)
+    );
+    let mut trees = vec![Tree::right(&sides)];
+    for _ in 0..12 {
+        trees.push(Tree::any(&sides, &mut rng));
+    }
+    for tree in &trees {
+        let nested = || tree.build(&lookup);
+        let what = format!("{tree:?}");
+        assert_eq!(nested().keys().collect::<Vec<_>>(), wanted, "{what}");
+        let back: Vec<u32> = nested().rev().map(|row| row.id).collect();
+        assert_eq!(back, reversed, "{what}");
+        let covered: Vec<u32> = zigzag(nested().covered().map(|(key, ())| key), &mut rng);
+        assert_eq!(covered, wanted, "{what}");
+    }
+
+    let narrower: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.wide == 0 && row.mid == 4 && (row.narrow == 5 || row.narrow == 6))
+        .map(|row| row.id)
+        .collect();
+    let either = || find.by_narrow(&5).or(find.by_narrow(&6));
+    let flat = || find.by_wide(&0).and(find.by_mid(&4)).and(either());
+    let nested = || find.by_wide(&0).and(find.by_mid(&4).and(either()));
+    let plan = nested().explain();
+    assert_eq!(plan, flat().explain(), "{plan}");
+    assert_eq!(plan.sides.len(), 3, "{plan}");
+    assert_eq!(
+        (plan.sides[2].step, plan.sides[2].read),
+        (Step::Or, Read::Walked)
+    );
+    assert_eq!(nested().keys().collect::<Vec<_>>(), narrower);
+    assert_eq!(
+        nested().rev().map(|row| row.id).collect::<Vec<_>>(),
+        narrower.iter().rev().copied().collect::<Vec<_>>()
+    );
+    let ored = || {
+        find.by_wide(&0).and(
+            find.by_mid(&4)
+                .and(find.by_narrow(&5))
+                .or(find.by_narrow(&6)),
+        )
+    };
+    let plan = ored().explain();
+    assert_eq!(plan.sides.len(), 2, "{plan}");
+    assert_eq!(plan.sides[1].step, Step::Or, "{plan}");
+    assert_eq!(plan.sides[1].sides[0].step, Step::And, "{plan}");
+    let wanted_ored: Vec<u32> = rows
+        .iter()
+        .filter(|row| row.wide == 0 && (row.mid == 4 && row.narrow == 5 || row.narrow == 6))
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(ored().keys().collect::<Vec<_>>(), wanted_ored);
+}
+
+#[test]
+fn an_and_nested_on_the_right_of_another_version_filters_the_left_rows() {
+    let mut rng = Rng::new(91);
+    let (table, rows) = spread_table(&mut rng);
+    let mut newer = table.clone();
+    let mut changed = rows.clone();
+    for row in changed.iter_mut().step_by(3) {
+        row.wide = 1 - row.wide;
+        row.tags = Counted(vec![99 - row.tags.0[0]]);
+        newer.insert(row.clone());
+    }
+    for (left, left_rows, right, right_rows) in [
+        (&table, &rows, &newer, &changed),
+        (&newer, &changed, &table, &rows),
+    ] {
+        let wanted: Vec<Spread> = left_rows
+            .iter()
+            .filter(|row| row.narrow == 5 && row.mid == 4)
+            .filter(|row| {
+                let other = &right_rows[row.id as usize];
+                other.wide == 0 && other.tags.0[0] < 70
+            })
+            .cloned()
+            .collect();
+        let ids: Vec<u32> = wanted.iter().map(|row| row.id).collect();
+        let flat = || {
+            left.find()
+                .by_narrow(&5)
+                .and(right.find().by_wide(&0))
+                .and(right.by_tags_range(..70).into_matches())
+                .and(left.find().by_mid(&4))
+        };
+        let nested = || {
+            left.find().by_narrow(&5).and(
+                right.find().by_wide(&0).and(
+                    right
+                        .by_tags_range(..70)
+                        .into_matches()
+                        .and(left.find().by_mid(&4)),
+                ),
+            )
+        };
+        let plan = nested().explain();
+        assert_eq!(plan.sides.len(), 4, "{plan}");
+        assert_eq!(walked_sides(&plan), [0], "{plan}");
+        assert_eq!(walked_sides(&flat().explain()), [0], "{plan}");
+        assert_eq!(plan.sides[2].read, Read::Tested, "{plan}");
+        let read: Vec<Spread> = nested().map(|row| (*row).clone()).collect();
+        assert_eq!(read, wanted);
+        let mut back: Vec<Spread> = nested().rev().map(|row| (*row).clone()).collect();
+        back.reverse();
+        assert_eq!(back, wanted);
+        assert_eq!(nested().keys().collect::<Vec<_>>(), ids);
+        assert_eq!(flat().keys().collect::<Vec<_>>(), ids);
+        let mut lent = Vec::new();
+        nested().visit(|row| lent.push(row.clone()));
+        assert_eq!(lent, wanted);
+    }
 }
 
 fn explained_alike(
@@ -1644,6 +1902,116 @@ fn started_chain_agrees(versions: &[Version<'_>], query: &Query, rng: &mut Rng) 
         read, wanted,
         "covered after starting group {group} and {query:?}, {front} then {back}"
     );
+}
+
+fn regrouped(links: &[&Query], rng: &mut Rng) -> Query {
+    if let [link] = links {
+        return (*link).clone();
+    }
+    let at = 1 + rng.below(links.len() as u64 - 1) as usize;
+    Query::And(
+        Box::new(regrouped(&links[..at], rng)),
+        Box::new(regrouped(&links[at..], rng)),
+    )
+}
+
+fn planned_alike(flat: &Explain, nested: &Explain) -> bool {
+    let read = |plan: &Explain| match (plan.step, plan.read) {
+        (Step::Range, Read::Tested) => Read::Collected,
+        (_, read) => read,
+    };
+    flat.step == nested.step
+        && flat.keys == nested.keys
+        && read(flat) == read(nested)
+        && flat.sides.len() == nested.sides.len()
+        && flat
+            .sides
+            .iter()
+            .zip(&nested.sides)
+            .all(|(flat, nested)| planned_alike(flat, nested))
+}
+
+fn nested_agrees(versions: &[Version<'_>], query: &Query, exact: bool, rng: &mut Rng) {
+    let tables = tables_of(versions);
+    let nested = regrouped(&query.links(), rng);
+    let group = rng.below(4) as u8;
+    let find = tables[0].find();
+    let plans = [
+        (
+            query.lookup_in(&tables, 0).explain(),
+            nested.lookup_in(&tables, 0).explain(),
+        ),
+        (
+            find.by_group(&group)
+                .and(query.lookup_in(&tables, 0))
+                .explain(),
+            find.by_group(&group)
+                .and(nested.lookup_in(&tables, 0))
+                .explain(),
+        ),
+    ];
+    for (flat, plan) in &plans {
+        let what = format!("{nested:?}\nflat:\n{flat}\nnested:\n{plan}");
+        assert_eq!(walked_sides(plan), walked_sides(flat), "{what}");
+        if exact {
+            assert_eq!(plan, flat, "{what}");
+        } else {
+            assert!(planned_alike(flat, plan), "{what}");
+        }
+    }
+    agree_in(versions, &nested, rng);
+    let (_, model) = versions[0];
+    let rows = query.rows(versions, 0);
+    let wanted: Vec<(u32, (u16, u8))> = model
+        .values()
+        .filter(|row| row.group == group && rows.contains_key(&row.id))
+        .map(|row| (row.id, (row.score, row.band)))
+        .collect();
+    let covered: Vec<(u32, (u16, u8))> = zigzag(
+        find.by_group(&group)
+            .and(nested.lookup_in(&tables, 0))
+            .covered(),
+        rng,
+    );
+    assert_eq!(covered, wanted, "covered group {group} and {nested:?}");
+    let read: Vec<(u32, (u16, u8))> = find
+        .by_group(&group)
+        .and(nested.lookup_in(&tables, 0))
+        .rev()
+        .map(|row| (row.id, (row.score, row.band)))
+        .collect();
+    let reversed: Vec<(u32, (u16, u8))> = wanted.iter().rev().copied().collect();
+    assert_eq!(read, reversed, "rows of group {group} and {nested:?}");
+}
+
+#[test]
+fn nested_ands_plan_and_read_as_the_chain_written_flat() {
+    for seed in 0..u64::from(common::cases(32)) {
+        let mut rng = Rng::new(seed ^ 0xa11);
+        let shape = if seed % 2 == 0 { WIDE } else { NARROW };
+        let count = 200 + rng.below(1500) as u32;
+        let model = model(&mut rng, count, shape);
+        let table = table_of(&model);
+        let (newer, changed) = edited(&mut rng, &table, &model, shape);
+        let versions = [(&table, &model), (&newer, &changed)];
+        let ids = ids_in(&versions);
+        for _ in 0..30 {
+            let count = 1 + rng.below(2) as usize;
+            let query = match rng.below(3) {
+                0 | 1 => chain(&mut rng, ids, shape, count),
+                _ => query(&mut rng, ids, shape, 3, count),
+            };
+            nested_agrees(&versions[..count], &query, count == 1, &mut rng);
+        }
+        let (_dir, db) = stored_pair(&table, &newer);
+        let read = db.read();
+        let stored = [(&read.rows, &model), (&read.other, &changed)];
+        for _ in 0..10 {
+            let count = 1 + rng.below(2) as usize;
+            let query = chain(&mut rng, ids, shape, count);
+            nested_agrees(&stored[..count], &query, false, &mut rng);
+        }
+    }
 }
 
 fn tagged_table(rows: u32, seed: u64) -> (Table<Tagged>, Vec<Tagged>) {

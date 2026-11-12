@@ -166,14 +166,15 @@ keys is looked up in the larger, so 10 keys against 100,000 take 1.5 µs where w
 Every lookup knows how many keys it holds as soon as it is built, counted from the counts the
 index's nodes keep, without reading its entries, and a combination picks how to read its lookups
 from those counts the first time it is read, not from the order you wrote them in. A chain of `and`,
-such as `a.and(b).and(c)`, is one `and` of up to eight lookups: the one with the fewest keys leads,
+such as `a.and(b).and(c)`, is one `and` of up to 64 lookups: the one with the fewest keys leads,
 those with less than four times its keys are walked beside it, and the rest are looked up, fewest
 keys first, each only for a key every lookup before it holds. Written in another order, a chain
-yields the rows and covered fields of its leftmost lookup, and costs the same. On 200,000 rows,
-measured on 2026-11-11, a lookup of 100,000 keys, then one of 1,000, then one of 1,000 took 12 µs
-where they took 47 µs before chains were planned, as long as written smallest first. `explain()`
-shows the plan without reading anything, one line a lookup, each side indented below its `and` or
-`or`:
+yields the rows and covered fields of its leftmost lookup, and costs the same, and an `and` nested
+on the right, as in `a.and(b.and(c))`, joins the chain as its lookups, so it plans as
+`a.and(b).and(c)` does. On 200,000 rows, measured on 2026-11-11, a lookup of 100,000 keys, then one
+of 1,000, then one of 1,000 took 12 µs where they took 47 µs before chains were planned, as long as
+written smallest first. `explain()` shows the plan without reading anything, one line a lookup,
+each side indented below its `and` or `or`:
 
 ```rust
 let find = shop.orders.find();
@@ -193,8 +194,8 @@ and, at most 12 keys, walked
   range, 9124 keys, tested
 ```
 
-A lookup made with `and` on a combination already read from, or nested on the right as in
-`a.and(b.and(c))`, is planned on its own, as one side.
+An `or`, and a combination already read from, joins a chain as one side, planned on its own, and
+a chain of 64 lookups given another becomes one side of a new chain.
 
 `and` takes any lookup and keeps the covered fields of its left side, but `or` yields a key that
 only its right side holds with that side's covered fields, so it compiles only when both sides cover
@@ -237,15 +238,16 @@ measurements.
 A range written first, as `orders.by_day_range(first..=last).into_matches().and(...)`, is tested
 too when another side of the `and` reads the same table at the same version, since the combination
 reads its rows through the range's own finder and the range borrows that side's. That side can be
-an `or` or another `and`, which lends the finder of a range it reads in full; only a side whose
-every range is itself tested has none to lend. 10 keys against a range of 100,000 written that way
-took 1.4 µs, where it had taken 2.4 ms. Of two ranges, the one with fewer keys leads and the other
-is tested. In a chain, the keys led to a range are estimated from the lookups walked before it, as
-if they matched independently, so two lookups of 50,000 keys that share 12,500 and a range of
-100,000 took 3.0 ms where they took 4.6 ms with the range read in full. A range tests each key led
-to it once, from whichever end the combination is read, so the tests stop once they number a
-quarter of the range's keys only when the estimate was too low, and then cost about what reading
-the range would, as rows read from the file do.
+an `or`, which lends the finder of a range it reads in full, and only a side whose every range is
+itself tested has none to lend. A lookup of an `and` nested on the right lends like any other side
+of the chain, as long as the nested `and`'s first lookup reads that table at that version as well.
+10 keys against a range of 100,000 written that way took 1.4 µs, where it had taken 2.4 ms. Of two
+ranges, the one with fewer keys leads and the other is tested. In a chain, the keys led to a range
+are estimated from the lookups walked before it, as if they matched independently, so two lookups
+of 50,000 keys that share 12,500 and a range of 100,000 took 3.0 ms where they took 4.6 ms with the
+range read in full. A range tests each key led to it once, from whichever end the combination is
+read, so the tests stop once they number a quarter of the range's keys only when the estimate was
+too low, and then cost about what reading the range would, as rows read from the file do.
 
 Lookups of two tables of the same row type, or of two versions of one table, such as a snapshot's
 and the one inside a commit, combine as well. Each answers for the table and version it was made

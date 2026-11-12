@@ -2461,18 +2461,19 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for Matches<T, C> {
 /// of similar size are walked side by side. When one side of an `and` has at least four times the
 /// keys of the other, only the smaller is walked and each of its keys is looked up in the larger,
 /// so a few keys against many cost a few searches. A chain such as `a.and(b).and(c)` is one `and`
-/// of up to eight sides: the side with the fewest keys leads, those within four times its keys are
-/// walked beside it, and the rest are searched, fewest keys first, each only for a key every
-/// side before it holds. The order the chain was written in decides only which side's rows and
-/// covered fields it yields, and which of two sides with as many keys leads. A range or prefix
-/// lookup on the table is not in key order,
-/// so it is searched by reading the row of each key and testing it against the range, and when it
-/// has less than four times the keys led to it it is read in full and sorted instead, as
-/// [`IntoMatches`] describes. In a chain, the keys led to a range are estimated from the counts of
-/// the sides walked before it, as if they matched independently. The choices are made when the
-/// combination is first read, from the number of keys each lookup counts in its index, and
-/// [`explain`](Matches::explain) shows them. A combination reads the indexes and rows as they were
-/// when its lookups were built.
+/// of up to 64 sides, however its `and`s nest, as in `a.and(b.and(c))`: the side with the fewest
+/// keys leads, those within four times its keys are walked beside it, and the rest are searched,
+/// fewest keys first, each only for a key every side before it holds. The order the chain was
+/// written in decides only which side's rows and covered fields it yields, and which of two sides
+/// with as many keys leads. An `or`, and a combination already read from, is one side of a chain,
+/// and a chain of 64 sides given another becomes one side of a new chain. A range or prefix lookup
+/// on the table is not in key order, so it is searched by reading the row of each key and testing
+/// it against the range, and when it has less than four times the keys led to it it is read in
+/// full and sorted instead, as [`IntoMatches`] describes. In a chain, the keys led to a range are
+/// estimated from the counts of the sides walked before it, as if they matched independently. The
+/// choices are made when the combination is first read, from the number of keys each lookup counts
+/// in its index, and [`explain`](Matches::explain) shows them. A combination reads the indexes and
+/// rows as they were when its lookups were built.
 ///
 /// [`keys`](Matches::keys) gives the keys alone and [`covered`](Matches::covered) the covered
 /// fields of the leftmost lookup, so a combination whose first index covers what you show reads
@@ -2573,12 +2574,15 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
     /// `other` can be any [`IntoMatches`], so a range or prefix lookup on the table joins too,
     /// tested key by key when the keys led to it are at most a quarter of its own and read in full
     /// and sorted otherwise. When this combination is itself an `and` not yet read, `other` joins
-    /// it as one more side, up to eight, so a chain of `and` is led by its smallest side whatever
-    /// the order, as [`Matches`] describes. The result keeps this side's covered fields, and reads
-    /// each row from this side. `other` may be a lookup of another table, or of another version of
-    /// this one: it matches the keys its own table holds, and decides only which of this side's
-    /// rows are yielded. If this combination has already yielded rows, what it has left is read
-    /// into a sorted list first.
+    /// it as one more side, and when `other` is an `and` not yet read, each of its sides joins, up
+    /// to 64 sides in all, so `a.and(b.and(c))` is the chain `a.and(b).and(c)`, and a chain of
+    /// `and` is led by its smallest side whatever the order and nesting it was written in, as
+    /// [`Matches`] describes. An `or` joins as one side, and a chain of 64 sides given another
+    /// becomes one side of a new chain. The result keeps this side's covered fields, and reads each
+    /// row from this side. `other` may be a lookup of another table, or of another version of this
+    /// one: it matches the keys its own table holds, and decides only which of this side's rows are
+    /// yielded. If either combination has already yielded rows, what it has left is read into a
+    /// sorted list first, which joins as one side.
     ///
     /// # Examples
     ///
@@ -2613,19 +2617,21 @@ impl<T: Record, C: Send + 'static> Matches<T, C> {
             && right.more.is_none()
             && (left.stream.ranges() || right.stream.ranges())
             && left.rows.same_map(&right.rows);
-        let (right, spare) = right.adopted();
+        let (mut right, spare) = right.adopted();
         if same
             && let Some(rows) = spare
             && left.stream.wants()
         {
             left.stream.adopt(&mut Spare(Some(Box::new(rows))));
         }
-        let stream = match left
-            .stream
-            .join(Box::new(Blind(right)), same, left.rows.len())
-        {
-            None => left.stream,
-            Some(right) => Box::new(All::new(left.stream, right, alone, same)),
+        let total = left.rows.len();
+        let stream = match right.split() {
+            None => chained(left.stream, Box::new(Blind(right)), alone, same, total),
+            Some(sides) => sides
+                .into_iter()
+                .fold(left.stream, |stream, (side, shared)| {
+                    chained(stream, side, alone, same && shared, total)
+                }),
         };
         Matches {
             rows: left.rows,
@@ -3039,8 +3045,9 @@ impl<T: Record, C> DoubleEndedIterator for MatchCovered<T, C> {
 /// [`Matches::explain`].
 ///
 /// A lookup has no [`sides`](Explain::sides), and an `and` or an `or` has one for each lookup or
-/// combination it was given, left first. `Display` prints the tree one step a line, each side
-/// indented below the step it belongs to.
+/// combination it was given, left first, where an `and` not yet read given to an `and` counts as
+/// its own sides. `Display` prints the tree one step a line, each side indented below the step it
+/// belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Explain {
     /// What the step is.
@@ -3218,6 +3225,9 @@ trait Stream<K, C>: Send {
         _total: usize,
     ) -> Option<Box<dyn Stream<K, ()>>> {
         Some(right)
+    }
+    fn split(&mut self) -> Option<Vec<Side<K>>> {
+        None
     }
     fn explain(&self, role: Role, offered: bool) -> Explain;
 }
@@ -3987,6 +3997,19 @@ impl<K: 'static, X: 'static> Stream<K, ()> for Blind<K, X> {
         self.0.ranges()
     }
 
+    fn join(
+        &mut self,
+        right: Box<dyn Stream<K, ()>>,
+        same: bool,
+        total: usize,
+    ) -> Option<Box<dyn Stream<K, ()>>> {
+        self.0.join(right, same, total)
+    }
+
+    fn split(&mut self) -> Option<Vec<Side<K>>> {
+        self.0.split()
+    }
+
     fn explain(&self, role: Role, offered: bool) -> Explain {
         self.0.explain(role, offered)
     }
@@ -4004,7 +4027,9 @@ const RATIO: usize = 4;
 
 const FRESH: u64 = 64;
 
-const SIDES: usize = 8;
+const SIDES: usize = 64;
+
+type Side<K> = (Box<dyn Stream<K, ()>>, bool);
 
 struct All<K, C> {
     left: Box<dyn Stream<K, C>>,
@@ -4014,7 +4039,7 @@ struct All<K, C> {
     settled: [bool; 2],
     covering: bool,
     landed: Option<K>,
-    shared: u8,
+    shared: u64,
     ordered: bool,
     order: [u8; SIDES],
     walks: usize,
@@ -4057,6 +4082,20 @@ macro_rules! seen {
             }
         }
     };
+}
+
+#[inline]
+fn chained<K: Data + Ord, C: Send + 'static>(
+    mut left: Box<dyn Stream<K, C>>,
+    right: Box<dyn Stream<K, ()>>,
+    alone: bool,
+    same: bool,
+    total: usize,
+) -> Box<dyn Stream<K, C>> {
+    match left.join(right, same, total) {
+        None => left,
+        Some(right) => Box::new(All::new(left, right, alone, same)),
+    }
 }
 
 fn estimate(candidates: usize, len: usize, total: usize) -> usize {
@@ -4174,7 +4213,7 @@ impl<K: Data + Ord, C> All<K, C> {
             settled: [false, false],
             covering: false,
             landed: None,
-            shared: u8::from(alone) | u8::from(same) << 1,
+            shared: u64::from(alone) | u64::from(same) << 1,
             ordered: false,
             order: [0; SIDES],
             walks: 0,
@@ -4476,7 +4515,7 @@ impl<K: Data + Ord, C> All<K, C> {
     }
 }
 
-impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
+impl<K: Data + Ord, C: Send + 'static> Stream<K, C> for All<K, C> {
     fn len(&self) -> usize {
         self.more
             .iter()
@@ -4650,10 +4689,31 @@ impl<K: Data + Ord, C: Send> Stream<K, C> for All<K, C> {
         if self.plan.is_some() || self.ordered || sides == SIDES {
             return Some(right);
         }
-        self.shared |= u8::from(same) << sides;
+        self.shared |= u64::from(same) << sides;
         self.more.push(right);
         self.total = total;
         None
+    }
+
+    fn split(&mut self) -> Option<Vec<Side<K>>> {
+        if self.plan.is_some() || self.ordered {
+            return None;
+        }
+        let left: Box<dyn Stream<K, C>> = Box::new(Listed::ready(VecDeque::new()));
+        let right: Box<dyn Stream<K, ()>> = Box::new(Listed::ready(VecDeque::new()));
+        let left = std::mem::replace(&mut self.left, left);
+        let right = std::mem::replace(&mut self.right, right);
+        let mut sides = Vec::with_capacity(self.sides());
+        sides.push((
+            Box::new(Blind(left)) as Box<dyn Stream<K, ()>>,
+            self.shares(0),
+        ));
+        sides.push((right, self.shares(1)));
+        let more = std::mem::take(&mut self.more);
+        for (at, side) in more.into_iter().enumerate() {
+            sides.push((side, self.shares(at + 2)));
+        }
+        Some(sides)
     }
 
     fn explain(&self, role: Role, offered: bool) -> Explain {

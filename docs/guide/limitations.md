@@ -77,13 +77,14 @@ This is an experiment, not a production database.
   clone up to 3.3 MB in a release build, so a type meant to hold long chains should drop them in a
   loop, as described under [Nesting depth](../internals/storage.md#nesting-depth).
 - Query planning goes by counts alone. You choose the indexes, and `and` and `or` combine lookups
-  by key. A chain of `and` is led by the lookup with the fewest keys, counted from its index, and
-  looks the others up fewest first, but it holds at most eight lookups, and `a.and(b.and(c))` plans
-  `b.and(c)` on its own. The keys several walked lookups share are estimated as if they matched
-  independently. A range or prefix lookup tests the keys led to it by reading their rows when they
-  are a quarter of its keys or fewer, and joins otherwise only after its keys are read and sorted,
-  and a factor of four decides both, whatever the rows cost to read. Each matching row is read
-  separately unless the index covers the fields it needs, as described under [Combining
+  by key. A chain of `and`, however it nests, is led by the lookup with the fewest keys, counted
+  from its index, and looks the others up fewest first, but it holds at most 64 lookups, and an
+  `or`, or a combination already read from, is one lookup of the chain, planned on its own. The
+  keys several walked lookups share are estimated as if they matched independently. A range or
+  prefix lookup tests the keys led to it by reading their rows when they are a quarter of its keys
+  or fewer, and joins otherwise only after its keys are read and sorted, and a factor of four
+  decides both, whatever the rows cost to read. Each matching row is read separately unless the
+  index covers the fields it needs, as described under [Combining
   lookups](tables.md#combining-lookups) and [Lookups](tables.md#lookups).
 
 Each subsystem's own limits are in the internals: [sync](../internals/sync.md#limits),
