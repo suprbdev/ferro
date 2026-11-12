@@ -10,7 +10,10 @@ use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Rng, cases, fast, padded_links, spread_into, spread_of, text};
+use common::{
+    Rng, Sent, cases, fast, node_body, padded_links, push_varint, resent, sharing_one_value,
+    spread_into, spread_of, text,
+};
 use ferro::codec::{Encoder, HashSink, Object};
 use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Store, StoreOptions, Trace};
@@ -7287,5 +7290,149 @@ fn a_remote_landed_again_through_a_merge_keeps_the_merged_history_a_pass_cut_by_
         assert_eq!(counts, expected, "{stage}");
         c.verify_typed()
             .unwrap_or_else(|error| panic!("{stage} merged: {error}"));
+    }
+}
+
+const PAST_HELD: usize = 3 * 1024 + 7;
+
+fn widen(objects: &mut [Sent], keys: &[u64], summaries: Option<&[u64]>) {
+    let [spilled, node, root, _] = objects else {
+        unreachable!("a value, a node, a root and a commit");
+    };
+    let two = summaries.map(|summaries| &summaries[..2]);
+    assert_eq!(node.body, node_body(&keys[..2], two));
+    let mut counted = Vec::new();
+    push_varint(&mut counted, 2);
+    if let Some(two) = two {
+        push_varint(&mut counted, two[0].wrapping_add(two[1]));
+    }
+    assert_eq!(root.body, counted);
+    node.body = node_body(keys, summaries);
+    node.links = vec![(1, None); keys.len()];
+    spilled.uses = keys.len() as u64;
+    root.body.clear();
+    push_varint(&mut root.body, keys.len() as u64);
+    if let Some(summaries) = summaries {
+        let total = summaries
+            .iter()
+            .fold(0u64, |sum, one| sum.wrapping_add(*one));
+        push_varint(&mut root.body, total);
+    }
+}
+
+#[test]
+fn a_node_with_more_links_than_a_check_holds_lands_and_a_bad_one_past_them_is_refused() {
+    let value = text(9, 600);
+    let (head, mut objects, keys) = sharing_one_value::<()>(PAST_HELD);
+    widen(&mut objects, &keys, None);
+    let dir = tempfile::tempdir().unwrap();
+    let b = open(&dir, "b.ferro");
+    let pulled = b.receive("a", &resent(&head, &objects), refuse).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let landed = b.read();
+    assert_eq!(landed.len(), PAST_HELD);
+    assert_eq!(landed.get(&keys[PAST_HELD - 1]).as_deref(), Some(&value));
+    b.verify_typed().unwrap();
+
+    let mut sink = HashSink;
+    let mut encoder = Encoder::new(&mut sink);
+    "short".to_string().encode(&mut encoder).unwrap();
+    let short = encoder.into_object().body;
+    objects[0].uses -= 1;
+    objects[1].links[2_500] = (2, None);
+    let short = Sent {
+        body: short,
+        links: Vec::new(),
+        uses: 1,
+    };
+    objects.insert(0, short);
+    let c = open(&dir, "c.ferro");
+    match c.receive("a", &resent(&head, &objects), refuse) {
+        Err(Error::Bundle(message)) => assert!(message.contains("stored apart"), "{message}"),
+        other => panic!("accepted a value too short to spill past the first links: {other:?}"),
+    }
+    assert_eq!(c.version(), 0);
+}
+
+#[test]
+fn a_summarized_node_with_more_links_than_a_check_holds_is_held_to_each_entry() {
+    type Spilled = Map<u64, String, Sum>;
+    let unmerged = |_: &mut Spilled,
+                    _: &Snapshot<Spilled>,
+                    _: &Snapshot<Spilled>|
+     -> (String, ()) { panic!("no merge expected") };
+    let (head, mut objects, keys) = sharing_one_value::<Sum>(PAST_HELD);
+    let mut summaries: Vec<u64> = keys.iter().map(|key| key * 3 + 600).collect();
+    let mut honest = Vec::new();
+    for object in &objects {
+        honest.push(Sent {
+            body: object.body.clone(),
+            links: object.links.clone(),
+            uses: object.uses,
+        });
+    }
+    widen(&mut honest, &keys, Some(&summaries));
+    let dir = tempfile::tempdir().unwrap();
+    let b: Db<Spilled> = fast().open(dir.path().join("b.ferro")).unwrap();
+    let pulled = b.receive("a", &resent(&head, &honest), unmerged).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let total = summaries
+        .iter()
+        .fold(0u64, |sum, one| sum.wrapping_add(*one));
+    assert_eq!(b.read().summary(), Some(Sum(total)));
+    b.verify_typed().unwrap();
+
+    summaries[2_500] += 1;
+    widen(&mut objects, &keys, Some(&summaries));
+    let c: Db<Spilled> = fast().open(dir.path().join("c.ferro")).unwrap();
+    match c.receive("a", &resent(&head, &objects), unmerged) {
+        Err(Error::Bundle(message)) => {
+            assert!(message.contains("not the fold of its entries"), "{message}")
+        }
+        other => panic!("accepted a forged summary past the first links: {other:?}"),
+    }
+    assert_eq!(c.version(), 0);
+}
+
+#[derive(Data, Clone, Default)]
+struct ShelvedPeer {
+    rows: Vec<shadow::Shadow>,
+}
+
+#[derive(Data, Clone, Default)]
+struct ShelvedMine {
+    rows: Vec<Table<shadow::Row>>,
+}
+
+#[test]
+fn a_table_past_the_links_a_check_holds_is_held_to_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let honest = shadow::Shadow::of(&shadow::honest());
+    let shelves = 1_500;
+    let peer: Db<ShelvedPeer> = fast().open(dir.path().join("peer.ferro")).unwrap();
+    let mine: Db<ShelvedMine> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    peer.update(|root| root.rows = vec![honest.clone(); shelves])
+        .unwrap();
+    assert_eq!(
+        from_peer(&mine, &peer).unwrap().outcome,
+        Outcome::FastForward
+    );
+    assert_eq!(mine.read().rows[shelves - 1].key_by_email(&400), Some(3));
+    mine.verify_typed().unwrap();
+
+    for (case, forged) in shadow::forgeries() {
+        let peer: Db<ShelvedPeer> = fast()
+            .open(dir.path().join(format!("{case}.ferro")))
+            .unwrap();
+        let fresh: Db<ShelvedMine> = fast()
+            .open(dir.path().join(format!("{case}-mine.ferro")))
+            .unwrap();
+        peer.update(|root| {
+            root.rows = vec![honest.clone(); shelves];
+            root.rows[shelves - 1] = forged;
+        })
+        .unwrap();
+        assert_disagrees(from_peer(&fresh, &peer), &fresh, case);
+        assert_eq!(fresh.version(), 0, "{case}");
     }
 }

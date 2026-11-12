@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::time::Instant;
 
-use common::{Tripwire, fast, text};
+use common::{Sent, Tripwire, fast, node_body, resent, sharing_one_value, text};
 use ferro::{
     Bundle, Data, Db, Error, Keep, Map, Outcome, Reclaim, Record, Snapshot, Summary, Table,
 };
@@ -211,6 +211,26 @@ fn claims_links_never_made() -> Bundle {
     Bundle::from(out)
 }
 
+fn shares_one_spilled_value(count: usize) -> Bundle {
+    let (head, mut objects, keys) = sharing_one_value::<()>(count);
+    let [spilled, node, root, _] = &mut objects[..] else {
+        unreachable!("a value, a node, a root and a commit");
+    };
+    assert_eq!(node.body, node_body(&keys[..2], None));
+    node.body = node_body(&keys, None);
+    node.links = vec![(1, None); count];
+    spilled.uses = count as u64;
+    root.body.clear();
+    varint(&mut root.body, count as u64);
+    let unlinked = Sent {
+        body: Vec::new(),
+        links: Vec::new(),
+        uses: 0,
+    };
+    objects.insert(0, unlinked);
+    resent(&head, &objects)
+}
+
 #[test]
 fn hostile_bundles_cost_memory_in_proportion_to_what_they_carry() {
     let dir = tempfile::tempdir().unwrap();
@@ -236,6 +256,11 @@ fn hostile_bundles_cost_memory_in_proportion_to_what_they_carry() {
             3,
         ),
         ("links claimed and never made", claims_links_never_made(), 3),
+        (
+            "a node of a million keys sharing one spilled value",
+            shares_one_spilled_value(MIB),
+            3,
+        ),
     ];
     for (name, bundle, ratio) in cases {
         let len = bundle.as_bytes().len();

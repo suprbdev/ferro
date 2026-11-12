@@ -24,8 +24,8 @@ use hashbrown::HashTable;
 use hashbrown::hash_table as table;
 
 use crate::codec::{
-    Checks, Claim, Data, Decoder, FoundTable, HASH_BYTES, Hash, Kind, Object, PairRoots, Paired,
-    Pairing, Plans, Ptr, Recalled, Shape, Tables, pair_roots, push_varint,
+    Checks, Claim, Data, Decoder, Finding, FoundTable, HASH_BYTES, Hash, Kind, Object, PairRoots,
+    Paired, Pairing, Plans, Ptr, Recalled, Shape, Tables, Walks, pair_roots, push_varint,
 };
 use crate::db::{Db, Head, Refs, Snapshot, now_ms};
 use crate::dense::{self, Column, Hashes, Index, MARKED_MOST, Marked};
@@ -34,8 +34,10 @@ use crate::log::{Chain, Entry, Facts, Merged, Node, disagreement};
 use crate::map::Map;
 use crate::pool::{self, Pool};
 use crate::reentry::{Crossing, Needs};
+use crate::stack;
 use crate::store::{
-    LinkTo, Record, Room, Staging, Store, Together, Txn, compressed, stored_within,
+    LinkTo, Opened, Record, Room, StagedLinks, Staging, Store, Together, Txn, compressed,
+    stored_within,
 };
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
@@ -2293,6 +2295,43 @@ struct Vetting<'a> {
     recalled: Option<Recalled>,
 }
 
+struct Walking<'w, 'a> {
+    vetting: RefCell<&'w mut Vetting<'a>>,
+    links: &'w StagedLinks<'w>,
+    floor: usize,
+    failed: RefCell<Option<Error>>,
+}
+
+impl Walking<'_, '_> {
+    fn check(&self, found: &mut Vec<(usize, Kind)>) -> Result<()> {
+        if found.is_empty() {
+            return Ok(());
+        }
+        let mut vetting = self.vetting.borrow_mut();
+        for (index, kind) in found.drain(..) {
+            let link = self.links.link(index)?;
+            vetting.queue.push((link, kind, None));
+        }
+        stack::with_room(|| vetting.run_above(self.floor))
+            .unwrap_or_else(|| Err(bad("the objects it links nest too deep to check")))
+    }
+}
+
+impl Walks for Walking<'_, '_> {
+    fn walk(&self, found: &mut Vec<(usize, Kind)>) -> Result<()> {
+        let checked = match self.failed.borrow().is_some() {
+            true => Err(bad("checking what it links stopped")),
+            false => self.check(found),
+        };
+        found.clear();
+        if let Err(error) = checked {
+            self.failed.borrow_mut().get_or_insert(error);
+            return Err(bad("checking what it links stopped"));
+        }
+        Ok(())
+    }
+}
+
 fn rejected(error: Error) -> Error {
     match error {
         Error::Decode(message) => bad(message),
@@ -2344,7 +2383,13 @@ fn undecodable(kind: &Kind, error: Error) -> Error {
 
 impl Vetting<'_> {
     fn run(&mut self) -> Result<()> {
-        while let Some((ptr, kind, before)) = self.queue.pop() {
+        self.run_above(0)
+    }
+
+    fn run_above(&mut self, floor: usize) -> Result<()> {
+        while self.queue.len() > floor
+            && let Some((ptr, kind, before)) = self.queue.pop()
+        {
             let shape = match self.staging.find(ptr) {
                 Some(id) => self.sent(id, ptr.hash, &kind, before)?,
                 None => {
@@ -2417,7 +2462,14 @@ impl Vetting<'_> {
             hash,
             offset: self.staging.offset(id),
         };
-        let object = self.staging.read_object(ptr)?;
+        let object = match self.staging.open(ptr, LINKS_HELD)? {
+            Opened::Whole(object) => object,
+            Opened::Body(body, staged) => {
+                let shape = self.dense(id, ptr, kind, &body, &staged)?;
+                self.keep(id, kind, shape, (links, pinned, counted));
+                return Ok(shape);
+            }
+        };
         self.spend(object.body.len())?;
         let tables = RefCell::new(Vec::new());
         let (shape, found, zero_width) = kind
@@ -2451,33 +2503,78 @@ impl Vetting<'_> {
             }
             self.queue.push((object.links[index], child, covered));
         }
-        if shared {
-            let left = if pinned {
-                u8::MAX
-            } else {
-                links - u8::from(counted)
-            };
-            let checks = self.kept.entry(id).or_default();
-            match checks.iter().position(|kept| kept.kinds[0].id == kind.id) {
-                Some(at) if checks[at].left == 0 => {
-                    checks.swap_remove(at);
-                }
-                Some(at) => {
-                    let kinds = &mut checks[at].kinds;
-                    if kinds.len() >= RANGES_KEPT {
-                        kinds.remove(0);
-                    }
-                    kinds.push(kind.clone());
-                }
-                None => checks.push(Kept {
-                    left,
-                    shape,
-                    kinds: vec![kind.clone()],
-                }),
+        self.keep(id, kind, shape, (links, pinned, counted));
+        Ok(shape)
+    }
+
+    fn keep(
+        &mut self,
+        id: u32,
+        kind: &Kind,
+        shape: Shape,
+        (links, pinned, counted): (u8, bool, bool),
+    ) {
+        if links < 2 && !pinned {
+            return;
+        }
+        let left = if pinned {
+            u8::MAX
+        } else {
+            links - u8::from(counted)
+        };
+        let checks = self.kept.entry(id).or_default();
+        match checks.iter().position(|kept| kept.kinds[0].id == kind.id) {
+            Some(at) if checks[at].left == 0 => {
+                checks.swap_remove(at);
             }
-            if checks.is_empty() {
-                self.kept.remove(&id);
+            Some(at) => {
+                let kinds = &mut checks[at].kinds;
+                if kinds.len() >= RANGES_KEPT {
+                    kinds.remove(0);
+                }
+                kinds.push(kind.clone());
             }
+            None => checks.push(Kept {
+                left,
+                shape,
+                kinds: vec![kind.clone()],
+            }),
+        }
+        if checks.is_empty() {
+            self.kept.remove(&id);
+        }
+    }
+
+    fn dense(
+        &mut self,
+        id: u32,
+        ptr: Ptr,
+        kind: &Kind,
+        body: &[u8],
+        links: &StagedLinks<'_>,
+    ) -> Result<Shape> {
+        self.spend(body.len())?;
+        self.credit(id, links.count());
+        let tables = RefCell::new(Vec::new());
+        let floor = self.queue.len();
+        let walking = Walking {
+            vetting: RefCell::new(self),
+            links,
+            floor,
+            failed: RefCell::new(None),
+        };
+        let found = Finding::new(Some(&walking));
+        let checked = kind.check_reading(body, links, Some(&found), Some(&tables));
+        let mut rest = found.into_found();
+        let checked = checked.and_then(|checked| walking.walk(&mut rest).map(|()| checked));
+        if let Some(error) = walking.failed.into_inner() {
+            return Err(error);
+        }
+        let (shape, zero_width) = checked.map_err(|error| undecodable(kind, error))?;
+        self.tables.note(tables.into_inner());
+        self.tally(zero_width)?;
+        if shape.deferred {
+            self.deferred.push((ptr, kind.clone()));
         }
         Ok(shape)
     }
@@ -2498,11 +2595,18 @@ impl Vetting<'_> {
             hash,
             offset: self.staging.offset(id),
         };
-        let object = self.staging.read_object(ptr)?;
-        self.rerun(object.body.len())?;
-        let (shape, _, zero_width) = kind
-            .check(&object.body, &object.links, None)
-            .map_err(|error| undecodable(kind, error))?;
+        let checked = match self.staging.open(ptr, LINKS_HELD)? {
+            Opened::Whole(object) => {
+                self.rerun(object.body.len())?;
+                kind.check(&object.body, &object.links, None)
+                    .map(|(shape, _, zero_width)| (shape, zero_width))
+            }
+            Opened::Body(body, links) => {
+                self.rerun(body.len())?;
+                kind.check_reading(&body, &links, None, None)
+            }
+        };
+        let (shape, zero_width) = checked.map_err(|error| undecodable(kind, error))?;
         self.tally(zero_width)?;
         if shape.deferred {
             self.deferred.push((ptr, kind.clone()));
@@ -2596,8 +2700,14 @@ impl Vetting<'_> {
         let (view, recalled, staging) = (self.view(), self.recalled.as_ref(), self.staging);
         staging.overlaid(view, || {
             for (ptr, kind) in &deferred {
-                let object = staging.read_object(*ptr)?;
-                let checked = kind.recheck(&object.body, &object.links, view, recalled);
+                let checked = match staging.open(*ptr, LINKS_HELD)? {
+                    Opened::Whole(object) => {
+                        kind.recheck(&object.body, &object.links, view, recalled)
+                    }
+                    Opened::Body(body, links) => {
+                        kind.recheck_reading(&body, &links, view, recalled)
+                    }
+                };
                 if let Some(error) = view.overdrawn() {
                     return Err(error);
                 }
@@ -2618,11 +2728,18 @@ impl Vetting<'_> {
         let tables = RefCell::new(Vec::new());
         let (held, zero_width) = match self.staging.find(root) {
             Some(_) => {
-                let object = self.staging.read_object(root)?;
-                let (_, _, zero_width) = self
-                    .root_kind
-                    .check_tables(&object.body, &object.links, &tables)
-                    .map_err(|error| undecodable(self.root_kind, error))?;
+                let checked = match self.staging.open(root, LINKS_HELD)? {
+                    Opened::Whole(object) => self
+                        .root_kind
+                        .check_tables(&object.body, &object.links, &tables)
+                        .map(|(shape, _, zero_width)| (shape, zero_width)),
+                    Opened::Body(body, links) => {
+                        self.root_kind
+                            .check_reading(&body, &links, None, Some(&tables))
+                    }
+                };
+                let (_, zero_width) =
+                    checked.map_err(|error| undecodable(self.root_kind, error))?;
                 (false, zero_width)
             }
             None => {

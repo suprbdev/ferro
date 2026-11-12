@@ -170,7 +170,9 @@ more. An object's body is held whole, about four times over while it is read, co
 arrived uncompressed, as described under [Applying](sync.md#applying), hashed and copied, so the
 largest value sent bounds memory too. Its links are held resolved up to 1,024 of them, 40 KiB, and
 past that only as the bytes they arrived as, a byte or two for a link by place, since its record is
-resolved and written a MiB at a time once they are in. The hashes held for links still to arrive are
+resolved and written a MiB at a time once they are in. The checks read an object of more than 1,024
+links back the same way, its body whole and its links one at a time where its record keeps them, as
+described under [Checking trees](#checking-trees). The hashes held for links still to arrive are
 bounded by what the bundle has carried: once those of the objects later links are said to name, at
 32 bytes each, would take more than the bytes read so far and 4 MiB, the bundle is refused with "it
 says later objects link more of its objects than its size allows". An honest bundle holds far fewer.
@@ -183,7 +185,9 @@ A hostile stream gets no more. 48 distinct objects of 1 MiB took 2.4 MiB of heap
 Two million links by place to one object, 2.1 MB, took 7.4 MB, and sixteen million, 16.8 MB, took
 25.4 MB, where each link used to become a 32-byte pointer and its record was held whole, and two
 million links took 215.5 MB. Two million empty objects that each said a later object would link
-them, 6.3 MB, were refused with 9.0 MB, where the hash kept for each took 220.6 MB.
+them, 6.3 MB, were refused with 9.0 MB, where the hash kept for each took 220.6 MB. A node of a
+million keys that each spill one shared value, 6.3 MB, took 26.8 MB to check, where the check held
+each of its links resolved with the kind it must lead to and took 576.3 MB.
 `hostile_bundles_cost_memory_in_proportion_to_what_they_carry` in `ferro/tests/sync_memory.rs`
 bounds each to three times its length and 20 MiB. A 33 MB stream of 4,549 objects took 5.5 MB, and
 256 commits with 64 KiB messages, 17 MB, took 5.9 MB.
@@ -449,6 +453,54 @@ count, its trusted range lies inside the new one and its trusted parent's level 
 Otherwise the held node is loaded and its leftmost and rightmost keys are found down its edges,
 O(depth). A link to held data of another type is checked below it, as described under [Held data
 linked as another type](#held-data-linked-as-another-type). Anything else rejects the bundle.
+
+An object of more than 1,024 links is not read back whole for its check. Its body is, and its
+links are read one at a time where its record keeps them, from the staging's memory or from the
+file 64 KiB at a time, keeping where every 256th link starts so that going back reads at most 255
+again. The typed links its check finds are walked 1,024 at a time: each batch is checked, with
+everything below it, before the check reads on, so the walk holds a batch of kinds and the links
+they lead to rather than one for each link the object has, and an object of that many links below
+it does the same in its turn, on a segment of stack as decoding moves to one once the thread's
+runs short. A table it holds is noted with its links read again from the record. Its children are
+so checked before its own check ends, and a count or level that does not match what its link
+claims refuses the bundle only once they have been. Reached again under a range no earlier check
+covers, it checks again every child the new check finds, not only those an earlier kind does not
+imply, as it keeps no earlier kinds to compare, and a check that goes back to read part of it
+again, as a summarized node does when an inline value holds a collection, walks again the typed
+links it reads again. Confirming a summary it is linked under, rechecking it once the summaries it
+holds can be recomputed, and finding the tables of a root of that many links read it the same way
+and keep none of its links.
+
+A node of a million keys that each spill one shared value, a bundle of 6.3 MB, used to hold each of
+its links resolved, the kind each must lead to and a worklist entry for each, and took 576.3 MB of
+heap to check and land. It now takes 26.8 MB, most of it the node's body and the list of keys its
+check builds, in 0.18 s against 0.20 s, and one of four million keys, 27.5 MB, 106.4 MB against
+2.3 GB, most of that while its body arrives, as described under [Where checked objects
+wait](#where-checked-objects-wait), at the median of three runs alternating with the build before.
+`a_node_with_more_links_than_a_check_holds_lands_and_a_bad_one_past_them_is_refused`,
+`a_summarized_node_with_more_links_than_a_check_holds_is_held_to_each_entry` and
+`a_table_past_the_links_a_check_holds_is_held_to_its_rows` in `ferro/tests/sync.rs` land objects
+of 3,079 and 4,500 links and refuse each with one bad value, summary or table past its first two
+batches.
+
+Every decoder now carries where to read the links it does not hold and what to hand the typed links
+it finds to, so decoding costs a little more everywhere. Receiving the million objects of the clone
+under [Naming sent objects by their place](sync.md#naming-sent-objects-by-their-place) runs 13.77
+billion instructions against 13.74, 0.3% more, in the same time and heap, a pull of three one-key
+commits into it 3.79 million against 3.80, a pull of two commits, four million keys of a `Set<u32>`
+and 60,000 more, 0.5% more, and a pull of 50 versions of a root that holds 20,000 tables, 8.94
+billion against 8.81, 1.5% more, all in the same heap.
+
+Measured and left out:
+
+- Refusing an object whose links would cost more to check than a multiple of its bytes. The walk
+  held about 550 bytes for each typed link of the node above, against 6 it carried, and an honest
+  root that holds maps or tables carries 2 to 25 bytes for each, so a bound that kept the walk
+  within a few times what an object carries would refuse honest roots, and one loose enough for
+  them would let a node take a hundred times its size.
+- Checking the object again for each batch of its typed links, so that a batch is a range of them
+  rather than what one check has found so far. A check of the node above takes 40 ms, and batches
+  small enough to keep the walk within the node's size take about 60 checks of it, some 2.4 s.
 
 The check costs the bundle, not the database: every sent object is decoded once, plus one read per
 parent on a hint path, the edges of a reused subtree whose range narrowed, and what held data

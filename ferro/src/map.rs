@@ -1179,12 +1179,13 @@ fn entry_summary<K: Data, V: Data, S: Summary<K, V>>(key: &K, r: &mut Decoder<'_
     };
     let start = r.checkpoint();
     V::visit(r)?;
-    let (bytes, links) = r.read_since(start);
+    let visited = r.read_so_far();
+    let links = r.links_since(start)?;
     let mut sink = HashSink;
     let mut encoder = Encoder::reusing(&mut sink, KEY_SCRATCH.take());
     let encoded = key.encode(&mut encoder);
-    encoder.raw(bytes);
-    for link in links {
+    encoder.raw(r.bytes_since(start));
+    for link in links.iter() {
         encoder.link(*link);
     }
     let hash = hash_parts(
@@ -1197,11 +1198,9 @@ fn entry_summary<K: Data, V: Data, S: Summary<K, V>>(key: &K, r: &mut Decoder<'_
     if let Some(summary) = recalled.get::<S>(&id) {
         return Ok(summary);
     }
-    let visited = (bytes.len(), links.len());
     r.rewind(start);
     let value = V::decode(r)?;
-    let (bytes, links) = r.read_since(start);
-    if (bytes.len(), links.len()) != visited {
+    if r.read_so_far() != visited {
         return Err(Error::Decode(
             "a value decodes other bytes than it visits".into(),
         ));

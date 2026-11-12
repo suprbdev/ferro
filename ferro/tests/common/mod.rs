@@ -6,9 +6,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::Once;
 
-use ferro::codec::{Decoder, Encoder, HashSink};
+use ferro::codec::{Decoder, Encoder, HashSink, Object};
 use ferro::store::{Store, StoreOptions, Txn};
-use ferro::{Data, Db, Durability, Map, Options, Ptr};
+use ferro::{Bundle, Data, Db, Durability, Hash, Map, Options, Ptr, Summary};
 
 pub struct Tripwire<'a> {
     bytes: &'a [u8],
@@ -616,4 +616,127 @@ impl Data for Brittle {
         tick()?;
         Ok(key)
     }
+}
+
+pub struct Sent {
+    pub body: Vec<u8>,
+    pub links: Vec<(u64, Option<Hash>)>,
+    pub uses: u64,
+}
+
+pub fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+pub fn sent_objects(bundle: &Bundle) -> (Vec<u8>, Vec<Sent>) {
+    let bytes = bundle.as_bytes();
+    let mut pos = 10 + HASH_BYTES;
+    varint(bytes, &mut pos);
+    for _ in 0..varint(bytes, &mut pos) {
+        pos += HASH_BYTES;
+        varint(bytes, &mut pos);
+    }
+    assert_eq!(varint(bytes, &mut pos), 0, "a bundle that names no roots");
+    assert_eq!(varint(bytes, &mut pos), 0, "a bundle that names no hints");
+    let head = bytes[..pos].to_vec();
+    let mut objects = Vec::new();
+    for _ in 0..varint(bytes, &mut pos) {
+        let flagged = varint(bytes, &mut pos);
+        let stored = (flagged >> 1) as usize;
+        let body = match flagged & 1 {
+            1 => {
+                let raw = varint(bytes, &mut pos) as usize;
+                lz4_flex::block::decompress(&bytes[pos..pos + stored], raw).unwrap()
+            }
+            _ => bytes[pos..pos + stored].to_vec(),
+        };
+        pos += stored;
+        let links = (0..varint(bytes, &mut pos))
+            .map(|_| match varint(bytes, &mut pos) {
+                0 => {
+                    let hash: Hash = bytes[pos..pos + HASH_BYTES].try_into().unwrap();
+                    pos += HASH_BYTES;
+                    (0, Some(hash))
+                }
+                back => (back, None),
+            })
+            .collect();
+        let uses = varint(bytes, &mut pos);
+        objects.push(Sent { body, links, uses });
+    }
+    assert_eq!(pos, bytes.len());
+    (head, objects)
+}
+
+pub fn resent(head: &[u8], objects: &[Sent]) -> Bundle {
+    let mut hashes: Vec<Hash> = Vec::with_capacity(objects.len());
+    for (at, object) in objects.iter().enumerate() {
+        let links = object
+            .links
+            .iter()
+            .map(|(back, hash)| Ptr {
+                hash: hash.unwrap_or_else(|| hashes[at - *back as usize]),
+                offset: 0,
+            })
+            .collect();
+        hashes.push(
+            Object {
+                body: object.body.clone(),
+                links,
+            }
+            .hash(),
+        );
+    }
+    let mut out = head.to_vec();
+    out[10..10 + HASH_BYTES].copy_from_slice(hashes.last().unwrap());
+    push_varint(&mut out, objects.len() as u64);
+    for object in objects {
+        push_varint(&mut out, (object.body.len() as u64) << 1);
+        out.extend_from_slice(&object.body);
+        push_varint(&mut out, object.links.len() as u64);
+        for (back, hash) in &object.links {
+            push_varint(&mut out, *back);
+            out.extend(hash.iter().flatten());
+        }
+        push_varint(&mut out, object.uses);
+    }
+    Bundle::from(out)
+}
+
+pub fn node_body(keys: &[u64], summaries: Option<&[u64]>) -> Vec<u8> {
+    let mut body = vec![0];
+    push_varint(&mut body, keys.len() as u64);
+    for key in keys {
+        push_varint(&mut body, *key);
+    }
+    for index in 0..keys.len() {
+        body.push(1);
+        if let Some(summaries) = summaries {
+            push_varint(&mut body, summaries[index]);
+        }
+    }
+    body.resize(body.len() + keys.len() + 1, 0);
+    body
+}
+
+pub fn sharing_one_value<S: Summary<u64, String>>(count: usize) -> (Vec<u8>, Vec<Sent>, Vec<u64>) {
+    let dir = tempfile::tempdir().unwrap();
+    let a: Db<Map<u64, String, S>> = fast().open(dir.path().join("a.ferro")).unwrap();
+    let fresh: Db<Map<u64, String, S>> = fast().open(dir.path().join("fresh.ferro")).unwrap();
+    let keys: Vec<u64> = (1..).filter(|key| level_of(key) == 0).take(count).collect();
+    let value = text(9, 600);
+    a.update(|root| {
+        root.insert(keys[0], value.clone());
+        root.insert(keys[1], value.clone());
+    })
+    .unwrap();
+    let (head, objects) = sent_objects(&a.bundle(&fresh.have().unwrap()).unwrap());
+    assert_eq!(objects.len(), 4, "a value, a node, a root and a commit");
+    assert_eq!(objects[1].links, vec![(1, None); 2]);
+    assert_eq!(objects[0].uses, 2);
+    (head, objects, keys)
 }

@@ -29,7 +29,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, RandomState};
@@ -191,6 +191,10 @@ const STAGED_ROOM: u64 = 1 << 20;
 const STAGED_LEARNED: usize = 1 << 17;
 /// The most capacity a check's scratch body keeps between records.
 const SCRATCH_KEEP: usize = 1 << 20;
+/// How many bytes of a staged record's links in the file [`StagedLinks`] reads at a time.
+const LINKS_WINDOW: usize = 64 << 10;
+/// How many links of a staged record lie between the places [`StagedLinks`] keeps, to go back to.
+const LINKS_MARKED: usize = 256;
 /// The most bytes of capacity each of the buffers that [`Store::read_lent`] reuses keeps between
 /// reads.
 const LENT_KEEP: usize = 64 << 10;
@@ -6278,13 +6282,82 @@ impl Staging {
     /// checked as it arrived, but refusing a record read from the file that reads as zeroes, as
     /// where a write never landed, unless its object is the empty one.
     pub(crate) fn read_object(&self, ptr: Ptr) -> Result<Object> {
+        match self.open(ptr, usize::MAX)? {
+            Opened::Whole(object) => Ok(object),
+            Opened::Body(..) => unreachable!("no record holds more than usize::MAX links"),
+        }
+    }
+
+    /// Reads the object at `ptr`, an offset in the staging, as [`read_object`](Staging::read_object)
+    /// does, unless it has more than `most` links: then it reads only its body, and leaves its
+    /// links where they are, for a [`StagedLinks`] to read as a check comes to each.
+    pub(crate) fn open(&self, ptr: Ptr, most: usize) -> Result<Opened<'_>> {
         let end = self.start + self.buf.len() as u64;
         let (held, tail) = match ptr.offset.checked_sub(self.start) {
             Some(at) if ptr.offset < end => (&self.buf[at as usize..], end),
             _ => (&[][..], self.start),
         };
         let file = self.log.as_ref().map(|_| &*self.store.inner.file);
-        let (object, _, _) = Store::read_within(file, ptr, tail, held, false, false, None, true)?;
+        if ptr.offset < LOG_START || ptr.offset >= tail {
+            return Err(Error::Corrupt(format!(
+                "pointer {} outside log of {tail} bytes",
+                ptr.offset
+            )));
+        }
+        let bytes = match file {
+            Some(file) if held.is_empty() => {
+                let want = (tail - ptr.offset).min(READ_AHEAD as u64) as usize;
+                let mut bytes = vec![0u8; want];
+                file.read_exact_at(&mut bytes, ptr.offset)?;
+                Cow::Owned(bytes)
+            }
+            _ => Cow::Borrowed(held),
+        };
+        let mut reader = RecordReader {
+            file,
+            start: ptr.offset,
+            tail,
+            bytes,
+            pos: 0,
+            staged: true,
+        };
+        let header = reader.header()?;
+        let body = match header.raw {
+            Some(raw) => {
+                let stored = reader.take(header.stored)?;
+                let body = lz4_flex::block::decompress(stored, raw).map_err(|error| {
+                    Error::Corrupt(format!("bad compressed body at {}: {error}", ptr.offset))
+                })?;
+                if body.len() != raw {
+                    return Err(wrong_length(ptr.offset));
+                }
+                body
+            }
+            None => reader.take(header.stored)?.to_vec(),
+        };
+        if header.links > most {
+            let first = ptr.offset + reader.pos as u64;
+            let links = StagedLinks {
+                file: file.filter(|_| held.is_empty()),
+                held,
+                record: ptr.offset,
+                tail,
+                count: header.links,
+                at: RefCell::new(LinksAt {
+                    window: Vec::new(),
+                    window_at: first,
+                    next: 0,
+                    pos: first,
+                    marks: vec![first],
+                }),
+            };
+            return Ok(Opened::Body(body, links));
+        }
+        let mut links = Vec::with_capacity(header.links.min(1024));
+        for _ in 0..header.links {
+            links.push(reader.link()?);
+        }
+        let object = Object { body, links };
         if held.is_empty()
             && object.body.is_empty()
             && object.links.is_empty()
@@ -6295,7 +6368,7 @@ impl Staging {
                 ptr.offset
             )));
         }
-        Ok(object)
+        Ok(Opened::Whole(object))
     }
 
     /// Runs `f` with the objects staged here readable through `view`, a [`Store::view`].
@@ -6405,6 +6478,124 @@ impl Drop for Staging {
             let bytes = log.frames.iter().map(|(at, end)| end - at).sum();
             self.store.inner.staging.fetch_sub(bytes, Ordering::AcqRel);
         }
+    }
+}
+
+/// An object a [`Staging`] read back for a check, as [`Staging::open`] reads it.
+pub(crate) enum Opened<'a> {
+    /// The whole object.
+    Whole(Object),
+    /// The object's body, and its links where the record keeps them.
+    Body(Vec<u8>, StagedLinks<'a>),
+}
+
+/// The links of a staged record, read where the record keeps them as a check asks for each: in
+/// the staging's memory, or from the file [`LINKS_WINDOW`] bytes at a time.
+///
+/// Reading them in order costs a parse of each. It keeps where every [`LINKS_MARKED`]th link
+/// starts, as far as it has read, so going back to an earlier link reads at most that many again.
+pub(crate) struct StagedLinks<'a> {
+    file: Option<&'a File>,
+    /// The record's bytes, from its start, for a record held in memory.
+    held: &'a [u8],
+    /// Where the record starts, which its links' distances lead back from.
+    record: u64,
+    /// Where the bytes that can be read end.
+    tail: u64,
+    count: usize,
+    at: RefCell<LinksAt>,
+}
+
+/// Where a [`StagedLinks`] is in its record's links.
+struct LinksAt {
+    /// The bytes of the file read last.
+    window: Vec<u8>,
+    /// Where `window` starts.
+    window_at: u64,
+    /// The index of the link at `pos`.
+    next: usize,
+    /// Where the link `next` starts.
+    pos: u64,
+    /// Where each link whose index is a multiple of [`LINKS_MARKED`] starts, as far as read.
+    marks: Vec<u64>,
+}
+
+impl StagedLinks<'_> {
+    /// The bytes from where `at` is to the end of the link there, or to `tail` if that comes
+    /// first, reading them from the file if they are not in memory.
+    fn bytes<'s>(&'s self, at: &'s mut LinksAt) -> Result<&'s [u8]> {
+        let end = (at.pos + (HASH_BYTES + MAX_VARINT) as u64).min(self.tail);
+        if at.pos >= end {
+            return Err(self.cut_short());
+        }
+        let Some(file) = self.file else {
+            let from = (at.pos - self.record) as usize;
+            let to = (end - self.record) as usize;
+            return self.held.get(from..to).ok_or_else(|| self.cut_short());
+        };
+        let held = at.window_at + at.window.len() as u64;
+        if at.pos < at.window_at || end > held {
+            let want = ((self.tail - at.pos) as usize).min(LINKS_WINDOW);
+            at.window.resize(want, 0);
+            file.read_exact_at(&mut at.window, at.pos)?;
+            at.window_at = at.pos;
+        }
+        let from = (at.pos - at.window_at) as usize;
+        Ok(&at.window[from..from + (end - at.pos) as usize])
+    }
+
+    /// Reads the link where `at` is and moves past it.
+    fn step(&self, at: &mut LinksAt) -> Result<Ptr> {
+        let bytes = self.bytes(at)?;
+        let Some(hash) = bytes.get(..HASH_BYTES) else {
+            return Err(self.cut_short());
+        };
+        let hash: Hash = hash.try_into().expect("slice length is HASH_BYTES");
+        let mut used = HASH_BYTES;
+        let distance = parse_varint(bytes, &mut used)?.ok_or_else(|| self.cut_short())?;
+        at.pos += used as u64;
+        at.next += 1;
+        if at.next.is_multiple_of(LINKS_MARKED) && at.marks.len() == at.next / LINKS_MARKED {
+            at.marks.push(at.pos);
+        }
+        Ok(Ptr {
+            hash,
+            offset: self.record.wrapping_sub(unzigzag(distance) as u64),
+        })
+    }
+
+    fn cut_short(&self) -> Error {
+        Error::Corrupt(format!(
+            "the links of the staged record at {} run past its end",
+            self.record
+        ))
+    }
+
+    /// How many links the record has.
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The link at `index` among the record's links.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Decode`] past the last link, [`Error::Corrupt`] for links that run past the
+    /// record, and the I/O error of a failed read.
+    pub(crate) fn link(&self, index: usize) -> Result<Ptr> {
+        if index >= self.count {
+            return Err(Error::Decode("link table exhausted".into()));
+        }
+        let mut at = self.at.borrow_mut();
+        if index < at.next {
+            let mark = index / LINKS_MARKED;
+            at.next = mark * LINKS_MARKED;
+            at.pos = at.marks[mark];
+        }
+        while at.next < index {
+            self.step(&mut at)?;
+        }
+        self.step(&mut at)
     }
 }
 
