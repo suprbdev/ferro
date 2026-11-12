@@ -38,8 +38,8 @@ use crate::pool::{self, Pool};
 use crate::reentry::{Crossing, Needs};
 use crate::stack;
 use crate::store::{
-    LinkTo, Opened, Record, Room, StagedLinks, Staging, Store, Together, Txn, compressed,
-    stored_within,
+    LinkTo, MAX_VARINT, Opened, Record, Room, StagedLinks, Staging, Store, Together, Txn,
+    compressed, stored_within,
 };
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
@@ -882,6 +882,11 @@ impl Prepared {
                 at.offset
             )));
         }
+        self.bytes.reserve(
+            object.body.len()
+                + packed.as_ref().map_or(0, Vec::len)
+                + (object.links.len() + 2) * (HASH_BYTES + MAX_VARINT),
+        );
         self.bytes.extend_from_slice(&object.body);
         let body = self.bytes.len();
         let packed = packed.map(|packed| {
@@ -970,6 +975,7 @@ fn prepare(
 #[derive(Default)]
 struct Slot {
     chunks: VecDeque<Prepared>,
+    bytes: usize,
     done: bool,
 }
 
@@ -981,6 +987,15 @@ struct Readied {
     bytes: usize,
     stopped: bool,
     panic: Option<Box<dyn Any + Send>>,
+}
+
+impl Readied {
+    fn room_for(&self, claimed: usize) -> bool {
+        match claimed - self.emitting {
+            0 => self.slots[0].bytes < AHEAD_BYTES,
+            _ => self.bytes < AHEAD_BYTES,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1019,17 +1034,18 @@ impl Lookahead {
                 held,
                 |chunk, last| {
                     let mut state = self.state.lock();
-                    while !state.stopped && claimed != state.emitting && state.bytes >= AHEAD_BYTES
-                    {
+                    while !state.stopped && !state.room_for(claimed) {
                         self.room.wait(&mut state);
                     }
                     going = !state.stopped && chunk.failed.is_none();
                     if state.stopped {
                         return false;
                     }
-                    state.bytes += chunk.bytes.capacity();
+                    let size = chunk.bytes.capacity();
+                    state.bytes += size;
                     let at = claimed - state.emitting;
                     let slot = &mut state.slots[at];
+                    slot.bytes += size;
                     slot.chunks.push_back(chunk);
                     slot.done = last;
                     self.ready.notify_one();
@@ -1101,7 +1117,9 @@ impl Ahead {
             }
             if let Some(slot) = state.slots.front_mut() {
                 if let Some(chunk) = slot.chunks.pop_front() {
-                    state.bytes -= chunk.bytes.capacity();
+                    let size = chunk.bytes.capacity();
+                    slot.bytes -= size;
+                    state.bytes -= size;
                     self.shared.room.notify_all();
                     return Some(chunk);
                 }

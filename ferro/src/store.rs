@@ -176,7 +176,7 @@ const DEDUPE_WAYS: usize = 2;
 /// one of them.
 const DEDUPE_CHUNK: usize = 64;
 /// The longest varint, which a `u64` takes.
-const MAX_VARINT: usize = 10;
+pub(crate) const MAX_VARINT: usize = 10;
 /// The shortest body that is LZ4 compressed.
 const COMPRESS_MIN: usize = 96;
 /// The most LZ4 can expand a body by, which a record's claimed raw length may not pass.

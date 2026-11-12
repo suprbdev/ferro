@@ -138,10 +138,11 @@ threads take its runs in turn, read each object from the file, check its hash ag
 bytes and encode it as it will be sent, each link to a sent object as how far back it is, which
 they find by galloping over the runs from the object's own and halving one. The sending thread
 puts the encoded objects out in their order. A thread works at most four runs a thread ahead of the
-run being sent, and waits while 256 KiB of encoded objects does, unless its run is the one
-being sent. A first pull of fewer than 4,096 objects, or on one core, encodes each run on the sending
-thread. Objects the file holds twice, at two offsets, are sent twice, since the pass knows objects
-by their offsets.
+run being sent, and waits while 256 KiB of encoded objects does, or, on the run being sent, while
+256 KiB of that run's does, so the thread on that run waits only while the sending thread has some
+of it to take. A first pull of fewer than 4,096 objects, or on one core, encodes each run on the
+sending thread. Objects the file holds twice, at two offsets, are sent twice, since the pass knows
+objects by their offsets.
 
 An incremental bundle is planned as before. The tree comparison reads only the links of each record,
 and keeps each object it will send in a table of 16-byte slots: its offset, its place in the bundle,
@@ -714,6 +715,9 @@ Measured and left out:
 - A heap of the offsets of each window of 1 MiB, then sorted lists by window of 1 MiB, against those
   of 64 KiB: 466 and 397 million instructions on the sending thread, against 324.
 - Letting the encoded objects waiting take 1 MiB rather than 256 KiB: no faster.
+- Letting the run being sent wait whole rather than 256 KiB of it: no faster, 0.28 to 0.29 s for
+  `clone`'s `send` of 8M keys and 72 ms for the harness's bundle either way, and 69 MiB of heap to
+  send 130 values of 1 MiB to a slow reader, against 10.
 
 ## Memory for each object
 
@@ -767,10 +771,15 @@ the pass has yet to follow: a few hundred in a tree written in commits, since ea
 children closely, and 388,454 at most for the 895,489 objects of 100,000 commits of ten keys, since
 each commit links nodes written by the ones before. Each window adds an empty list, 24 bytes, at
 most 384 KiB in all. It reads the file through a window of 1 MiB, and each commit adds about 100
-bytes. While the objects go out, those encoded and waiting take at most 256 KiB, besides the run
-being sent and what each thread is encoding, 32 objects or 16 KiB of them at most and one object
-more. The sender of an incremental pull
-keeps, for each object it will send, a 16-byte slot and a control byte in a table split into 16
+bytes. While the objects go out, those encoded and waiting take less than 256 KiB and a chunk of the
+run being sent, and as much again of the runs after it, where a chunk is 32 objects, or 16 KiB of
+them and one object more. Besides those, each thread holds the chunk it is encoding or waiting to
+add, and the sending thread the chunk it is sending and 64 KiB of the bundle with one object more.
+`a_first_pull_of_large_values_to_a_slow_reader_holds_a_few_of_them_on_every_thread` in
+`ferro/tests/sync_send_heap.rs` sends 130 values of 1 MiB to a reader that pauses 0.5 ms a write
+and expects under 16 MiB of heap on all threads: about 10 MiB, against 4.4 MiB when one thread
+built the bundle and 69 MiB while the run being sent could wait whole. The sender of an incremental
+pull keeps, for each object it will send, a 16-byte slot and a control byte in a table split into 16
 that runs between 44 and 88% full, 19 to 39 bytes, a commit adds 80 bytes, and each object the old
 side reaches its hash, its origin as a position and link index, and a slot, about 40. The
 objects it reaches under nodes the next level names count toward 65,536 a bundle, so they add at
