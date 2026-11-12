@@ -363,3 +363,188 @@ fn a_small_cycle_verifies_on_the_calling_thread_and_a_large_one_on_more() {
     assert_eq!(verifying_threads(), 0);
     assert_eq!(*seen.lock().unwrap(), [0, 0, 3]);
 }
+
+fn build_long(path: &Path, seed: u64) {
+    let db: Db<Root> = options(1).open(path).unwrap();
+    let mut rng = Rng::new(seed);
+    let put = |db: &Db<Root>, rng: &mut Rng| {
+        let (key, value) = (
+            rng.below(400),
+            text(rng.next(), 40 + rng.below(200) as usize),
+        );
+        db.update(|root| {
+            root.insert(key, value.clone());
+        })
+        .unwrap();
+    };
+    for _ in 0..2600 {
+        put(&db, &mut rng);
+    }
+    let side = db.fork("side").unwrap();
+    for step in 0..2300u64 {
+        put(&side, &mut rng);
+        if step % 3 == 0 {
+            put(&db, &mut rng);
+        }
+    }
+    db.merge_with(&side, |root, base, theirs| {
+        root.merge(base, theirs, |c| c.theirs.map(|v| (*v).clone()));
+        ("merge", ())
+    })
+    .unwrap();
+    for _ in 0..50 {
+        put(&db, &mut rng);
+    }
+}
+
+#[test]
+fn long_chains_read_ahead_copy_the_same_bytes_at_every_thread_count() {
+    let _turn = serial();
+    let dir = dir();
+    let source = dir.path().join("source.ferro");
+    build_long(&source, 11);
+    for keep in [Keep::All, Keep::Last(2100), Keep::Last(3000)] {
+        let mut copies = Vec::new();
+        for threads in [1, 2, 3, 5, 8, 16] {
+            let path = dir.path().join(format!("long-{threads}.ferro"));
+            fs::copy(&source, &path).unwrap();
+            let db: Db<Root> = options(threads).open(&path).unwrap();
+            let want = dump(&db.read());
+            db.compact(keep).unwrap();
+            assert_eq!(dump(&db.read()), want);
+            db.verify().unwrap();
+            let first = fs::read(&path).unwrap();
+            db.compact(keep).unwrap();
+            drop(db);
+            copies.push((threads, first, fs::read(&path).unwrap()));
+        }
+        for pair in copies.windows(2) {
+            let (one, other) = (pair[0].0, pair[1].0);
+            assert!(
+                pair[0].1 == pair[1].1,
+                "{keep:?}: first copies at {one} and {other}"
+            );
+            assert!(
+                pair[0].2 == pair[1].2,
+                "{keep:?}: second copies at {one} and {other}"
+            );
+        }
+    }
+}
+
+fn entries_by_version(path: &Path) -> Vec<(u64, u64)> {
+    let db: Db<Root> = options(1).open(path).unwrap();
+    let roots: std::collections::HashMap<u64, u64> = (1..=db.version())
+        .map(|version| {
+            (
+                db.at(version).unwrap().commit().root.unwrap().offset,
+                version,
+            )
+        })
+        .collect();
+    drop(db);
+    let bytes = fs::read(path).unwrap();
+    let mut entries: Vec<(u64, u64)> = admin::layout(path, Keep::All)
+        .unwrap()
+        .extents
+        .iter()
+        .filter_map(|(offset, _)| {
+            let (links, _) = common::link_slots(&bytes, *offset as usize);
+            Some((*roots.get(&links.first()?.target)?, *offset))
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn a_damaged_entry_in_a_long_chain_fails_alike_at_every_thread_count() {
+    let _turn = serial();
+    let dir = dir();
+    let source = dir.path().join("source.ferro");
+    build(&source, 3000, 600, 60);
+    let entries = entries_by_version(&source);
+    assert_eq!(entries.len(), 3000);
+    let bytes = fs::read(&source).unwrap();
+    for version in [
+        2999, 2252, 2251, 2250, 2249, 1501, 1500, 1499, 751, 750, 749, 2, 1,
+    ] {
+        let at = entries[version - 1].1 as usize;
+        let (links, _) = common::link_slots(&bytes, at);
+        let payload = at + 3;
+        let prev = links.get(1).map(|link| link.at);
+        let skip = links.get(2).map(|link| link.at);
+        for (what, byte) in [("payload", Some(payload)), ("prev", prev), ("skip", skip)] {
+            let Some(byte) = byte else { continue };
+            let mut outcomes = Vec::new();
+            for threads in [1, 2, 3, 5, 8] {
+                let path = dir.path().join(format!("damaged-{threads}.ferro"));
+                let mut damaged = bytes.clone();
+                damaged[byte] ^= 0x01;
+                fs::write(&path, &damaged).unwrap();
+                let db: Db<Root> = options(threads).open(&path).unwrap();
+                let outcome = db.compact(Keep::All).map(|_| ());
+                if outcome.is_ok() {
+                    db.verify().unwrap();
+                }
+                drop(db);
+                outcomes.push((threads, format!("{outcome:?}")));
+            }
+            for pair in outcomes.windows(2) {
+                assert_eq!(
+                    pair[0].1, pair[1].1,
+                    "v{version} {what}: {} against {} threads",
+                    pair[0].0, pair[1].0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cycles_under_writers_on_long_chains_keep_every_retained_commit() {
+    let _turn = serial();
+    let dir = dir();
+    let path = dir.path().join("db.ferro");
+    let db: Db<Root> = options(8).open(&path).unwrap();
+    for i in 0..2400u64 {
+        db.update(|root| {
+            root.insert(i % 300, text(i, 50));
+        })
+        .unwrap();
+    }
+    let side = db.fork("side").unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = |db: Db<Root>, lane: u64| {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut made = Vec::new();
+            let mut i = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                let (key, value) = (lane * 1000 + i % 300, text(lane << 32 | i, 50));
+                db.update(|root| {
+                    root.insert(key, value.clone());
+                })
+                .unwrap();
+                made.push((db.version(), key, value));
+                i += 1;
+            }
+            made
+        })
+    };
+    let writers = [writer(db.clone(), 1), writer(side.clone(), 2)];
+    for _ in 0..8 {
+        db.compact(Keep::Last(2300)).unwrap();
+        side.compact(Keep::Last(2300)).unwrap();
+    }
+    stop.store(true, Ordering::SeqCst);
+    let made: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    db.verify().unwrap();
+    for (branch, made) in [&db, &side].into_iter().zip(&made) {
+        let oldest = branch.version().saturating_sub(2000);
+        for (version, key, value) in made.iter().filter(|m| m.0 > oldest) {
+            let snapshot = branch.at(*version).unwrap();
+            assert_eq!(&*snapshot.get(key).unwrap(), value, "v{version}");
+        }
+    }
+}

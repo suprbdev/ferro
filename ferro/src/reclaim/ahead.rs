@@ -202,9 +202,14 @@ impl Ahead {
             }
         }
         self.publish(read, None, &mut batch);
-        self.finish(read);
     }
 
+    /// Hands `batch` to the walk as the next records of the stretch `read` names, with `next`
+    /// the entry its thread reads after them, or, with `next` `None`, as the stretch's last
+    /// records, marking it read as far as its thread got under the same lock.
+    ///
+    /// Returns `false`, handing over nothing, once the chain it belongs to is ended or `batch`
+    /// would take the stretch past its share of [`HOLD_BYTES`].
     fn publish(&self, read: &Read, next: Option<Option<Ptr>>, batch: &mut Vec<Fetched>) -> bool {
         let mut state = self.state.lock();
         if state.generation != read.generation {
@@ -213,21 +218,26 @@ impl Ahead {
         let share = state.share;
         let stretch = &mut state.stretches[read.index];
         let weight: usize = batch.iter().map(Fetched::weight).sum();
-        if stretch.bytes + weight > share {
-            return false;
+        let fits = stretch.bytes + weight <= share;
+        if fits {
+            stretch.bytes += weight;
+            stretch.started = true;
+            stretch.fetched.extend(mem::take(batch));
         }
-        stretch.bytes += weight;
-        stretch.started = true;
-        stretch.fetched.extend(mem::take(batch));
-        if let Some(next) = next {
-            stretch.next = next;
+        match next {
+            Some(next) if fits => stretch.next = next,
+            Some(_) => return false,
+            None => {
+                stretch.started = true;
+                stretch.ended = true;
+            }
         }
         let waiting = state.waiting;
         drop(state);
         if waiting {
             self.fetched.notify_all();
         }
-        true
+        fits
     }
 
     /// Marks the stretch `read` names as read as far as its thread got.
@@ -265,5 +275,71 @@ fn find(source: &Store, chain: &Chain, version: u64) -> Option<Ptr> {
             Some(skip) if skip_version(at) >= version => skip,
             _ => entry.prev?,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::HASH_BYTES;
+
+    fn ptr(at: u64) -> Ptr {
+        Ptr {
+            hash: [at as u8; HASH_BYTES],
+            offset: at,
+        }
+    }
+
+    fn fetched(at: u64) -> Fetched {
+        Fetched {
+            ptr: ptr(at),
+            len: 1,
+            record: vec![0],
+        }
+    }
+
+    #[test]
+    fn the_walk_passes_to_the_next_stretch_once_a_stretch_hands_over_its_last_records() {
+        let ahead = Ahead::default();
+        let chain = Chain {
+            tip: Some(ptr(4096)),
+            first: 1,
+            last: 4096,
+        };
+        let reads = ahead.begin(&chain, 2);
+        assert_eq!(reads.len(), 2);
+        assert!(ahead.publish(&reads[1], Some(Some(ptr(2048))), &mut Vec::new()));
+        let mut batch = vec![fetched(2048), fetched(2047)];
+        assert!(ahead.publish(&reads[1], Some(Some(ptr(2046))), &mut batch));
+        assert!(ahead.publish(&reads[0], Some(Some(ptr(4096))), &mut Vec::new()));
+        let mut last = vec![fetched(4096), fetched(4095)];
+        assert!(ahead.publish(&reads[0], None, &mut last));
+        for at in [4096, 4095, 2048, 2047] {
+            let taken = ahead.take(ptr(at)).map(|fetched| fetched.ptr);
+            assert_eq!(taken, Some(ptr(at)), "the entry at {at}");
+        }
+    }
+
+    #[test]
+    fn a_last_batch_past_the_share_still_ends_the_stretch() {
+        let ahead = Ahead::default();
+        let chain = Chain {
+            tip: Some(ptr(4096)),
+            first: 1,
+            last: 4096,
+        };
+        let reads = ahead.begin(&chain, 2);
+        assert!(ahead.publish(&reads[1], Some(Some(ptr(2048))), &mut Vec::new()));
+        assert!(ahead.publish(&reads[0], Some(Some(ptr(4096))), &mut Vec::new()));
+        let mut huge = vec![Fetched {
+            ptr: ptr(4096),
+            len: 1,
+            record: vec![0; HOLD_BYTES],
+        }];
+        assert!(!ahead.publish(&reads[0], None, &mut huge));
+        let state = ahead.state.lock();
+        assert!(state.stretches[0].ended);
+        assert!(state.stretches[0].fetched.is_empty());
+        assert_eq!(state.stretches[0].bytes, 0);
     }
 }

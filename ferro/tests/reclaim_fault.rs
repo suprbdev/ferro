@@ -39,6 +39,13 @@ static COPY_SLOW: AtomicBool = AtomicBool::new(false);
 static COPY_WRITES: AtomicI64 = AtomicI64::new(0);
 static COPY_FAILS: AtomicBool = AtomicBool::new(false);
 
+static READS_WATCHED: AtomicBool = AtomicBool::new(false);
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static OLD_END: AtomicI64 = AtomicI64::new(0);
+static OLD_READS_IN_PAUSE: AtomicI64 = AtomicI64::new(0);
+static COPY_READS_FAIL_AT: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+static COPY_READS_FAILED: AtomicI64 = AtomicI64::new(0);
+
 thread_local! {
     static WRITES_FAIL: Cell<bool> = const { Cell::new(false) };
     static SYNC_HELD: Cell<bool> = const { Cell::new(false) };
@@ -143,6 +150,35 @@ pub extern "C" fn pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: 
     // its C prototype `ssize_t pwrite64(int, const void *, size_t, off64_t)` matches this function
     // pointer type.
     let real: extern "C" fn(c_int, *const c_void, usize, i64) -> isize =
+        unsafe { std::mem::transmute(symbol) };
+    real(fd, buf, count, offset)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pread64(fd: c_int, buf: *mut c_void, count: usize, offset: i64) -> isize {
+    if READS_WATCHED.load(Ordering::SeqCst) && std::thread::current().name() == Some("ferro-copy") {
+        if PAUSED.load(Ordering::SeqCst) && offset < OLD_END.load(Ordering::SeqCst) {
+            OLD_READS_IN_PAUSE.fetch_add(1, Ordering::SeqCst);
+        }
+        let failing = COPY_READS_FAIL_AT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&offset);
+        if failing {
+            COPY_READS_FAILED.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: `__errno_location` returns a non-null pointer to the calling thread's `errno`,
+            // valid for writes for as long as the thread runs.
+            unsafe { *__errno_location() = EIO };
+            return -1;
+        }
+    }
+    // SAFETY: `RTLD_NEXT` is glibc's pseudo-handle for the next definition after this one in lookup
+    // order, and `c"pread64"` is a NUL-terminated string that outlives the call.
+    let symbol = unsafe { dlsym(RTLD_NEXT, c"pread64".as_ptr()) };
+    // SAFETY: glibc defines `pread64`, so `symbol` is the non-null address of that function, and
+    // its C prototype `ssize_t pread64(int, void *, size_t, off64_t)` matches this function pointer
+    // type.
+    let real: extern "C" fn(c_int, *mut c_void, usize, i64) -> isize =
         unsafe { std::mem::transmute(symbol) };
     real(fd, buf, count, offset)
 }
@@ -581,4 +617,127 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
     let db: Db<Root> = options().open(&path).unwrap();
     assert_eq!(dump(&db.read()), want);
     db.verify().unwrap();
+}
+
+fn fill_one(db: &Db<Root>, start: u64, commits: u64) {
+    for i in start..start + commits {
+        db.update(|root| {
+            root.insert(0, text(i, 60));
+        })
+        .unwrap();
+    }
+}
+
+fn entry_offsets(path: &Path) -> Vec<i64> {
+    let db: Db<Root> = options().read_only(true).open(path).unwrap();
+    let roots: std::collections::HashSet<u64> = (1..=db.version())
+        .map(|version| db.at(version).unwrap().commit().root.unwrap().offset)
+        .collect();
+    drop(db);
+    let layout = ferro::admin::layout(path, Keep::All).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    layout
+        .extents
+        .iter()
+        .filter(|(offset, _)| {
+            let (links, _) = common::link_slots(&bytes, *offset as usize);
+            links
+                .first()
+                .is_some_and(|link| roots.contains(&link.target))
+        })
+        .map(|(offset, _)| *offset as i64)
+        .collect()
+}
+
+#[test]
+fn the_pause_reads_no_chain_ahead_when_an_earlier_pass_walked_it() {
+    let _turn = serial();
+    for added in [1, 2100] {
+        let dir = dir();
+        let path = dir.path().join("db.ferro");
+        let slot: Arc<Mutex<Option<Db<Root>>>> = Arc::new(Mutex::new(None));
+        let hook = {
+            let slot = slot.clone();
+            move |name: &'static str| match name {
+                "synced" => {
+                    let db = slot.lock().unwrap().clone().unwrap();
+                    OLD_END.store(db.size_on_disk() as i64, Ordering::SeqCst);
+                    fill_one(&db, 9000, added);
+                }
+                "paused" => PAUSED.store(true, Ordering::SeqCst),
+                "swapped" => PAUSED.store(false, Ordering::SeqCst),
+                _ => {}
+            }
+        };
+        let db: Db<Root> = options()
+            .copy_threads(4)
+            .hook(Hook(Arc::new(hook)))
+            .open(&path)
+            .unwrap();
+        *slot.lock().unwrap() = Some(db.clone());
+        fill_one(&db, 0, 3000);
+        OLD_READS_IN_PAUSE.store(0, Ordering::SeqCst);
+        READS_WATCHED.store(true, Ordering::SeqCst);
+        let report = db.compact(Keep::All);
+        READS_WATCHED.store(false, Ordering::SeqCst);
+        PAUSED.store(false, Ordering::SeqCst);
+        *slot.lock().unwrap() = None;
+        let report = report.unwrap();
+        db.verify().unwrap();
+        assert_eq!(db.version(), 3000 + added);
+        let latest = text(9000 + added - 1, 60);
+        assert_eq!(*db.read().get(&0).unwrap(), latest);
+        assert_eq!(
+            OLD_READS_IN_PAUSE.load(Ordering::SeqCst),
+            0,
+            "{added} added: copy threads read entries an earlier pass walked during the pause: \
+             {report:?}"
+        );
+        drop(db);
+        let db: Db<Root> = options().open(&path).unwrap();
+        assert_eq!(*db.read().get(&0).unwrap(), latest);
+        db.verify().unwrap();
+    }
+}
+
+#[test]
+fn reads_ahead_that_fail_leave_the_walk_to_read_the_entries_itself() {
+    let _turn = serial();
+    let dir = dir();
+    let source = dir.path().join("source.ferro");
+    {
+        let db: Db<Root> = options().open(&source).unwrap();
+        fill_one(&db, 0, 3000);
+    }
+    let entries = entry_offsets(&source);
+    assert!(entries.len() >= 3000, "{}", entries.len());
+    let copy = |name: &str, threads: usize, failing: Vec<i64>| -> Vec<u8> {
+        let path = dir.path().join(name);
+        std::fs::copy(&source, &path).unwrap();
+        let db: Db<Root> = options().copy_threads(threads).open(&path).unwrap();
+        let want = dump(&db.read());
+        *COPY_READS_FAIL_AT.lock().unwrap() = failing;
+        READS_WATCHED.store(true, Ordering::SeqCst);
+        let report = db.compact(Keep::All);
+        READS_WATCHED.store(false, Ordering::SeqCst);
+        COPY_READS_FAIL_AT.lock().unwrap().clear();
+        report.unwrap();
+        assert_eq!(dump(&db.read()), want);
+        db.verify().unwrap();
+        drop(db);
+        std::fs::read(&path).unwrap()
+    };
+    let one = copy("one.ferro", 1, Vec::new());
+    for threads in [2, 4, 8] {
+        for every in [1, 7, 500] {
+            COPY_READS_FAILED.store(0, Ordering::SeqCst);
+            let failing = entries.iter().step_by(every).copied().collect();
+            let bytes = copy(&format!("{threads}-{every}.ferro"), threads, failing);
+            assert!(
+                COPY_READS_FAILED.load(Ordering::SeqCst) > 0,
+                "{threads} {every}"
+            );
+            assert!(bytes == one, "{threads} threads failing every {every}");
+        }
+    }
 }

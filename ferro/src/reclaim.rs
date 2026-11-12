@@ -24,7 +24,7 @@ use std::time::Duration;
 use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, Staged};
 use crate::db::{Head, Refs};
 use crate::error::{Error, Result};
-use crate::log::{Closures, Entry, skip_version};
+use crate::log::{Chain, Closures, Entry, skip_version};
 use crate::platform::{copy_owner, start_writeback};
 pub(crate) use crate::platform::{rename, sync_parent};
 use crate::refs;
@@ -284,6 +284,7 @@ struct CopySink<'a> {
     spare: Vec<Buffers>,
     copied: HashMap<Hash, Copied, ByHash>,
     walked: HashMap<u64, Hash, ByOffset>,
+    reached: HashMap<String, u64>,
     records: HashMap<u64, u64, ByOffset>,
     kept: Needs,
     needs: Needs,
@@ -647,6 +648,26 @@ impl CopySink<'_> {
         }
         self.needs.add(at, need);
         true
+    }
+
+    /// The part of `chain`, the branch `name`'s, for threads to read ahead of the walk.
+    ///
+    /// In the first pass it is the whole chain. In a later one, which `earlier` marks, it is only
+    /// the versions above the newest an earlier pass walked on the branch, since the walk stops
+    /// at an entry it walked before. It is `None` for a chain whose tip was walked, and in a later
+    /// pass for a branch that no earlier pass walked or that has no newer versions.
+    fn unread(&self, name: &str, chain: &Chain, earlier: bool) -> Option<Chain> {
+        let walked = chain
+            .tip
+            .is_some_and(|tip| self.walked.get(&tip.offset) == Some(&tip.hash));
+        match self.reached.get(name) {
+            _ if walked => None,
+            Some(&reached) => (reached < chain.last).then(|| Chain {
+                first: chain.first.max(reached + 1),
+                ..*chain
+            }),
+            None => (!earlier).then_some(*chain),
+        }
     }
 
     fn placed(&self, hash: Hash) -> Option<Ptr> {
@@ -1131,6 +1152,7 @@ impl<'a> Copier<'a> {
                 spare: Vec::new(),
                 copied: HashMap::default(),
                 walked: HashMap::default(),
+                reached: HashMap::new(),
                 records: HashMap::default(),
                 kept: Needs::default(),
                 needs: Needs::default(),
@@ -1156,16 +1178,14 @@ impl<'a> Copier<'a> {
         let cache = RefCell::new(mem::take(&mut sink.cache));
         let ahead = sink.units.as_ref().map(Units::ahead);
         let read = |ptr| cache.borrow_mut().read(&source, ahead.as_deref(), ptr);
-        for (_, branch) in refs.try_entries()? {
+        let earlier = !sink.walked.is_empty();
+        for (name, branch) in refs.try_entries()? {
             let (first, after) = (branch.log.first, branch.log.after(&source)?);
             let root = branch.root;
             closures.chain(&branch.log);
-            let walked = branch
-                .log
-                .tip
-                .is_some_and(|tip| sink.walked.get(&tip.offset) == Some(&tip.hash));
-            if let Some(units) = sink.units.as_mut().filter(|_| !walked) {
-                units.read_ahead(&branch.log);
+            let unread = sink.unread(&name, &branch.log, earlier);
+            if let (Some(units), Some(unread)) = (sink.units.as_mut(), unread) {
+                units.read_ahead(&unread);
             }
             let visited = branch.log.visit_with(root, read, |ptr, entry, _, _| {
                 if !sink.wanted(ptr, Need::new(first, after), &mut again) {
@@ -1186,6 +1206,7 @@ impl<'a> Copier<'a> {
                 units.end_ahead();
             }
             visited?;
+            sink.reached.insert(name, branch.log.last);
         }
         loop {
             for (ptr, need) in again.drain(..) {

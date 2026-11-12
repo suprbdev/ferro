@@ -677,16 +677,19 @@ off in the build of the last:
   it splits the chain's versions into up to four stretches, one for each of up to four of the
   copy's other threads. A thread reads its stretch down the `prev` links, from the tip or from the
   entry the skip links lead to from the tip, checks each record's hash and decodes it to find the
-  next, and hands the records to the walk in batches of 32. The walk takes each entry it reads from
-  the stretch that holds it next, waiting for that stretch's thread if it is on its way, and reads
-  it itself otherwise: an entry no thread has reached, one a damaged link sent elsewhere, one
-  reached through a merge, or one past where a stretch's share of 16 MiB filled. So the walk sees
-  the same records in the same order, and meets any error on its own read with the error one
-  thread gives. A chain whose tip an earlier pass walked is not read ahead, so neither is a later
-  pass's nor the pause's. All 40,001 entries of the table rows came from the stretches, and the
-  walk waited 3 ms for them in all. The walk down the chains now ends at 22 to 29 ms at 8 threads,
-  36 to 50 ms at 16 and 72 to 94 ms at 32: its bookkeeping, six maps and the closures' marks for
-  each entry, is what is left, and it slows as the other threads run.
+  next, and hands the records to the walk in two batches of 4 and then in batches of 32, marking
+  its stretch read with the last of them. The walk takes each entry it reads from the stretch that
+  holds it next, waiting for that stretch's thread if it is on its way, and reads it itself
+  otherwise: an entry no thread has reached, one a damaged link sent elsewhere, one reached
+  through a merge, or one past where a stretch's share of 16 MiB filled. So the walk sees the same
+  records in the same order, and meets any error on its own read with the error one thread gives.
+  The walk stops at an entry an earlier pass walked, so a later pass and the pause read ahead only
+  the versions above the newest one an earlier pass walked on that branch, and only when there are
+  2,048 of them or more; a branch no earlier pass walked, or whose tip one did, is not read ahead
+  then. All 40,001 entries of the table rows came from the stretches, and the walk waited 3 ms for
+  them in all. The walk down the chains now ends at 22 to 29 ms at 8 threads, 36 to 50 ms at 16
+  and 72 to 94 ms at 32: its bookkeeping, six maps and the closures' marks for each entry, is what
+  is left, and it slows as the other threads run.
 
 Against the build before, on 2026-11-11, pinned as above, medians of five alternating runs:
 
