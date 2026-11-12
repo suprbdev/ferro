@@ -15,7 +15,8 @@ The library is `ferro/src`:
   API; `dense`, `epoch`, `follow`, `graph`, `platform`, `prefix`, `reclaim`, `reentry`, `refs` and
   `shared` are private, with `Following` re-exported from `follow` and `Prefix` from `prefix`.
 - `codec.rs`: the `Data` trait, `Encoder`, `Decoder`, primitive impls, and `Object`, `Ptr`,
-  `hash_of` and `Bytes`.
+  `hash_of` and `Bytes`, and `HashBatch`, which checks many hashes at once for a verify, described
+  under [Hashes checked many at once](verify.md#hashes-checked-many-at-once).
 - `store.rs`: one generation of the database: the append-only file, commit frames, superblocks,
   recovery, object reads with hash verification, node cache, and the `dedupe` table.
 - `map.rs`: `Map<K, V>`, the persistent ordered tree, its optional summaries, `Cursor`, and `Val`,
@@ -46,7 +47,8 @@ The library is `ferro/src`:
 - `follow.rs`: the thread behind `Options::follow` and `Following`, described under
   [Followers](processes.md#followers).
 - `admin.rs`: functions that work on a path without user types: `info`, `log`, `verify`, `layout`,
-  `space` and `compact`, and `Keep`.
+  `space` and `compact`, and `Keep`, and the walk behind every verify, described under [Verifying a
+  file](verify.md).
 - `platform.rs`: the file calls that differ between Unix and Windows, described under
   [Windows](windows.md).
 - `sync.rs`: `Have`, `Bundle`, and `Db::pull`, `push` and `receive`, which copy a branch between

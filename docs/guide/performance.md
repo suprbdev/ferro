@@ -36,6 +36,11 @@ Of the 3.5 KB a single-key commit writes, 38% is the hashes of the children of t
 changed path and 21% those nodes' keys, as [Bytes of a small commit](../internals/commit-bytes.md)
 measures, with the encodings tried to make it smaller.
 
+A `Durability::Fsync` commit that follows 100 ms or more in which nothing reached the disk takes
+longer: on this machine the first one or two such commits took about 12 ms between them, as the SSD
+left a power-saving state, whether the time went to reads, a verify or a sleep, as [Commits after a
+verify](../internals/verify.md#commits-after-a-verify) measures.
+
 The booking commits cost 4 and 14% more than the 82 and 93 µs this page gave before, measured on
 2026-11-03. Since then the example's customer index covers six fields of each booking, which
 [Covering indexes](../internals/schema-and-unique-indexes.md#covering-indexes) found adds 5% to the
@@ -250,6 +255,7 @@ median of:
 | `reclaim`, 3 | 15 s of fsync commits keeping 100 versions, a cycle every 64 MiB | Longest pause 2.9 ms on `metrics`, 3.2 ms on `ledger`, 3.4 ms on `wiki` and 2.8 ms on table updates, commits a second within 2.2% of no cycles |
 | `reclaim`, 3 | Updates of 20,000 rows over 64 and 256 branches, a cycle every 4 MiB | Median pause 3.1 and 4.4 ms |
 | `reclaim copy`, 5 | The copy a reclamation cycle makes, keeping everything, of 189 MB of table rows and of 331 MB of 320 byte values, on the default 8 threads, measured on 2026-11-07 | 0.19 and 0.11 s, 1,000 and 2,960 MB/s, against 0.80 and 0.41 s on one thread |
+| `verify`, 5 | `Db::verify` of the 47.9 MB file `make compare-versioned` builds, 151,133 objects, measured on 2026-11-12 beside other work at a load average of 37 to 56 | 36 ms on the default 8 threads and 112 ms on one, against 279 ms before a verify ran on several threads and checked hashes many at once |
 
 ## Slower than before
 

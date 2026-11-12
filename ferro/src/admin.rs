@@ -9,12 +9,18 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::BuildHasherDefault;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Duration;
 
+use parking_lot::{Condvar, Mutex};
+
 use crate::codec::{
-    Checked, Data, Decoder, Encoder, Hash, HashSink, Kind, PairRoots, Pairing, Plans, Ptr, Tables,
-    pair_roots,
+    Checked, Data, Decoder, Encoder, HASH_BYTES, Hash, HashBatch, HashSink, Kind, PairRoots,
+    Pairing, Plans, Ptr, Tables, pair_roots,
 };
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
@@ -23,9 +29,21 @@ use crate::map::Map;
 pub use crate::reclaim::{Compacted, Reclaim, Space};
 use crate::reclaim::{Copier, Roots, rename, sibling, sync_parent};
 use crate::refs::{self, Root};
-use crate::store::{Closing, Store, StoreOptions};
+use crate::store::{Closing, Prehashed, Store, StoreOptions};
 
 const CONFIRMED_KEPT: usize = 1 << 12;
+/// The most threads [`rehashed`] walks on when [`StoreOptions::copy_threads`] is 0.
+const REHASH_THREADS: usize = 8;
+/// How long a log [`rehashed`] walks on one thread when [`StoreOptions::copy_threads`] is 0.
+const REHASH_ALONE: u64 = 1 << 20;
+/// How many sets the objects a [`Rehash`] has reached are kept in.
+const REHASH_SHARDS: usize = 1024;
+/// The most objects a thread of a [`Rehash`] takes from the shared stack at once.
+const REHASH_TAKE: usize = 32;
+/// How many of the objects it reached last a thread of a [`Rehash`] remembers, by their hashes.
+const REHASH_RECENT: usize = 4096;
+
+type ByHash = BuildHasherDefault<Prehashed>;
 
 /// How much history each branch retains.
 ///
@@ -171,7 +189,8 @@ pub fn log(path: impl AsRef<Path>, branch: &str, limit: usize) -> Result<Vec<Com
 }
 
 /// Re-hashes every object reachable from every retained version of every branch in the file at
-/// `path`, and checks the branch table, as [`Db::verify`](crate::Db::verify) does.
+/// `path`, and checks the branch table, as [`Db::verify`](crate::Db::verify) does, on one thread
+/// per core up to 8 once the log holds 1 MiB.
 ///
 /// # Errors
 ///
@@ -188,22 +207,23 @@ pub fn verify(path: impl AsRef<Path>) -> Result<crate::Verified> {
 /// Re-hashes every object reachable from the branch table at `head`, counting each once, then
 /// checks the branch table and its steps as the types that read them, as [`typed`] checks the
 /// values of a branch, and that each branch's merge records name a branch the table holds.
+///
+/// The objects are re-hashed by [`rehashed`], on several threads for a large file, and only if
+/// that fails again by [`walked`], one at a time in a fixed order, so that the error is the first
+/// in that order whatever the threads did.
 pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verified> {
     let mut report = crate::Verified {
         file_bytes: store.file_len()?,
         ..crate::Verified::default()
     };
     if let Some(ptr) = head {
-        let mut seen = HashSet::new();
         let roots = Roots::of(store, ptr)?;
-        roots.walk(
-            store,
-            |ptr, _| seen.insert(ptr),
-            |_, _, len| {
-                report.objects += 1;
-                report.bytes += u64::from(len);
-            },
-        )?;
+        let (objects, bytes) = match rehashed(store, &roots) {
+            Ok(found) => found,
+            Err(_) => walked(store, &roots)?,
+        };
+        report.objects = objects;
+        report.bytes = bytes;
         checked(
             store,
             vec![(ptr, Kind::value::<Root>(), false)],
@@ -212,6 +232,310 @@ pub(crate) fn verified(store: &Store, head: Option<Ptr>) -> Result<crate::Verifi
         named_merges(&load_refs(store, head)?)?;
     }
     Ok(report)
+}
+
+/// Re-hashes every object reachable from `roots` one at a time, in the order [`Roots::walk`]
+/// reaches them, and returns how many there are and the bytes they take.
+///
+/// # Errors
+///
+/// The first read error in that order, such as [`Error::Corrupt`] for an object whose bytes do
+/// not match its hash.
+fn walked(store: &Store, roots: &Roots) -> Result<(u64, u64)> {
+    let mut seen = HashSet::new();
+    let (mut objects, mut bytes) = (0, 0);
+    roots.walk(
+        store,
+        |ptr, _| seen.insert(ptr),
+        |_, _, len| {
+            objects += 1;
+            bytes += u64::from(len);
+        },
+    )?;
+    Ok((objects, bytes))
+}
+
+/// Re-hashes the same objects as [`walked`] and returns the same counts, faster: the log entries
+/// are walked as [`walked`] walks them, and the trees they reach on as many threads as
+/// [`rehash_threads`] gives, each reading through [`Store::check_record`], which allocates nothing
+/// for an object and decompresses a body straight into the bytes it hashes, and checking the
+/// hashes of small objects in a [`HashBatch`], many at once.
+///
+/// An object's links are followed before its hash is checked, so after damage it can read
+/// records that [`walked`] would not reach, but it fails wherever [`walked`] does.
+///
+/// # Errors
+///
+/// A read error if any object fails to read or check, though not always the first that
+/// [`walked`] reports.
+fn rehashed(store: &Store, roots: &Roots) -> Result<(u64, u64)> {
+    let mut seen: HashSet<Ptr, ByHash> = HashSet::default();
+    let mut trees = Vec::new();
+    let (mut objects, mut bytes) = (0, 0);
+    roots.walk(
+        store,
+        |ptr, entry| match entry {
+            true => seen.insert(ptr),
+            false => {
+                trees.push(ptr);
+                false
+            }
+        },
+        |_, _, len| {
+            objects += 1;
+            bytes += u64::from(len);
+        },
+    )?;
+    trees.reverse();
+    let threads = rehash_threads(store);
+    let (more, more_bytes) = match threads {
+        1 => rehashed_alone(store, seen, trees)?,
+        _ => Rehash::new(store, seen, trees, threads).run()?,
+    };
+    Ok((objects + more, bytes + more_bytes))
+}
+
+/// How many threads [`rehashed`] walks the trees of `store` on, counting its own: the
+/// [`StoreOptions::copy_threads`] it was opened with, or for 0, the number of cores up to
+/// [`REHASH_THREADS`] once the log holds [`REHASH_ALONE`] bytes, and 1 below that.
+fn rehash_threads(store: &Store) -> usize {
+    match store.copy_threads() {
+        0 if store.size() < REHASH_ALONE => 1,
+        0 => thread::available_parallelism().map_or(1, |cores| cores.get().min(REHASH_THREADS)),
+        threads => threads,
+    }
+}
+
+/// Re-hashes every object that `trees`, a stack, reaches and `seen` does not hold, on this thread,
+/// and returns how many there are and the bytes they take.
+fn rehashed_alone(
+    store: &Store,
+    mut seen: HashSet<Ptr, ByHash>,
+    mut trees: Vec<Ptr>,
+) -> Result<(u64, u64)> {
+    let mut links = Vec::new();
+    let mut batch = HashBatch::new();
+    let (mut objects, mut bytes) = (0, 0);
+    while let Some(ptr) = trees.pop() {
+        if !seen.insert(ptr) {
+            continue;
+        }
+        bytes += u64::from(store.check_record(ptr, &mut links, &mut batch)?);
+        objects += 1;
+        trees.extend_from_slice(&links);
+    }
+    batch.finish()?;
+    Ok((objects, bytes))
+}
+
+/// A walk over trees that several threads share, each re-hashing the objects it reaches first.
+///
+/// Each thread walks depth first from the objects it took, and hands the older half of what it
+/// has yet to walk to the shared stack whenever that is empty and another thread waits for work,
+/// once it has checked every hash its [`HashBatch`] holds, so that every object on the shared
+/// stack was reached through records whose hashes matched. The walk ends once every thread waits
+/// with the shared stack empty, or one fails.
+struct Rehash<'a> {
+    store: &'a Store,
+    /// The objects reached so far, in [`REHASH_SHARDS`] sets by the last bytes of their hashes.
+    seen: Vec<Shard>,
+    work: Mutex<Work>,
+    wake: Condvar,
+    /// Whether a thread waits for work and the shared stack is empty, as last seen under the lock.
+    hungry: AtomicBool,
+    failed: AtomicBool,
+}
+
+/// One set of [`Rehash::seen`], on cache lines of its own.
+#[repr(align(128))]
+struct Shard(Mutex<HashSet<Ptr, ByHash>>);
+
+/// The shared stack of a [`Rehash`], the threads walking and those of them waiting on it.
+struct Work {
+    ptrs: Vec<Ptr>,
+    threads: usize,
+    idle: usize,
+    done: bool,
+}
+
+impl<'a> Rehash<'a> {
+    /// A walk of `store` on `threads` threads from `trees`, a stack, past the objects in `seen`.
+    fn new(
+        store: &'a Store,
+        seen: HashSet<Ptr, ByHash>,
+        trees: Vec<Ptr>,
+        threads: usize,
+    ) -> Rehash<'a> {
+        let mut shards: Vec<HashSet<Ptr, ByHash>> =
+            (0..REHASH_SHARDS).map(|_| HashSet::default()).collect();
+        for ptr in seen {
+            shards[shard_of(&ptr)].insert(ptr);
+        }
+        Rehash {
+            store,
+            seen: shards
+                .into_iter()
+                .map(|shard| Shard(Mutex::new(shard)))
+                .collect(),
+            work: Mutex::new(Work {
+                ptrs: trees,
+                threads,
+                idle: 0,
+                done: false,
+            }),
+            wake: Condvar::new(),
+            hungry: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    /// Runs the walk on this thread and the others, and returns how many objects they re-hashed
+    /// and the bytes those take. A thread the system will not start is left out of the walk.
+    ///
+    /// # Errors
+    ///
+    /// The error of a thread that failed.
+    fn run(&self) -> Result<(u64, u64)> {
+        let threads = self.work.lock().threads;
+        let parts = thread::scope(|scope| {
+            let helpers: Vec<_> = (1..threads)
+                .filter_map(|_| {
+                    let spawned = thread::Builder::new()
+                        .name("ferro-verify".to_string())
+                        .spawn_scoped(scope, || self.part());
+                    if spawned.is_err() {
+                        self.work.lock().threads -= 1;
+                        self.wake.notify_all();
+                    }
+                    spawned.ok()
+                })
+                .collect();
+            let mut parts = vec![self.part()];
+            for helper in helpers {
+                match helper.join() {
+                    Ok(part) => parts.push(part),
+                    Err(panic) => resume_unwind(panic),
+                }
+            }
+            parts
+        });
+        parts
+            .into_iter()
+            .try_fold((0, 0), |(objects, bytes), part| {
+                let (more, more_bytes) = part?;
+                Ok((objects + more, bytes + more_bytes))
+            })
+    }
+
+    /// One thread's share of the walk: how many objects it re-hashed and the bytes those take.
+    ///
+    /// # Errors
+    ///
+    /// The first error of this thread, which ends the walk for every thread, as a panic does.
+    fn part(&self) -> Result<(u64, u64)> {
+        match catch_unwind(AssertUnwindSafe(|| self.walk_part())) {
+            Ok(Ok(part)) => Ok(part),
+            Ok(Err(error)) => {
+                self.stop();
+                Err(error)
+            }
+            Err(panic) => {
+                self.stop();
+                resume_unwind(panic)
+            }
+        }
+    }
+
+    /// The walk of [`Rehash::part`], which leaves ending the walk for the others to it.
+    fn walk_part(&self) -> Result<(u64, u64)> {
+        let mut stack = Vec::new();
+        let mut links = Vec::new();
+        let mut batch = HashBatch::new();
+        let mut recent = vec![None; REHASH_RECENT];
+        let (mut objects, mut bytes) = (0, 0);
+        while self.take(&mut stack) {
+            while let Some(ptr) = stack.pop() {
+                if self.failed.load(Ordering::Relaxed) {
+                    return Ok((objects, bytes));
+                }
+                let slot = &mut recent[recent_of(&ptr)];
+                if *slot == Some(ptr) {
+                    continue;
+                }
+                *slot = Some(ptr);
+                if !self.seen[shard_of(&ptr)].0.lock().insert(ptr) {
+                    continue;
+                }
+                bytes += u64::from(self.store.check_record(ptr, &mut links, &mut batch)?);
+                objects += 1;
+                stack.extend_from_slice(&links);
+                if stack.len() > 1 && self.hungry.load(Ordering::Relaxed) {
+                    batch.finish()?;
+                    self.give(&mut stack);
+                }
+            }
+        }
+        batch.finish()?;
+        Ok((objects, bytes))
+    }
+
+    /// Moves objects from the shared stack to `stack`, waiting while the stack is empty and
+    /// another thread walks, or returns `false` once the walk is over.
+    fn take(&self, stack: &mut Vec<Ptr>) -> bool {
+        let mut work = self.work.lock();
+        loop {
+            if work.done {
+                return false;
+            }
+            if !work.ptrs.is_empty() {
+                let take = work.ptrs.len().div_ceil(work.threads).min(REHASH_TAKE);
+                let from = work.ptrs.len() - take;
+                stack.extend(work.ptrs.drain(from..));
+                let hungry = work.idle > 0 && work.ptrs.is_empty();
+                self.hungry.store(hungry, Ordering::Relaxed);
+                return true;
+            }
+            if work.idle + 1 >= work.threads {
+                work.done = true;
+                self.wake.notify_all();
+                return false;
+            }
+            work.idle += 1;
+            self.hungry.store(true, Ordering::Relaxed);
+            self.wake.wait(&mut work);
+            work.idle -= 1;
+        }
+    }
+
+    /// Hands the older half of `stack` to the shared stack if that is empty and a thread waits.
+    fn give(&self, stack: &mut Vec<Ptr>) {
+        let mut work = self.work.lock();
+        if work.ptrs.is_empty() && work.idle > 0 {
+            work.ptrs.extend(stack.drain(..stack.len() / 2));
+            self.hungry.store(false, Ordering::Relaxed);
+            self.wake.notify_all();
+        }
+    }
+
+    /// Ends the walk early, after a thread failed.
+    fn stop(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+        self.work.lock().done = true;
+        self.wake.notify_all();
+    }
+}
+
+/// Where a thread of a [`Rehash`] keeps `ptr` among the objects it reached last, by bytes of its
+/// hash that neither [`shard_of`] nor the sets use.
+fn recent_of(ptr: &Ptr) -> usize {
+    usize::from(u16::from_le_bytes([ptr.hash[8], ptr.hash[9]])) % REHASH_RECENT
+}
+
+/// The shard of [`Rehash::seen`] that holds `ptr`, by the last bytes of its hash, since the sets
+/// place a hash by its first bytes.
+fn shard_of(ptr: &Ptr) -> usize {
+    let tail = [ptr.hash[HASH_BYTES - 2], ptr.hash[HASH_BYTES - 1]];
+    usize::from(u16::from_le_bytes(tail)) % REHASH_SHARDS
 }
 
 /// Checks that every merge record in `refs` names a branch `refs` holds, as dropping a branch

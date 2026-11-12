@@ -154,6 +154,13 @@ numbers. This index lists them by subsystem.
 - `File::lock`, `ReOpenFile`, generation-numbered files, and deleting before renaming:
   [Windows](windows.md).
 
+## Verify
+
+- Reading a record as a `get` does, and windows of 1 to 64 KiB before and 1 to 16 KiB from it,
+  [Reading records](verify.md#reading-records); 64 sets packed together for eight threads, and
+  no memory of the objects a thread reached last, [Threads](verify.md#threads); a sorted pass over
+  the file and a set without locks, [Left out](verify.md#left-out).
+
 ## Errors and tables
 
 - Decode errors as `Error`, and checking separators on local reads: [Errors and checks on local

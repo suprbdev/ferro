@@ -1684,9 +1684,11 @@ impl Options {
         self
     }
 
-    /// How many threads a reclamation cycle copies and checks on, counting the one it runs on.
+    /// How many threads a reclamation cycle copies and checks on, and [`Db::verify`] and
+    /// [`Db::verify_typed`] re-hash on, counting the one each runs on.
     ///
-    /// Zero, the default, means the number of cores up to 8, and 1 keeps a cycle on one thread.
+    /// Zero, the default, means the number of cores up to 8, though a verify of a log under 1 MiB
+    /// stays on one thread, and 1 keeps a cycle or a verify on one thread.
     pub fn copy_threads(mut self, threads: usize) -> Self {
         self.store.copy_threads = threads;
         self
@@ -6162,6 +6164,10 @@ impl<T: Data> Db<T> {
     /// map's, so that a lookup by name finds every branch the table lists, and it checks that
     /// each branch's merge records name a branch the table holds, as dropping a branch removes the
     /// records that name it.
+    ///
+    /// It re-hashes on as many threads as [`Options::copy_threads`] gives, by default one per core
+    /// up to 8 once the log holds 1 MiB, and the error it reports for a damaged file does not
+    /// depend on how many.
     ///
     /// # Errors
     ///

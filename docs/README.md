@@ -53,6 +53,7 @@ machine, most of them on 2026-11-05. Start with [Getting started](guide/getting-
 | [Windows](internals/windows.md) | Locks, durability and renaming over an open file |
 | [Schema evolution, unique and covering indexes](internals/schema-and-unique-indexes.md) | Field tags, unique constraints and ranges, covered fields and their cost, index fingerprints and combined lookups |
 | [Errors and checks on local reads](internals/errors.md) | Panics, `Result` and bounds on crafted files |
+| [Verifying a file](internals/verify.md) | The walk, reads, hashes checked many at once, threads, and the slow sync after an idle disk |
 | [Fuzzing and testing](internals/testing.md) | Fuzz targets, and where the other tests are described |
 | [A delta log between checkpoints](internals/delta-log.md) | A design that was built, measured and left out |
 | [Alternatives measured and rejected](internals/alternatives.md) | An index of everything left out, by subsystem |

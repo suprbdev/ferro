@@ -45,6 +45,8 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use blake3::IncrementCounter;
+use blake3::platform::Platform;
 use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
@@ -237,6 +239,223 @@ impl<'a> Hashing<'a> {
         out.copy_from_slice(&full.as_bytes()[..HASH_BYTES]);
         out
     }
+}
+
+/// The words BLAKE3 starts the chaining value of every chunk from, in unkeyed hashing.
+const BLAKE3_IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+/// BLAKE3's flag for the first block of a chunk.
+const CHUNK_START: u8 = 1 << 0;
+/// BLAKE3's flag for the last block of a chunk.
+const CHUNK_END: u8 = 1 << 1;
+/// BLAKE3's flag for the compression that gives the hash of the whole input.
+const ROOT: u8 = 1 << 3;
+/// The most inputs a [`HashBatch`] compresses at once, the widest SIMD degree BLAKE3 has.
+const BATCH_INPUTS: usize = 16;
+/// The blocks of a BLAKE3 chunk, so the most a [`HashBatch`] input takes.
+const CHUNK_BLOCKS: usize = blake3::CHUNK_LEN / blake3::BLOCK_LEN;
+/// The most bytes a [`HashBatch`] keeps for the body of an object larger than a chunk once it is
+/// checked.
+const SPILL_KEEP: usize = 1 << 20;
+
+/// Checks the hashes of many objects together, so that BLAKE3 compresses the blocks of several
+/// at once with SIMD rather than each block after the one before.
+///
+/// An object whose hashed bytes fit one BLAKE3 chunk, 1 KiB, is queued with the others whose
+/// bytes take as many blocks, and a group is checked once it holds as many objects as the CPU
+/// compresses at once: every block but the last of each through
+/// `blake3::platform::Platform::hash_many`, then each last block with the root flag. A larger
+/// object is hashed at once. Each check gives the hash [`hash_parts`] gives.
+///
+/// `blake3::platform` is public for the crate's benchmarks and not part of its documented API,
+/// so ferro depends on one exact version of `blake3`, and a unit test checks this against
+/// [`hash_parts`] at every length up to a chunk.
+pub(crate) struct HashBatch {
+    platform: Platform,
+    full: usize,
+    groups: Vec<Group>,
+    spill: Vec<u8>,
+}
+
+/// The objects a [`HashBatch`] has queued whose hashed bytes take the same number of blocks.
+#[derive(Default)]
+struct Group {
+    /// Each object's hashed bytes, padded with zeroes to whole blocks.
+    bytes: Vec<u8>,
+    /// Each object's length of hashed bytes, and its pointer.
+    queued: Vec<(usize, Ptr)>,
+}
+
+impl HashBatch {
+    /// An empty batch, for the CPU this runs on.
+    pub(crate) fn new() -> HashBatch {
+        HashBatch::on(Platform::detect())
+    }
+
+    /// An empty batch that hashes through `platform`.
+    fn on(platform: Platform) -> HashBatch {
+        HashBatch {
+            platform,
+            full: platform.simd_degree().clamp(1, BATCH_INPUTS),
+            groups: (0..CHUNK_BLOCKS).map(|_| Group::default()).collect(),
+            spill: Vec::new(),
+        }
+    }
+
+    /// Queues the check that the object at `ptr`, of `raw` body bytes and links with these
+    /// hashes, whose body `fill` writes into the bytes it is given, has `ptr`'s hash, and checks
+    /// the group it joins if that is full.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `fill` returns, which leaves nothing queued for the object, and
+    /// [`Error::Corrupt`] for the first object of a group it checks whose hash differs.
+    pub(crate) fn check_filled<'a>(
+        &mut self,
+        ptr: Ptr,
+        raw: usize,
+        links: impl ExactSizeIterator<Item = &'a Hash>,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        let total = links
+            .len()
+            .saturating_mul(HASH_BYTES)
+            .saturating_add(raw.saturating_add(8));
+        if total > blake3::CHUNK_LEN {
+            let hash = hash_filled(raw, links, &mut self.spill, fill);
+            self.spill.clear();
+            self.spill.shrink_to(SPILL_KEEP);
+            return matches(hash?, ptr);
+        }
+        let blocks = total.div_ceil(blake3::BLOCK_LEN);
+        let group = &mut self.groups[blocks - 1];
+        let at = group.bytes.len();
+        group.bytes.resize(at + blocks * blake3::BLOCK_LEN, 0);
+        let slot = &mut group.bytes[at..];
+        slot[..4].copy_from_slice(&(raw as u32).to_le_bytes());
+        slot[4..8].copy_from_slice(&(links.len() as u32).to_le_bytes());
+        if let Err(error) = fill(&mut slot[8..8 + raw]) {
+            group.bytes.truncate(at);
+            return Err(error);
+        }
+        for (index, link) in links.enumerate() {
+            let from = 8 + raw + index * HASH_BYTES;
+            slot[from..from + HASH_BYTES].copy_from_slice(link);
+        }
+        group.queued.push((total, ptr));
+        match group.queued.len() >= self.full {
+            true => self.check_group(blocks - 1),
+            false => Ok(()),
+        }
+    }
+
+    /// Checks every object still queued.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] for the first object of a group whose hash differs.
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        (0..CHUNK_BLOCKS).try_for_each(|index| self.check_group(index))
+    }
+
+    /// Checks the objects queued in the group whose hashed bytes take `before` blocks before the
+    /// last, and empties it.
+    fn check_group(&mut self, before: usize) -> Result<()> {
+        let group = &mut self.groups[before];
+        let stride = (before + 1) * blake3::BLOCK_LEN;
+        let mut out = [0u8; BATCH_INPUTS * blake3::OUT_LEN];
+        let mut found = Ok(());
+        for (part, queued) in group.queued.chunks(BATCH_INPUTS).enumerate() {
+            let bytes = &group.bytes[part * BATCH_INPUTS * stride..];
+            let out = &mut out[..queued.len() * blake3::OUT_LEN];
+            leading(&self.platform, before, bytes, stride, out);
+            for (index, &(total, ptr)) in queued.iter().enumerate() {
+                let mut cv = BLAKE3_IV;
+                if before > 0 {
+                    let words = out[index * blake3::OUT_LEN..].chunks_exact(4);
+                    for (word, bytes) in cv.iter_mut().zip(words) {
+                        *word = u32::from_le_bytes(bytes.try_into().expect("a word is 4 bytes"));
+                    }
+                }
+                let from = index * stride + before * blake3::BLOCK_LEN;
+                let last: &[u8; blake3::BLOCK_LEN] = bytes[from..from + blake3::BLOCK_LEN]
+                    .try_into()
+                    .expect("a slot ends in a whole block");
+                let flags = CHUNK_END | ROOT | if before == 0 { CHUNK_START } else { 0 };
+                let len = (total - before * blake3::BLOCK_LEN) as u8;
+                self.platform
+                    .compress_in_place(&mut cv, last, len, 0, flags);
+                let mut hash = [0u8; HASH_BYTES];
+                for (bytes, word) in hash.chunks_mut(4).zip(cv) {
+                    bytes.copy_from_slice(&word.to_le_bytes());
+                }
+                if found.is_ok() {
+                    found = matches(hash, ptr);
+                }
+            }
+        }
+        group.bytes.clear();
+        group.queued.clear();
+        found
+    }
+}
+
+/// Fails with [`Error::Corrupt`] unless `hash` is the hash `ptr` names.
+fn matches(hash: Hash, ptr: Ptr) -> Result<()> {
+    match hash == ptr.hash {
+        true => Ok(()),
+        false => Err(Error::Corrupt(format!(
+            "hash mismatch for object at {}",
+            ptr.offset
+        ))),
+    }
+}
+
+/// Compresses every block but the last of each input in `bytes`, one every `stride` bytes and each
+/// `before` blocks before its last, as the start of a chunk, through `platform`, writing each
+/// input's chaining value to `out`, which holds one for each input. It writes nothing for
+/// `before` 0.
+fn leading(platform: &Platform, before: usize, bytes: &[u8], stride: usize, out: &mut [u8]) {
+    match before {
+        1 => leading_of::<64>(platform, bytes, stride, out),
+        2 => leading_of::<128>(platform, bytes, stride, out),
+        3 => leading_of::<192>(platform, bytes, stride, out),
+        4 => leading_of::<256>(platform, bytes, stride, out),
+        5 => leading_of::<320>(platform, bytes, stride, out),
+        6 => leading_of::<384>(platform, bytes, stride, out),
+        7 => leading_of::<448>(platform, bytes, stride, out),
+        8 => leading_of::<512>(platform, bytes, stride, out),
+        9 => leading_of::<576>(platform, bytes, stride, out),
+        10 => leading_of::<640>(platform, bytes, stride, out),
+        11 => leading_of::<704>(platform, bytes, stride, out),
+        12 => leading_of::<768>(platform, bytes, stride, out),
+        13 => leading_of::<832>(platform, bytes, stride, out),
+        14 => leading_of::<896>(platform, bytes, stride, out),
+        15 => leading_of::<960>(platform, bytes, stride, out),
+        _ => {}
+    }
+}
+
+/// [`leading`] for inputs whose blocks before the last take `N` bytes.
+fn leading_of<const N: usize>(platform: &Platform, bytes: &[u8], stride: usize, out: &mut [u8]) {
+    let count = out.len() / blake3::OUT_LEN;
+    let inputs: [&[u8; N]; BATCH_INPUTS] = std::array::from_fn(|index| {
+        let from = index.min(count - 1) * stride;
+        bytes[from..from + N]
+            .try_into()
+            .expect("a slot holds its blocks before the last")
+    });
+    platform.hash_many(
+        &inputs[..count],
+        &BLAKE3_IV,
+        0,
+        IncrementCounter::No,
+        0,
+        CHUNK_START,
+        0,
+        out,
+    );
 }
 
 impl Object {
@@ -4248,3 +4467,96 @@ tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8);
 tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
 tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
 tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(seed: u64, raw: usize, links: usize) -> (Vec<u8>, Vec<Hash>) {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
+        let body = (0..raw).map(|_| next()).collect();
+        let hashes = (0..links)
+            .map(|_| std::array::from_fn(|_| next()))
+            .collect();
+        (body, hashes)
+    }
+
+    fn queue(batch: &mut HashBatch, ptr: Ptr, body: &[u8], hashes: &[Hash]) -> Result<()> {
+        batch.check_filled(ptr, body.len(), hashes.iter(), |out| {
+            out.copy_from_slice(body);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_batch_checks_the_hash_hash_parts_gives_at_every_length_up_to_past_a_chunk() {
+        let mut platforms = vec![Platform::portable(), Platform::detect()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        platforms.extend(
+            [Platform::sse2(), Platform::sse41(), Platform::avx2()]
+                .into_iter()
+                .flatten(),
+        );
+        for platform in platforms {
+            let mut batch = HashBatch::on(platform);
+            let mut offset = 0;
+            for raw in 0..1200 {
+                for links in [0, 1, 7] {
+                    let (body, hashes) = object(offset, raw, links);
+                    offset += 1;
+                    let hash = hash_parts(&body, hashes.iter());
+                    queue(&mut batch, Ptr { hash, offset }, &body, &hashes).unwrap();
+                }
+            }
+            batch.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_batch_names_the_object_whose_hash_differs_in_any_group() {
+        for raw in [0, 40, 56, 57, 300, 1000, 1016, 1017, 5000] {
+            let mut batch = HashBatch::new();
+            let mut failed = None;
+            for offset in 0..40 {
+                let (body, hashes) = object(offset, raw, 1);
+                let mut hash = hash_parts(&body, hashes.iter());
+                if offset == 21 {
+                    hash[HASH_BYTES - 1] ^= 1;
+                }
+                if let Err(error) = queue(&mut batch, Ptr { hash, offset }, &body, &hashes) {
+                    failed = Some(error);
+                    break;
+                }
+            }
+            let error = match failed {
+                Some(error) => error,
+                None => batch.finish().unwrap_err(),
+            };
+            match error {
+                Error::Corrupt(message) => {
+                    assert_eq!(message, "hash mismatch for object at 21", "{raw} bytes")
+                }
+                other => panic!("{raw} bytes: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_that_fails_to_fill_leaves_its_group_as_it_was() {
+        let mut batch = HashBatch::new();
+        let (body, hashes) = object(1, 100, 2);
+        let hash = hash_parts(&body, hashes.iter());
+        queue(&mut batch, Ptr { hash, offset: 1 }, &body, &hashes).unwrap();
+        let refused = batch.check_filled(Ptr { hash, offset: 2 }, 100, hashes.iter(), |_| {
+            Err(Error::Corrupt("refused".into()))
+        });
+        assert!(matches!(refused, Err(Error::Corrupt(message)) if message == "refused"));
+        batch.finish().unwrap();
+    }
+}

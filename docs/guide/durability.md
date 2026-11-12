@@ -18,7 +18,10 @@ the file holds. `verify_typed` also decodes every object reachable from every re
 your type: it checks each map node's count, level and key range, that each value is stored in its
 node or apart from it as its encoded size says, and that each `List` holds exactly the positions
 below its length, recomputes each summary, and checks each table's indexes against its rows, at the
-cost of a full decode. `admin::verify` and `ferro verify` check what `verify` does.
+cost of a full decode. `admin::verify` and `ferro verify` check what `verify` does. Each re-hashes
+on one thread per core up to 8 once the log holds 1 MiB, or as many as `Options::copy_threads` says,
+and reports the same error for a damaged file whatever the number, as [Verifying a
+file](../internals/verify.md) describes.
 
 ## Errors on read
 

@@ -51,8 +51,8 @@ use quick_cache::{DefaultHashBuilder, Lifecycle, Weighter};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::codec::{
-    ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, Hashing, Moved, Moves, Object, Ptr, Relocate,
-    Sink, Staged, hash_filled, hash_parts, push_varint,
+    ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, HashBatch, Hashing, Moved, Moves, Object, Ptr,
+    Relocate, Sink, Staged, hash_filled, hash_parts, push_varint,
 };
 use crate::dense::{Ascending, Column};
 use crate::error::{Error, Result};
@@ -152,6 +152,11 @@ const WINDOW_BEHIND: u64 = 4 << 10;
 const WINDOW_AHEAD: u64 = 4 << 10;
 /// How close to the start of a streaming [`Window`] a read must land for it to read wider.
 const WINDOW_NEAR: u64 = 64 << 10;
+/// How many bytes before a record [`Store::check_record`] reads with it.
+const CHECK_BEHIND: u64 = 16 << 10;
+/// How many bytes from a record's start [`Store::check_record`] reads, enough for nearly every
+/// record whole.
+const CHECK_AHEAD: u64 = 4 << 10;
 /// The most bytes a catch-up keeps in memory of the frames another process placed, for reads of
 /// the objects in them, counting the whole buffer of each read the frames came from, and so the
 /// largest frame it keeps together with the bytes read past it.
@@ -343,8 +348,9 @@ pub struct StoreOptions {
     /// Lets several processes write the file, if every one of them opens it with this, through
     /// byte-range locks that only 64-bit Linux has.
     pub shared: bool,
-    /// How many threads a reclamation cycle copies and checks on, counting its own. Zero, the
-    /// default, means the number of cores up to 8.
+    /// How many threads a reclamation cycle copies and checks on, and a verify re-hashes on,
+    /// counting its own. Zero, the default, means the number of cores up to 8, though a verify of
+    /// a log under 1 MiB stays on one thread.
     pub copy_threads: usize,
     /// Records every write, sync and change of length to the file, for crash tests.
     #[doc(hidden)]
@@ -1848,10 +1854,28 @@ impl Window {
         Ok(&self.bytes[(offset - start) as usize..])
     }
 
+    /// Reads the window for a record at `offset` in `store`'s `file` from [`CHECK_BEHIND`] bytes
+    /// before it to [`CHECK_AHEAD`] bytes from it, never past `tail`, and returns its bytes from
+    /// `offset`.
+    ///
+    /// A walk down a tree reads a node's children next, which were written before the node.
+    fn around(&mut self, file: &File, store: u64, offset: u64, tail: u64) -> Result<&[u8]> {
+        self.store = 0;
+        self.streaming.set(false);
+        let start = offset.saturating_sub(CHECK_BEHIND).max(LOG_START);
+        self.read(file, start, tail.min(offset.saturating_add(CHECK_AHEAD)))?;
+        self.store = store;
+        self.start = start;
+        Ok(&self.bytes[(offset - start) as usize..])
+    }
+
     /// Reads the bytes of `file` from `start` to `end` into the window.
     fn read(&mut self, file: &File, start: u64, end: u64) -> std::io::Result<()> {
-        self.bytes.clear();
-        self.bytes.resize((end - start) as usize, 0);
+        let len = (end - start) as usize;
+        match self.bytes.len() < len {
+            true => self.bytes.resize(len, 0),
+            false => self.bytes.truncate(len),
+        }
         file.read_exact_at(&mut self.bytes, start)
     }
 }
@@ -1940,6 +1964,32 @@ pub(crate) fn verify_stored(
         )));
     }
     Ok(())
+}
+
+/// Queues in `batch` the check that `record`, the bytes of the record at `ptr` that
+/// [`stored_within`] found to hold `stored` and `links`, holds an object whose hash is `ptr`'s, as
+/// [`verify_stored`] checks it at once.
+///
+/// # Errors
+///
+/// `Error::Corrupt` if the body does not decompress to its length, and the errors of
+/// [`HashBatch::check_filled`].
+fn batch_stored(
+    record: &[u8],
+    stored: &Stored,
+    links: &[Ptr],
+    ptr: Ptr,
+    batch: &mut HashBatch,
+) -> Result<()> {
+    let payload = &record[stored.payload.clone()];
+    let hashes = links.iter().map(|link| &link.hash);
+    batch.check_filled(ptr, stored.raw, hashes, |body| match stored.packed {
+        true => unpack_slice(payload, body, ptr.offset),
+        false => {
+            body.copy_from_slice(payload);
+            Ok(())
+        }
+    })
 }
 
 /// Seals the file of a new generation: syncs its log, writes a superblock naming `head` at `seq`
@@ -3189,6 +3239,11 @@ impl Store {
         self.inner.basis
     }
 
+    /// The [`StoreOptions::copy_threads`] the store was opened with.
+    pub(crate) fn copy_threads(&self) -> usize {
+        self.inner.options.copy_threads
+    }
+
     /// The file's metadata.
     pub(crate) fn metadata(&self) -> Result<std::fs::Metadata> {
         Ok(self.inner.file.metadata()?)
@@ -4421,6 +4476,98 @@ impl Store {
                 let file = Some(&*self.inner.file);
                 Store::read_within(file, ptr, tail, bytes, true, false, None, false)
                     .and_then(|(object, _, _)| f(&object.body, &object.links))
+            }
+        }
+    }
+
+    /// Reads the record at `ptr` as [`Store::read_record`] does and queues the check of its hash
+    /// in `batch`, without keeping its body: fills `links` with its links and returns its length in
+    /// the log.
+    ///
+    /// The bytes come from the frames a catch-up kept, from the [`Window`] this thread last read
+    /// from the file if it holds the record whole, or from a new read of the bytes around the
+    /// record, and a compressed body is decompressed straight into the bytes its hash is taken
+    /// over. A record that does not parse within those bytes is read and checked at once.
+    ///
+    /// A caller can reach `ptr` through a link of a record whose check is still queued, which
+    /// damage can point anywhere, so before it reads past the frames written so far, which could
+    /// wait for one being written, or reads a record longer than those bytes, which could claim
+    /// most of the file, it checks everything `batch` holds.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Store::read_record`], though the message of an [`Error::Corrupt`] can differ for
+    /// a record that fails more than one check, and the error for a hash that differs can come
+    /// from a later call or from [`HashBatch::finish`] instead.
+    pub(crate) fn check_record(
+        &self,
+        ptr: Ptr,
+        links: &mut Vec<Ptr>,
+        batch: &mut HashBatch,
+    ) -> Result<u32> {
+        if ptr.offset >= self.inner.written.load(Ordering::Acquire) {
+            batch.finish()?;
+        }
+        let tail = self.readable_past(ptr.offset)?;
+        if ptr.offset < LOG_START || ptr.offset >= tail {
+            return Err(Error::Corrupt(format!(
+                "pointer {} outside log of {tail} bytes",
+                ptr.offset
+            )));
+        }
+        let kept = self
+            .inner
+            .options
+            .shared
+            .then(|| self.inner.followed.load());
+        let held = kept
+            .as_ref()
+            .and_then(|kept| kept.as_deref())
+            .map_or(&[][..], |kept| kept.from(ptr.offset, tail));
+        let mut window = WINDOW.try_with(Cell::take).unwrap_or_default();
+        let checked = self.check_within(held, &mut window, links, batch, ptr, tail);
+        let _ = WINDOW.try_with(|kept| kept.set(window));
+        checked
+    }
+
+    /// [`Store::check_record`] with its bytes and buffers in hand.
+    fn check_within(
+        &self,
+        held: &[u8],
+        window: &mut Window,
+        links: &mut Vec<Ptr>,
+        batch: &mut HashBatch,
+        ptr: Ptr,
+        tail: u64,
+    ) -> Result<u32> {
+        let id = self.inner.id;
+        let length = |stored: &Stored| {
+            u32::try_from(stored.len).map_err(|_| Error::Corrupt("record overflow".into()))
+        };
+        if held.is_empty()
+            && let Some(bytes) = window.holding(id, ptr.offset, tail)
+            && let Some(stored) = stored_within(bytes, ptr.offset, links)
+        {
+            batch_stored(bytes, &stored, links, ptr, batch)?;
+            return length(&stored);
+        }
+        let bytes = match held.is_empty() {
+            true => window.around(&self.inner.file, id, ptr.offset, tail)?,
+            false => held,
+        };
+        match stored_within(bytes, ptr.offset, links) {
+            Some(stored) => {
+                batch_stored(bytes, &stored, links, ptr, batch)?;
+                length(&stored)
+            }
+            None => {
+                batch.finish()?;
+                let file = Some(&*self.inner.file);
+                let (object, len, _) =
+                    Store::read_within(file, ptr, tail, bytes, true, false, None, false)?;
+                links.clear();
+                links.extend_from_slice(&object.links);
+                Ok(len)
             }
         }
     }
