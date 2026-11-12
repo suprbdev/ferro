@@ -28,7 +28,7 @@ use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use crate::admin::Keep;
-use crate::codec::{Data, Decoder, Encoder, Hash, Moves, Object, Ptr, Sink, try_hash_of};
+use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, try_hash_of};
 use crate::error::{Error, Result};
 use crate::follow::{Follower, Following};
 use crate::graph::{self, Start};
@@ -1959,6 +1959,16 @@ fn write_decoded<D: Data>(value: &D, txn: &mut Txn, store: &Store) -> Result<(Pt
     Ok((txn.put(object, hash)?, decoded))
 }
 
+/// Decodes a moved draft's root `object` again through its links as `settling` moved them, so
+/// that the value reads the records at their new offsets.
+fn decode_moved<T: Data>(object: &Object, settling: &Settling, store: &Store) -> Result<T> {
+    let links = object.links.iter().map(|link| settling.ptr(*link));
+    let links = links
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Error::Corrupt("a drafted root links a record its frame lost".into()))?;
+    T::decode(&mut Decoder::new(&object.body, &links, Some(store)))
+}
+
 type Placed<T> = (u64, u64, Option<Unsettled<T>>);
 
 /// The state a commit's frame publishes for its branch, set by the committing thread once it has
@@ -1974,38 +1984,30 @@ struct Unsettled<T> {
     landing: Landing,
     slot: Laid<T>,
     later: Option<Later<T>>,
+    /// The drafted value that a moved draft's root, decoded again under `tip`, replaced, which
+    /// the commit drops once its frame is written, so that a panic there cannot leave the frame
+    /// unwritten.
+    replaced: Option<T>,
 }
 
-/// What a commit builds its branch's new state from once it has let `tip` go: the drafted value
-/// and the root object it was decoded from, which a moved draft decodes again through its moved
-/// links, and the commit and log.
+/// What a commit builds its branch's new state from once it has let `tip` go: the value, decoded
+/// again under `tip` through the moved links if the draft moved, and the commit and log.
 struct Later<T> {
     value: T,
-    object: Object,
     commit: Commit,
     log: Chain,
 }
 
 impl<T: Data> Later<T> {
-    fn state(self, store: &Store, moves: Option<&Moves>) -> Result<State<T>> {
-        let value = match moves {
-            None => self.value,
-            Some(moves) => {
-                let links = self.object.links.iter().map(|link| moves.ptr(*link));
-                let links = links.collect::<Option<Vec<_>>>().ok_or_else(|| {
-                    Error::Corrupt("a drafted root links a record its frame lost".into())
-                })?;
-                T::decode(&mut Decoder::new(&self.object.body, &links, Some(store)))?
-            }
-        };
-        Ok(State {
+    fn state(self, store: &Store) -> State<T> {
+        State {
             snapshot: Snapshot {
-                value: Arc::new(value),
+                value: Arc::new(self.value),
                 commit: Arc::new(self.commit),
             },
             log: self.log,
             store: store.clone(),
-        })
+        }
     }
 }
 
@@ -3058,7 +3060,7 @@ impl<T: Data> Shared<T> {
         let Some(unsettled) = unsettled else {
             return Ok((version, time_ms));
         };
-        let (settling, store) = if tip.commit.is_some() {
+        let (settling, store, replaced) = if tip.commit.is_some() {
             let laid = self.lay(branch, state, framed, unsettled)?;
             drop(tip);
             laid
@@ -3066,9 +3068,10 @@ impl<T: Data> Shared<T> {
             drop(tip);
             self.lay(branch, state, framed, unsettled)?
         };
-        drop(whole);
         landed();
         settling.finish(&store);
+        drop(replaced);
+        drop(whole);
         Ok((version, time_ms))
     }
 
@@ -3713,31 +3716,33 @@ impl<T: Data> Shared<T> {
         read_clock(self.clock.as_ref())
     }
 
-    /// Finishes a frame placed under `tip` and writes it: settles how its draft moved, builds the
-    /// branch's new state and makes it the branch's tip, and lands the frame. `state` and
-    /// `framed` are the branch's tip before, which a failed write puts back.
+    /// Finishes a frame placed under `tip` and writes it: builds the branch's new state and makes
+    /// it the branch's tip, and lands the frame. `state` and `framed` are the branch's tip before,
+    /// which a failed write puts back.
     ///
-    /// The caller keeps the record of the whole file until this returns, so that user code run
-    /// here, the decode of a moved root and the drops of what it replaces, cannot start a write,
-    /// which would wait behind a frame placed after this one, and so for this one.
+    /// It runs no user code, so nothing but a failed write keeps the frame from being written. It
+    /// returns how the draft moved, for [`Settling::finish`], and the drafted value a moved root
+    /// replaced, which the caller drops once it is done with the frame, still holding the record
+    /// of the whole file, so that a write from that drop fails with [`Error::Reentrant`] as one
+    /// from the decode under `tip` does.
     fn lay(
         &self,
         branch: &Branch<T>,
         state: &Arc<State<T>>,
         framed: u64,
         unsettled: Unsettled<T>,
-    ) -> Result<(Settling, Store)> {
+    ) -> Result<(Settling, Store, Option<T>)> {
         let Unsettled {
-            mut settling,
+            settling,
             store,
             landing,
             slot,
             later,
+            replaced,
         } = unsettled;
-        settling.settle();
         let next = match later {
             Some(later) => {
-                let next = Arc::new(later.state(&store, settling.moves())?);
+                let next = Arc::new(later.state(&store));
                 let _ = slot.set(next.clone());
                 next
             }
@@ -3749,7 +3754,7 @@ impl<T: Data> Shared<T> {
         branch.tip.store(next);
         branch.framed.store(landing.frame().seq, Ordering::Release);
         self.land(branch, state, framed, landing)?;
-        Ok((settling, store))
+        Ok((settling, store, replaced))
     }
 
     fn land(
@@ -3882,7 +3887,7 @@ impl<T: Data> Shared<T> {
             mut txn,
             store,
             mut root,
-            value,
+            mut value,
             object,
             entry,
             step,
@@ -3913,8 +3918,11 @@ impl<T: Data> Shared<T> {
         }
         let mut settling = txn.rebase()?;
         let corrupt = || Error::Corrupt("a drafted root links a record its frame lost".into());
+        let mut replaced = None;
         if settling.moved() {
             root = settling.ptr(root).ok_or_else(corrupt)?;
+            let moved = decode_moved(&object, &settling, &store)?;
+            replaced = Some(mem::replace(&mut value, moved));
         }
         let (commit, log) = match entry {
             Some((commit, log)) => {
@@ -3969,15 +3977,10 @@ impl<T: Data> Shared<T> {
             step,
         );
         let slot = Laid::default();
-        let later = Later {
-            value,
-            object,
-            commit,
-            log,
-        };
+        let later = Later { value, commit, log };
         let later = match txn.spilled() {
             true => {
-                let _ = slot.set(Arc::new(later.state(&store, None)?));
+                let _ = slot.set(Arc::new(later.state(&store)));
                 None
             }
             false => Some(later),
@@ -3997,6 +4000,7 @@ impl<T: Data> Shared<T> {
             landing,
             slot,
             later,
+            replaced,
         };
         Ok((version, time_ms, Some(unsettled)))
     }

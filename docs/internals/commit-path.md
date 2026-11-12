@@ -359,7 +359,7 @@ from `dedupe` only below it, so it may link into a frame that is still being wri
 one. A read between `written` and `placed` waits for `written` to pass it: a commit on another
 branch that loads a node of the refs the frame before named, once the cache has dropped it, or a
 merge that loads the other branch's newest entry. The writer it waits for holds no lock but its own
-lane, and the user code it may run before it writes cannot write, as described under [Less under
+lane and runs no user code before it writes, as described under [Less under
 `tip`](#less-under-tip), so the wait ends. A read past `placed` fails as before.
 The next commit on the same branch needs the lane, which the writer releases only after writing.
 
@@ -911,8 +911,9 @@ depends on nothing another frame can change once the frame's place is decided, s
   since the draft began wrote one of its records and that its distances fit the bytes they were
   given, and gives its root and its log entry their new offsets, the drafted ones plus how far the
   frame moved. Writing each distance again, the records' new offsets for `dedupe` and the table of
-  moves for the cache come after `tip`, before the frame is checked and written, and so do decoding
-  the moved root, building the branch's new state and storing it as the branch's tip. The frame's
+  moves for the cache come after `tip`, before the frame is checked and written, and so do building
+  the branch's new state and storing it as the branch's tip. The moved root is still decoded under
+  `tip`, before the frame is placed, as described below. The frame's
   entry in the queue holds a slot for that state, which the writer fills before it writes the
   frame, and a leader publishes a frame only once `written` has passed it, so the slot is full by
   then. A draft that spilled is written as it is placed, so its state is still built under `tip`;
@@ -931,16 +932,20 @@ depends on nothing another frame can change once the frame's place is decided, s
   with a stand-in for the link to the step before, and under `tip` the commit checks that the head
   it writes has the same fields and links to the same objects, and sets the links.
 
-When a draft moved, the decode of the moved root and the drop of the drafted value ran under `tip`,
-and now run after it but before the frame is written. A write from that user code would place a
-frame after this one and wait for this one to be written, which waits for that write, so the commit
-keeps the record of the whole file until its frame is written, and such a write fails with
-`Error::Reentrant` as it did under `tip`. Without that,
-`user_code_run_under_tip_when_a_draft_moves_cannot_deadlock_a_write` deadlocked on its first run.
-The frames are the bytes they were, since the distances are written before the frame's check, and
+When a draft moved, the decode of the moved root and the drop of the drafted value it replaces are
+user code. Both first moved out of `tip` too, to run between placing the frame and writing it. But
+a placed frame that is never written is a hole no later frame can be kept past, so an error or a
+panic from that code poisoned the store, where under `tip` it had failed only its commit (#163).
+The decode now runs under `tip` again, through the links as the rebase moved them and before the
+frame is placed, so that an error or a panic from it leaves nothing placed. The drop runs once the
+frame is written, so that a panic there leaves the frame written and the branch's new state
+stored. A write from the decode would wait for `tip`, held by its own thread, and the commit keeps
+the record of the whole file until after the drop, so a write from either fails with
+`Error::Reentrant`, as both did under `tip`. `lay`, which writes the frame, runs no user code. The
+frames are the bytes they were, since the distances are written before the frame's check, and
 `a_frame_another_branch_moves_is_the_frame_written_in_its_place` still finds each moved frame to be
-the frame placed in its place. With `shared`, a commit writes its frame before it lets go of the file's
-commit lock, so there the work taken out of `tip` still runs under that lock.
+the frame placed in its place. With `shared`, a commit writes its frame before it lets go of the
+file's commit lock, so there the work taken out of `tip` still runs under that lock.
 
 Instructions under `tip` a commit, medians of three runs alternating with the tree before:
 
@@ -972,6 +977,21 @@ built into both trees but off, commits a second and p99:
 Only 16 writers gained in both sets. At 4 writers `tip` is free most of the time, and the whole
 process ran 156,800 user-space instructions a commit against 158,400 before, two runs each, so
 nothing moved out of `tip` costs a writer more. Bytes per commit did not change.
+
+Decoding the moved root under `tip` again costs about 570 instructions a commit at 8 writers and
+590 at 16. Counted as above, medians of five runs in each of two sets alternating with the tree
+before, with the load average between 5 and 15, which gave lower counts on both trees than the
+runs above:
+
+| Writers | Before | After |
+| ---: | ---: | ---: |
+| 1 | 6,049 and 6,092 | 6,158 and 6,201 |
+| 8 | 6,546 and 6,596 | 7,119 and 7,152 |
+| 16 | 7,653 and 7,771 | 8,241 and 8,355 |
+
+One writer never moves, so its 110 more come with the code around the decode, not the decode
+itself; decoding out of line did not change them. Commits a second and p99 moved by no more than
+between runs of the same tree.
 
 Measured and left out:
 

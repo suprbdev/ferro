@@ -5277,12 +5277,6 @@ struct Shift {
 }
 
 impl Settling {
-    /// How the draft's records moved, if another frame was placed first, once
-    /// [`Settling::settle`] has run.
-    pub(crate) fn moves(&self) -> Option<&Moves> {
-        self.moves.as_ref()
-    }
-
     /// Whether another frame was placed first, so that the draft's records moved.
     pub(crate) fn moved(&self) -> bool {
         self.moves.is_some() || self.shift.is_some()
@@ -5302,8 +5296,8 @@ impl Settling {
     }
 
     /// Builds the table of how a draft moved in place went, and gives each object it wrote its
-    /// new offset, once the caller has let `tip` go.
-    pub(crate) fn settle(&mut self) {
+    /// new offset, for [`Settling::finish`] once the caller has let `tip` go.
+    fn settle(&mut self) {
         let Some(shift) = self.shift.take() else {
             return;
         };

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::future::Future;
+use std::panic::{self, AssertUnwindSafe};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -892,6 +893,206 @@ fn user_code_run_under_tip_when_a_draft_moves_cannot_deadlock_a_write() {
             (Some(500), Some(600)),
             "{kind}"
         );
+        main.verify().unwrap();
+    }
+}
+
+type Fallible = RefCell<Option<Box<dyn FnOnce() -> ferro::Result<()>>>>;
+
+thread_local! {
+    static ON_DECODE_TRY: Fallible = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Default)]
+struct Picky;
+
+impl Data for Picky {
+    fn encode(&self, w: &mut Encoder<'_>) -> ferro::Result<()> {
+        w.u8(0);
+        Ok(())
+    }
+
+    fn decode(r: &mut Decoder<'_>) -> ferro::Result<Self> {
+        r.u8()?;
+        let armed = ON_DECODE_TRY
+            .try_with(|slot| slot.borrow_mut().take())
+            .ok()
+            .flatten();
+        if let Some(run) = armed {
+            run()?;
+        }
+        Ok(Picky)
+    }
+}
+
+#[derive(Data, Clone, Default)]
+struct Picked {
+    rows: Map<u64, u64>,
+    picky: Picky,
+}
+
+fn on_drafted(options: Options) -> Options {
+    let hook = |step: &'static str| {
+        if step == "drafted" {
+            run_armed(&ON_DRAFT);
+        }
+    };
+    options.hook(Hook(Arc::new(hook)))
+}
+
+fn overtake(other: &Db<Probed>) {
+    thread::scope(|scope| {
+        let landed = scope.spawn(|| {
+            other.update(|root| {
+                root.rows.insert(500, 500);
+            })
+        });
+        landed.join().unwrap().unwrap();
+    });
+}
+
+fn still_writable(kind: &str, b: &Db<Probed>, c: &Db<Probed>) {
+    let later = [
+        (
+            "own branch",
+            b.update(|root| {
+                root.rows.insert(601, 601);
+            }),
+        ),
+        (
+            "other branch",
+            c.update(|root| {
+                root.rows.insert(700, 700);
+            }),
+        ),
+    ];
+    for (what, result) in later {
+        assert!(result.is_ok(), "{kind}: {what}: {result:?}");
+    }
+}
+
+#[test]
+fn a_write_failing_in_the_decode_of_a_moved_root_fails_only_its_commit() {
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let main: Db<Picked> = on_drafted(options())
+            .open(dir.path().join("picked.ferro"))
+            .unwrap();
+        for i in 0..20 {
+            main.update(|root| {
+                root.rows.insert(i, i);
+            })
+            .unwrap();
+        }
+        let (a, b, c) = (
+            main.fork("a").unwrap(),
+            main.fork("b").unwrap(),
+            main.fork("c").unwrap(),
+        );
+        let (fired, failed) = {
+            let (a, b, c) = (a.clone(), b.clone(), c.clone());
+            finishes(kind, move || {
+                arm(&ON_DRAFT, move || {
+                    thread::scope(|scope| {
+                        let landed = scope.spawn(|| {
+                            a.update(|root| {
+                                root.rows.insert(500, 500);
+                            })
+                        });
+                        landed.join().unwrap().unwrap();
+                    });
+                    ON_DECODE_TRY.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || c.update(|_| ()).map(drop)));
+                    });
+                });
+                let failed = b.update(|root| {
+                    root.rows.insert(600, 600);
+                });
+                let fired = ON_DECODE_TRY.with(|slot| slot.borrow_mut().take().is_none());
+                (fired, failed.map(drop))
+            })
+        };
+        assert!(fired, "{kind}: the draft did not move");
+        assert!(
+            failed.is_err(),
+            "{kind}: the commit whose decode failed landed"
+        );
+        let later = [
+            (
+                "own branch",
+                b.update(|root| {
+                    root.rows.insert(601, 601);
+                }),
+            ),
+            (
+                "other branch",
+                c.update(|root| {
+                    root.rows.insert(700, 700);
+                }),
+            ),
+        ];
+        for (what, result) in later {
+            assert!(result.is_ok(), "{kind}: {what}: {result:?}");
+        }
+        main.verify().unwrap();
+    }
+}
+
+#[test]
+fn a_panic_in_the_decode_of_a_moved_root_fails_only_its_commit() {
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let (main, b, c) = probed(on_drafted(options()), &dir);
+        let a = main.fork("a").unwrap();
+        let fired = {
+            let (a, b) = (a.clone(), b.clone());
+            finishes(kind, move || {
+                arm(&ON_DRAFT, move || {
+                    overtake(&a);
+                    arm(&ON_DECODE, || panic!("ferro: test panic in a moved decode"));
+                });
+                let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+                    b.update(|root| {
+                        root.rows.insert(600, 600);
+                    })
+                    .map(drop)
+                }));
+                assert!(!matches!(ran, Ok(Ok(()))), "the commit landed");
+                fired(&ON_DECODE)
+            })
+        };
+        assert!(fired, "{kind}: the draft did not move");
+        still_writable(kind, &b, &c);
+        main.verify().unwrap();
+    }
+}
+
+#[test]
+fn a_panic_dropping_the_value_a_moved_root_replaces_fails_only_its_commit() {
+    for (kind, options) in kinds() {
+        let dir = dir();
+        let (main, b, c) = probed(on_drafted(options()), &dir);
+        let a = main.fork("a").unwrap();
+        let fired = {
+            let (a, b) = (a.clone(), b.clone());
+            finishes(kind, move || {
+                arm(&ON_DRAFT, move || {
+                    overtake(&a);
+                    arm(&ON_DROP, || {
+                        panic!("ferro: test panic dropping a drafted value")
+                    });
+                });
+                let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                    b.update(|root| {
+                        root.rows.insert(600, 600);
+                    })
+                    .map(drop)
+                }));
+                fired(&ON_DROP)
+            })
+        };
+        assert!(fired, "{kind}: nothing was dropped");
+        still_writable(kind, &b, &c);
         main.verify().unwrap();
     }
 }

@@ -18,7 +18,9 @@ the file took about 135,000 commits a second on the test machine on 2026-11-09, 
 one writer on one branch. Moving the rest of the work that does not need the lock out from under
 it, on 2026-11-12, cut what a commit runs under it at 16 branches from about 21,000 instructions to
 8,900, and gave 1.31 to 1.47 times the commits a second at 16 branches in runs alternating with the
-tree before on the same machine, then shared with other work, as described under [Less under
+tree before on the same machine, then shared with other work. Decoding a moved draft's root went
+back under the lock, so that an error or a panic from it fails only its commit, which costs about
+590 of those instructions back, as described under [Less under
 `tip`](../internals/commit-path.md#less-under-tip). A reclamation cycle, and `receive` once its
 bundle has arrived, wait for the closure running on every branch before they hold up all of them.
 
