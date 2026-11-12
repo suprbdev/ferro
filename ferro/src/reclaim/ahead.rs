@@ -3,14 +3,17 @@
 //! The walk down a chain reads each entry from the one above it, so on one thread it waits for
 //! every read in turn. [`Ahead::begin`] splits the chain's versions into stretches, and a thread
 //! reads each stretch down its `prev` links, from the tip or from the entry its skip links lead to,
-//! checking each record's hash and keeping its bytes. The walk then takes each entry it reads from
-//! the stretch that holds it, in order, and reads an entry itself where no stretch has it next: one
-//! that no thread has reached, that a damaged link sent elsewhere, or that the walk reaches some
-//! other way, such as through a merge. So the walk sees the same records in the same order as when
-//! it reads them all itself, and meets any error on its own read.
+//! checking each record's hash and keeping its bytes, those of each batch it hands over in one
+//! buffer. The walk then takes each entry it reads from the stretch that holds it, in order, and
+//! reads an entry itself where no stretch has it next: one that no thread has reached, that a
+//! damaged link sent elsewhere, or that the walk reaches some other way, such as through a merge.
+//! So the walk sees the same records in the same order as when it reads them all itself, and meets
+//! any error on its own read.
 
 use std::collections::VecDeque;
 use std::mem;
+use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -31,17 +34,38 @@ const BATCH: usize = 32;
 const WAIT: Duration = Duration::from_millis(10);
 
 /// The record of an entry a thread read ahead of the walk, as stored, whose hash checked against
-/// the pointer it was read by.
+/// the pointer it was read by, kept with the other records of its batch in one buffer.
 pub(super) struct Fetched {
     pub(super) ptr: Ptr,
     pub(super) len: u32,
-    pub(super) record: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
+    at: Range<usize>,
 }
 
 impl Fetched {
-    fn weight(&self) -> usize {
-        self.record.capacity() + size_of::<Fetched>()
+    /// The record's bytes.
+    pub(super) fn record(&self) -> &[u8] {
+        &self.bytes[self.at.clone()]
     }
+
+    fn weight(&self) -> usize {
+        self.at.len() + size_of::<Fetched>()
+    }
+}
+
+/// The records `found` names, read into `bytes`, as one batch that shares the buffer.
+fn seal(found: &mut Vec<(Ptr, u32, Range<usize>)>, bytes: &mut Vec<u8>) -> Vec<Fetched> {
+    bytes.shrink_to_fit();
+    let bytes = Arc::new(mem::take(bytes));
+    found
+        .drain(..)
+        .map(|(ptr, len, at)| Fetched {
+            ptr,
+            len,
+            bytes: bytes.clone(),
+            at,
+        })
+        .collect()
 }
 
 /// One stretch of a chain for a thread to read: the versions from `top` down to `bottom`.
@@ -169,18 +193,20 @@ impl Ahead {
             0 => read.chain.tip,
             _ => find(source, &read.chain, read.top),
         };
-        let mut batch = Vec::new();
-        if !self.publish(read, Some(start), &mut batch) {
+        if !self.publish(read, Some(start), &mut Vec::new()) {
             return self.finish(read);
         }
+        let mut found = Vec::new();
+        let mut bytes = Vec::new();
         let mut next = start;
         let mut expect = read.top;
         while let Some(ptr) = next.filter(|ptr| ptr.offset != 0) {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            let mut record = Vec::new();
-            let Ok((object, len)) = source.read_record_into(ptr, Some(&mut record)) else {
+            let from = bytes.len();
+            let Ok((object, len)) = source.read_record_into(ptr, Some(&mut bytes)) else {
+                bytes.truncate(from);
                 break;
             };
             let decoded = Entry::decode(&mut Decoder::new(&object.body, &object.links, None));
@@ -191,17 +217,19 @@ impl Ahead {
                 break;
             }
             next = entry.prev;
-            batch.push(Fetched { ptr, len, record });
+            found.push((ptr, len, from..bytes.len()));
             if expect == read.bottom {
                 break;
             }
             expect -= 1;
             let size = if read.top - expect < 8 { 4 } else { BATCH };
-            if batch.len() >= size && !self.publish(read, Some(next), &mut batch) {
+            if found.len() >= size
+                && !self.publish(read, Some(next), &mut seal(&mut found, &mut bytes))
+            {
                 return self.finish(read);
             }
         }
-        self.publish(read, None, &mut batch);
+        self.publish(read, None, &mut seal(&mut found, &mut bytes));
     }
 
     /// Hands `batch` to the walk as the next records of the stretch `read` names, with `next`
@@ -291,10 +319,15 @@ mod tests {
     }
 
     fn fetched(at: u64) -> Fetched {
+        whole(ptr(at), vec![0])
+    }
+
+    fn whole(ptr: Ptr, record: Vec<u8>) -> Fetched {
         Fetched {
-            ptr: ptr(at),
+            ptr,
             len: 1,
-            record: vec![0],
+            at: 0..record.len(),
+            bytes: Arc::new(record),
         }
     }
 
@@ -331,11 +364,7 @@ mod tests {
         let reads = ahead.begin(&chain, 2);
         assert!(ahead.publish(&reads[1], Some(Some(ptr(2048))), &mut Vec::new()));
         assert!(ahead.publish(&reads[0], Some(Some(ptr(4096))), &mut Vec::new()));
-        let mut huge = vec![Fetched {
-            ptr: ptr(4096),
-            len: 1,
-            record: vec![0; HOLD_BYTES],
-        }];
+        let mut huge = vec![whole(ptr(4096), vec![0; HOLD_BYTES])];
         assert!(!ahead.publish(&reads[0], None, &mut huge));
         let state = ahead.state.lock();
         assert!(state.stretches[0].ended);

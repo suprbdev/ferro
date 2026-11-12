@@ -79,9 +79,10 @@ across a cycle costs time proportional to its size.
   machine with 8 cores or more, it ran at 1,078 MB/s on a file of small table rows and 2,958 MB/s on
   one of 320 byte values, measured on 2026-11-11, so a 10 GB database takes about 9 seconds. On 4
   threads it ran at 682 MB/s on the table rows and on one at 250 and 778 MB/s, measured on
-  2026-11-12 on a machine other work was sharing. On 16 threads it gains about a tenth more on table
-  rows at best, and on 32 it is slower than on 8, because one thread walks the log and writes its
-  entries.
+  2026-11-12 on a machine other work was sharing. Changes later that day copied the table rows a
+  tenth faster on one thread and about a sixth faster on 8 and 16 threads, measured on that machine
+  while other work kept it busy. On 16 threads it gains about a tenth more on table rows at best,
+  and on 32 it is slower than on 8, because one thread walks the log and writes its entries.
 - A held `Snapshot` or `Map` keeps the file it was read from open. If a cycle has replaced that file
   since, its disk space comes back only when the last such handle is dropped.
 - Without retention the file only grows.

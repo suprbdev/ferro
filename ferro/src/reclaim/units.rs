@@ -12,10 +12,12 @@
 //! them, and the smallest key holds an object, so two units that reach one object agree on which
 //! copies it whichever thread got there first. Units are placed in key order: each record its unit
 //! still holds takes the next offset, and its length follows from the offsets of its links, which
-//! are all placed before it. Workers then write placed records in jobs of at least 256 KiB,
-//! reading each one again. A unit that reaches anything the walk treats differently, such as a log
-//! entry, a pruned hash or a link at offset 0, or whose discovery fails, is tainted, and the walk
-//! copies it itself where it falls in the order.
+//! are all placed before it. Workers then write placed records in jobs of at least 256 KiB, reading
+//! each one again, records that lie next to each other in the file in one read, and hand each job
+//! to whichever thread holds the file, which writes every job waiting before it lets the file go,
+//! so no thread waits for another's write. A unit that reaches anything the walk treats
+//! differently, such as a log entry, a pruned hash or a link at offset 0, or whose discovery fails,
+//! is tainted, and the walk copies it itself where it falls in the order.
 //!
 //! While the walk goes down the chains before it hands out any unit, it passes the root of each
 //! entry to [`Units::check_ahead`], and workers with nothing else to do check the hashes of the
@@ -24,13 +26,15 @@
 //! and parses it. Before that walk goes down a chain, [`Units::read_ahead`] has threads read the
 //! chain's entries ahead of it, as [`Ahead`] describes.
 //!
-//! Each thread remembers the slots of the hashes it met lately, so a claim of one of them takes
-//! no lock, and a claim compares and lowers the slot's key without one. The offsets placed records
-//! take are kept apart from the slots that the claims and checks write, and the root of each unit
-//! the walk dispatched is found by its number rather than its hash.
+//! A slot is numbered by hash in [`Ids`], which any thread reads without a lock, and each thread
+//! remembers the numbers of the hashes it met lately. A thread numbers every link of a record it
+//! reads at once, fetching their slots into the cache together, and a claim compares and lowers
+//! the slot's key without a lock. The offsets placed records take are kept apart from the slots
+//! that the claims and checks write, and the root of each unit the walk dispatched is found by its
+//! number rather than its hash.
 
 use std::any::Any;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::mem;
 use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
@@ -39,13 +43,16 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex};
 
 use super::ByHash;
 use super::ahead::{Ahead, Read};
+use super::ids::Ids;
 use crate::codec::{HASH_BYTES, Hash, Ptr, Staged};
 use crate::error::{Error, Result};
 use crate::log::Chain;
+use crate::map::prefetch;
 use crate::platform::start_writeback;
 use crate::store::{
     Store, Traced, Unpacked, append_staged, stored_within, varint_len, verify_stored, zigzag,
@@ -63,10 +70,11 @@ pub(super) const PENDING: u64 = u64::MAX - u32::MAX as u64;
 const LEVELS: u32 = 3;
 /// The most links a node split into units may have, so that each child's index fits its byte.
 const MAX_CHILDREN: usize = 254;
-const SHARDS: usize = 256;
 const CHUNK: usize = 1 << 16;
 const CHUNKS: usize = 1 << 16;
 const JOB_BYTES: u64 = 256 << 10;
+const SPAN_BYTES: u64 = 256 << 10;
+const SPARE_OUT: usize = 8;
 const KEEP_BYTES: usize = 1 << 20;
 const WAIT: Duration = Duration::from_millis(10);
 const BATCH: usize = 16;
@@ -127,11 +135,12 @@ impl<T: Default> Chunked<T> {
 
 /// Which unit holds each object, by hash, and where each placed object sits in the copy.
 ///
-/// A slot is found by hash under one of 256 locks, and read by its number without one. The
-/// offsets placed objects take are kept apart from the slots, so that the thread placing them
-/// reads the offsets of the objects they link from lines the other threads do not write.
+/// A slot is numbered by hash in [`Ids`], which any thread reads without a lock, and read by its
+/// number. The offsets placed objects take are kept apart from the slots, so that the thread
+/// placing them reads the offsets of the objects they link from lines the other threads do not
+/// write.
 struct Claims {
-    shards: Box<[Mutex<HashMap<Hash, u32, ByHash>>]>,
+    ids: Ids,
     slots: Chunked<Slot>,
     offsets: Chunked<AtomicU64>,
     next: AtomicU32,
@@ -140,15 +149,11 @@ struct Claims {
 impl Claims {
     fn new() -> Claims {
         Claims {
-            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            ids: Ids::new(),
             slots: Chunked::new(),
             offsets: Chunked::new(),
             next: AtomicU32::new(0),
         }
-    }
-
-    fn shard(&self, hash: &Hash) -> &Mutex<HashMap<Hash, u32, ByHash>> {
-        &self.shards[usize::from(hash[8]) % SHARDS]
     }
 
     fn slot(&self, id: u32) -> &Slot {
@@ -159,19 +164,27 @@ impl Claims {
         self.offsets.get(id)
     }
 
-    fn insert(&self, map: &mut HashMap<Hash, u32, ByHash>, hash: &Hash) -> u32 {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        assert!(id < u32::MAX, "a copy of more than 2^32 objects");
-        map.insert(*hash, id);
-        id
-    }
-
     fn claim(&self, hash: &Hash, key: Key, seen: &mut Seen) -> (u32, bool) {
         let id = self.id(hash, seen);
+        (id, self.take(id, key))
+    }
+
+    fn take(&self, id: u32, key: Key) -> bool {
         let slot = self.slot(id);
-        let won = key < slot.claim.load(Ordering::Acquire)
-            && key < slot.claim.fetch_min(key, Ordering::AcqRel);
-        (id, won)
+        key < slot.claim.load(Ordering::Acquire)
+            && key < slot.claim.fetch_min(key, Ordering::AcqRel)
+    }
+
+    fn number(&self, links: &[Ptr], ids: &mut Vec<u32>, seen: &mut Seen) {
+        for link in links {
+            self.ids.prefetch(&link.hash);
+        }
+        ids.clear();
+        for link in links {
+            let id = self.id(&link.hash, seen);
+            prefetch(std::ptr::from_ref(self.slot(id)).addr());
+            ids.push(id);
+        }
     }
 
     fn id(&self, hash: &Hash, seen: &mut Seen) -> u32 {
@@ -182,36 +195,41 @@ impl Claims {
         {
             return *id;
         }
-        if seen.ids.is_empty() {
-            let first = self.next.fetch_add(IDS, Ordering::Relaxed);
-            assert!(first < u32::MAX - IDS, "a copy of more than 2^32 objects");
-            seen.ids = first..first + IDS;
-        }
-        let mut map = self.shard(hash).lock();
-        let id = *map.entry(*hash).or_insert(seen.ids.start);
-        drop(map);
-        if id == seen.ids.start {
-            seen.ids.start += 1;
-        }
+        let id = match self.ids.get(hash) {
+            Some(id) => id,
+            None => {
+                if seen.ids.is_empty() {
+                    let first = self.next.fetch_add(IDS, Ordering::Relaxed);
+                    assert!(first < u32::MAX - IDS, "a copy of more than 2^32 objects");
+                    seen.ids = first..first + IDS;
+                }
+                let id = self.ids.insert(hash, seen.ids.start);
+                if id == seen.ids.start {
+                    seen.ids.start += 1;
+                }
+                id
+            }
+        };
         seen.put(at, hash, id);
         id
     }
 
-    fn held(&self, hash: &Hash, seen: &mut Seen) -> Key {
-        self.slot(self.id(hash, seen)).claim.load(Ordering::Acquire)
+    fn held(&self, id: u32) -> Key {
+        self.slot(id).claim.load(Ordering::Acquire)
     }
 
     fn placed(&self, hash: &Hash) -> Option<u64> {
-        let id = *self.shard(hash).lock().get(hash)?;
+        let id = self.ids.get(hash)?;
         let offset = self.offset(id).load(Ordering::Acquire);
         (offset != 0).then_some(offset)
     }
 
     fn place(&self, hash: &Hash, key: Key, offset: u64) {
-        let mut map = self.shard(hash).lock();
-        let id = match map.get(hash) {
-            Some(id) => *id,
-            None => self.insert(&mut map, hash),
+        let id = match self.ids.get(hash) {
+            Some(id) => id,
+            None => self
+                .ids
+                .insert(hash, self.next.fetch_add(1, Ordering::Relaxed)),
         };
         self.slot(id).claim.store(key, Ordering::Release);
         self.offset(id).store(offset, Ordering::Release);
@@ -254,7 +272,6 @@ pub(super) struct Unit {
     index: u32,
     root: Ptr,
     depth: u32,
-    taint: Arc<HashSet<Hash, ByHash>>,
     found: OnceLock<Found>,
 }
 
@@ -458,6 +475,10 @@ impl Scratch {
 /// The bytes of records the copy's threads hold at once, as read or as written, past which a
 /// thread waits for others to finish, unless it would hold them alone.
 const BUDGET: u64 = 16 << 20;
+/// The most bytes a compressed record and its body may take together for a thread to check it
+/// without counting them against [`BUDGET`], since it decompresses so small a body into a buffer
+/// it keeps from one record to the next.
+const UNCOUNTED: usize = 4 << 10;
 
 /// The bytes the copy's threads hold, counted without a lock while they fit [`BUDGET`].
 ///
@@ -530,6 +551,22 @@ impl Drop for Taken<'_> {
     }
 }
 
+/// The bytes of a write job, built and waiting for the file, counted against the budget until
+/// written.
+struct Filled {
+    bytes: Vec<u8>,
+    start: u64,
+    held: u64,
+}
+
+/// Write jobs built and waiting for whichever thread holds the file to write them, and the buffers
+/// of jobs written, for the next to be built in.
+#[derive(Default)]
+struct Outbox {
+    filled: Vec<Filled>,
+    spare: Vec<Vec<u8>>,
+}
+
 /// Bytes of a record the walk reads, counted against the threads' budget until dropped.
 pub(super) struct Reserved {
     shared: Arc<Shared>,
@@ -550,6 +587,7 @@ struct Shared {
     dispatched: Mutex<VecDeque<Arc<Unit>>>,
     placed: AtomicU64,
     writing: Mutex<()>,
+    outbox: Mutex<Outbox>,
     queue: Mutex<Queue>,
     ready: Condvar,
     moving: Mutex<()>,
@@ -562,6 +600,7 @@ struct Shared {
     cancel: AtomicBool,
     checking: AtomicBool,
     clean: HashSet<Hash, ByHash>,
+    taint: ArcSwap<HashSet<Hash, ByHash>>,
     threads: usize,
     ahead: Arc<Ahead>,
     roots: Chunked<AtomicU32>,
@@ -612,7 +651,7 @@ impl Shared {
             .read_stored(ptr, &mut s.bytes, &mut links, claims)
             .ok()?;
         if !checked {
-            if stored.packed && stored.raw > record.len() {
+            if stored.packed && stored.raw > record.len() && record.len() + stored.raw > UNCOUNTED {
                 *taken = None;
                 *taken = Some(self.budget.take((record.len() + stored.raw) as u64));
             }
@@ -697,16 +736,19 @@ impl Shared {
         }
     }
 
-    fn split(&self, unit: &Unit, node: &Node, seen: &mut Seen) -> Option<Vec<Arc<Unit>>> {
+    fn split(&self, unit: &Unit, node: &Node, ids: &[u32]) -> Option<Vec<Arc<Unit>>> {
         if unit.depth >= LEVELS || node.links.len() < 2 || node.links.len() > MAX_CHILDREN {
             return None;
         }
         let open: Vec<(Key, Ptr)> = node
             .links
             .iter()
+            .zip(ids)
             .enumerate()
-            .map(|(index, link)| (child_key(unit.key, unit.depth, index), *link))
-            .filter(|(key, link)| self.claims.held(&link.hash, seen) > *key)
+            .filter(|(index, (_, id))| {
+                self.claims.held(**id) > child_key(unit.key, unit.depth, *index)
+            })
+            .map(|(index, (link, _))| (child_key(unit.key, unit.depth, index), *link))
             .collect();
         if open.len() < 2 {
             return None;
@@ -717,7 +759,6 @@ impl Shared {
                 index: 0,
                 root,
                 depth: unit.depth + 1,
-                taint: unit.taint.clone(),
                 found: OnceLock::new(),
             })
         });
@@ -736,29 +777,28 @@ impl Shared {
                 records,
             });
         }
-        let mut node = self.read(unit.root, id, &unit.taint, s)?;
+        let taint = self.taint.load();
+        let mut node = self.read(unit.root, id, &taint, s)?;
         let mut chain = Vec::new();
         while let [link] = node.links[..] {
             let (child, won) = self.claims.claim(&link.hash, unit.key, &mut s.seen);
             if !won {
                 break;
             }
-            let next = self.read(link, child, &unit.taint, s)?;
+            let next = self.read(link, child, &taint, s)?;
             chain.push((id, mem::replace(&mut node, next), child));
             id = child;
         }
-        let children = match self.split(unit, &node, &mut s.seen) {
+        let mut ids = s.ids.pop().unwrap_or_default();
+        self.claims.number(&node.links, &mut ids, &mut s.seen);
+        let children = match self.split(unit, &node, &ids) {
             Some(children) => {
-                let ids: Vec<u32> = node
-                    .links
-                    .iter()
-                    .map(|link| self.claims.id(&link.hash, &mut s.seen))
-                    .collect();
                 records.push(id, &node, &ids)?;
+                s.recycle(node.links, ids);
                 children
             }
             None => {
-                self.descend(unit, id, node, &mut records, s)?;
+                self.descend(unit, &taint, (id, node, ids), &mut records, s)?;
                 Vec::new()
             }
         };
@@ -771,28 +811,28 @@ impl Shared {
     fn descend(
         &self,
         unit: &Unit,
-        id: u32,
-        root: Node,
+        taint: &HashSet<Hash, ByHash>,
+        root: (u32, Node, Vec<u32>),
         records: &mut Records,
         s: &mut Scratch,
     ) -> Option<()> {
-        let ids = s.ids.pop().unwrap_or_default();
-        let mut stack = vec![(id, root, ids)];
-        while let Some((_, node, ids)) = stack.last_mut() {
-            if let Some(link) = node.links.get(ids.len()).copied() {
+        let mut stack = vec![(root, 0)];
+        while let Some(((_, node, ids), next)) = stack.last_mut() {
+            if let Some(&child) = ids.get(*next) {
                 if self.cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                let (child, won) = self.claims.claim(&link.hash, unit.key, &mut s.seen);
-                ids.push(child);
-                if won {
-                    let node = self.read(link, child, &unit.taint, s)?;
-                    let ids = s.ids.pop().unwrap_or_default();
-                    stack.push((child, node, ids));
+                let link = node.links[*next];
+                *next += 1;
+                if self.claims.take(child, unit.key) {
+                    let node = self.read(link, child, taint, s)?;
+                    let mut ids = s.ids.pop().unwrap_or_default();
+                    self.claims.number(&node.links, &mut ids, &mut s.seen);
+                    stack.push(((child, node, ids), 0));
                 }
                 continue;
             }
-            let (id, node, ids) = stack.pop().expect("the stack is not empty");
+            let ((id, node, ids), _) = stack.pop().expect("the stack is not empty");
             records.push(id, &node, &ids)?;
             s.recycle(node.links, ids);
         }
@@ -901,16 +941,56 @@ impl Shared {
     }
 
     fn write(&self, job: &Job, s: &mut Scratch) -> Result<()> {
-        let taken = self.budget.take(job.len.saturating_mul(2));
-        let written = self.write_job(job, s);
-        if s.out.capacity() > 2 * KEEP_BYTES {
-            s.out = Vec::new();
+        let held = job.len.saturating_mul(2);
+        let taken = self.budget.take(held);
+        if s.out.capacity() == 0
+            && let Some(spare) = self.outbox.lock().spare.pop()
+        {
+            s.out = spare;
         }
+        let built = self.write_job(job, s);
         if s.bytes.capacity() > KEEP_BYTES {
             s.bytes = Vec::new();
         }
-        drop(taken);
-        written
+        built?;
+        mem::forget(taken);
+        let filled = Filled {
+            bytes: mem::take(&mut s.out),
+            start: job.start,
+            held,
+        };
+        self.outbox.lock().filled.push(filled);
+        self.write_out();
+        Ok(())
+    }
+
+    fn write_out(&self) {
+        while let Some(file) = self.writing.try_lock() {
+            loop {
+                let Some(filled) = self.outbox.lock().filled.pop() else {
+                    break;
+                };
+                let written = self.file.write_all_at(&filled.bytes, filled.start);
+                match written {
+                    Ok(()) => start_writeback(&self.file, filled.start, filled.bytes.len() as u64),
+                    Err(error) => self.fail(Failure::Failed(error.into())),
+                }
+                self.budget.give(filled.held);
+                let mut bytes = filled.bytes;
+                if bytes.capacity() <= 2 * KEEP_BYTES {
+                    bytes.clear();
+                    let mut outbox = self.outbox.lock();
+                    if outbox.spare.len() < SPARE_OUT {
+                        outbox.spare.push(bytes);
+                    }
+                }
+                self.queue.lock().writing -= 1;
+            }
+            drop(file);
+            if self.outbox.lock().filled.is_empty() {
+                return;
+            }
+        }
     }
 
     fn write_job(&self, job: &Job, s: &mut Scratch) -> Result<()> {
@@ -922,6 +1002,7 @@ impl Shared {
                     "a write job names a unit it cannot copy".into(),
                 ));
             };
+            let mut span = 0..0;
             for index in range.clone() {
                 let rec = &records.list[index];
                 let slot = self.claims.slot(rec.slot);
@@ -933,15 +1014,30 @@ impl Shared {
                     return Err(misplaced(rec.src));
                 }
                 let ids = records.links(index);
-                s.bytes.resize(rec.len as usize, 0);
-                self.source.read_exact(rec.src, &mut s.bytes)?;
-                let stored = match stored_within(&s.bytes, rec.src, &mut s.links) {
+                let end = rec.src.saturating_add(u64::from(rec.len));
+                if rec.src < span.start || end > span.end {
+                    let mut last = end;
+                    for next in &records.list[index + 1..range.end] {
+                        if next.src != last || last - rec.src >= SPAN_BYTES {
+                            break;
+                        }
+                        last = last.saturating_add(u64::from(next.len));
+                    }
+                    s.bytes.resize((last - rec.src) as usize, 0);
+                    self.source.read_exact(rec.src, &mut s.bytes)?;
+                    span = rec.src..last;
+                }
+                let mut from = (rec.src - span.start) as usize;
+                let record = &s.bytes[from..from + rec.len as usize];
+                let stored = match stored_within(record, rec.src, &mut s.links) {
                     Some(stored) => stored,
                     None => {
                         let ptr = Ptr {
                             hash: [0; HASH_BYTES],
                             offset: rec.src,
                         };
+                        span = 0..0;
+                        from = 0;
                         let (_, stored) =
                             self.source
                                 .read_stored(ptr, &mut s.bytes, &mut s.links, |_| Ok(()))?;
@@ -961,7 +1057,7 @@ impl Shared {
                 }
                 let staged = Staged {
                     raw: stored.raw,
-                    payload: &s.bytes[stored.payload.clone()],
+                    payload: &s.bytes[from + stored.payload.start..from + stored.payload.end],
                     packed: stored.packed,
                     links: &s.new,
                 };
@@ -970,11 +1066,6 @@ impl Shared {
         }
         if s.out.len() as u64 != job.len {
             return Err(misplaced(job.start));
-        }
-        {
-            let _writing = self.writing.lock();
-            self.file.write_all_at(&s.out, job.start)?;
-            start_writeback(&self.file, job.start, job.len);
         }
         Ok(())
     }
@@ -1031,12 +1122,15 @@ impl Shared {
                 self.try_place();
             }
             Item::Job(job) => {
-                match panic::catch_unwind(AssertUnwindSafe(|| self.write(&job, s))) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => self.fail(Failure::Failed(error)),
-                    Err(payload) => self.fail(Failure::Panicked(payload)),
+                let failure = match panic::catch_unwind(AssertUnwindSafe(|| self.write(&job, s))) {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(Failure::Failed(error)),
+                    Err(payload) => Some(Failure::Panicked(payload)),
+                };
+                if let Some(failure) = failure {
+                    self.fail(failure);
+                    self.queue.lock().writing -= 1;
                 }
-                self.queue.lock().writing -= 1;
             }
             Item::Check(ptr) => {
                 let _ = panic::catch_unwind(AssertUnwindSafe(|| self.check_ahead(ptr, s)));
@@ -1103,7 +1197,6 @@ pub(super) struct Units {
     dispatched: u64,
     batch: Vec<Arc<Unit>>,
     checks: Vec<Ptr>,
-    taint: Arc<HashSet<Hash, ByHash>>,
     scratch: Scratch,
 }
 
@@ -1121,6 +1214,7 @@ impl Units {
                 dispatched: Mutex::default(),
                 placed: AtomicU64::new(0),
                 writing: Mutex::new(()),
+                outbox: Mutex::default(),
                 queue: Mutex::default(),
                 ready: Condvar::new(),
                 moving: Mutex::new(()),
@@ -1133,6 +1227,7 @@ impl Units {
                 cancel: AtomicBool::new(false),
                 checking: AtomicBool::new(false),
                 clean: HashSet::default(),
+                taint: ArcSwap::default(),
                 threads,
                 ahead: Arc::default(),
                 roots: Chunked::new(),
@@ -1145,15 +1240,14 @@ impl Units {
             dispatched: 0,
             batch: Vec::new(),
             checks: Vec::new(),
-            taint: Arc::default(),
             scratch: Scratch::default(),
         }
     }
 
-    /// Sets the hashes that taint a unit dispatched from now on: those of log entries and of
-    /// pruned history.
+    /// Sets the hashes that taint a unit discovered from now on: those of log entries and of
+    /// pruned history. The walk sets them while no unit it dispatched is left to place.
     pub(super) fn taint(&mut self, hashes: HashSet<Hash, ByHash>) {
-        self.taint = Arc::new(hashes);
+        self.shared.taint.store(Arc::new(hashes));
     }
 
     /// The number of units dispatched since the walk last settled them all.
@@ -1303,6 +1397,17 @@ impl Units {
         (offset != 0).then_some(offset)
     }
 
+    /// Starts fetching into the cache what [`Units::placed`] reads first for `hash`, or, for a
+    /// link that holds `pending`, what [`Units::pending`] does.
+    pub(super) fn prefetch(&self, hash: &Hash, pending: u64) {
+        match u32::try_from(u64::MAX - pending) {
+            Ok(index) if pending >= PENDING => {
+                prefetch(std::ptr::from_ref(self.shared.roots.get(index)).addr());
+            }
+            _ => self.shared.claims.ids.prefetch(hash),
+        }
+    }
+
     /// Hands the tree at `root` to the threads as the next unit, with the copy ending at `end`
     /// when no unit is outstanding, and returns the offset a link to it holds until it is placed,
     /// for [`Units::pending`].
@@ -1318,7 +1423,6 @@ impl Units {
             index: self.index,
             root,
             depth: 0,
-            taint: self.taint.clone(),
             found: OnceLock::new(),
         });
         if first {

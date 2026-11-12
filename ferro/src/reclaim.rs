@@ -38,15 +38,16 @@ use units::{Key, PENDING, Reserved, Settled, Units};
 
 mod ahead;
 mod copies;
+mod ids;
 mod units;
 
 const FLUSH_BYTES: usize = 1 << 20;
 const SPAWN_PAST: u64 = 256 << 10;
-const SPARE: usize = 64;
 const SPARE_BYTES: usize = 64 << 10;
 const COPY_THREADS: usize = 8;
 const AHEAD: usize = 16384;
 const KEEP_BYTES: usize = 16 << 20;
+const RESERVE: u64 = 1 << 16;
 
 type ByHash = BuildHasherDefault<Prehashed>;
 type ByOffset = BuildHasherDefault<Spread>;
@@ -283,7 +284,9 @@ struct CopySink<'a> {
     bytes: Vec<u8>,
     body: Vec<u8>,
     cache: EntryCache,
-    spare: Vec<Buffers>,
+    old: Vec<Ptr>,
+    frames: Vec<Pending>,
+    held: Held,
     copied: Copies,
     walked: HashMap<u64, Hash, ByOffset>,
     reached: HashMap<String, u64>,
@@ -413,18 +416,38 @@ impl Needs {
 }
 
 #[derive(Default)]
-struct Buffers {
+struct Held {
     payload: Vec<u8>,
     old: Vec<Ptr>,
     links: Vec<Ptr>,
 }
 
+impl Held {
+    fn release(&mut self, pending: &Pending) {
+        self.payload.truncate(pending.payload);
+        self.old.truncate(pending.old);
+        self.links.truncate(pending.links);
+    }
+
+    fn trim(&mut self) {
+        self.payload.clear();
+        self.old.clear();
+        self.links.clear();
+        self.payload.shrink_to(SPARE_BYTES);
+        self.old.shrink_to(SPARE_BYTES / size_of::<Ptr>());
+        self.links.shrink_to(SPARE_BYTES / size_of::<Ptr>());
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Pending {
     from: Ptr,
     raw: usize,
     packed: bool,
     next: usize,
-    held: Buffers,
+    payload: usize,
+    old: usize,
+    links: usize,
     entry: Option<Rungs>,
 }
 
@@ -495,9 +518,9 @@ impl EntryCache {
     fn read(&mut self, source: &Store, ahead: Option<&Ahead>, ptr: Ptr) -> Result<(Object, u32)> {
         self.skip();
         if let Some(fetched) = ahead.and_then(|ahead| ahead.take(ptr))
-            && let Some(object) = object_of(&fetched.record, ptr.offset)
+            && let Some(object) = object_of(fetched.record(), ptr.offset)
         {
-            self.hold(&fetched.record);
+            self.hold(fetched.record());
             return Ok((object, fetched.len));
         }
         if self.full || self.held() >= KEEP_BYTES {
@@ -818,22 +841,26 @@ impl CopySink<'_> {
     }
 
     fn step(&mut self, ptr: Ptr, entry: bool, bytes: &mut Vec<u8>) -> Result<Step> {
-        let mut held = self.spare.pop().unwrap_or_default();
         if entry
             && let Some((record, rungs)) = self.cache.take(ptr)
-            && let Some(stored) = stored_within(record, ptr.offset, &mut held.old)
+            && let Some(stored) = stored_within(record, ptr.offset, &mut self.old)
         {
-            held.payload.clear();
-            held.payload
-                .extend_from_slice(&record[stored.payload.clone()]);
-            return Ok(Step::Descend(Pending {
+            let pending = Pending {
                 from: ptr,
                 raw: stored.raw,
                 packed: stored.packed,
-                next: held.links.len(),
-                held,
+                next: 0,
+                payload: self.held.payload.len(),
+                old: self.held.old.len(),
+                links: self.held.links.len(),
                 entry: Some(rungs),
-            }));
+            };
+            self.held
+                .payload
+                .extend_from_slice(&record[stored.payload.clone()]);
+            self.held.old.extend_from_slice(&self.old);
+            self.prefetch(&self.old);
+            return Ok(Step::Descend(pending));
         }
         let (units, reserved) = (&self.units, &mut self.reserved);
         let large = |claim: usize| {
@@ -842,52 +869,65 @@ impl CopySink<'_> {
             Ok(())
         };
         self.copied.prefetch(&ptr.hash);
-        let read = self.source.read_stored(ptr, bytes, &mut held.old, large);
+        let read = self.source.read_stored(ptr, bytes, &mut self.old, large);
         self.reserved = None;
         let (record, stored) = read?;
-        for link in &held.old {
-            self.copied.prefetch(&link.hash);
-        }
+        self.prefetch(&self.old);
         if !entry || self.walked.get(&ptr.offset) != Some(&ptr.hash) {
-            verify_stored(record, &stored, &held.old, ptr, &mut self.scratch)?;
+            verify_stored(record, &stored, &self.old, ptr, &mut self.scratch)?;
         }
         let entry = match entry {
             true => {
                 let body = body_of(record, &stored, ptr.offset, &mut self.body)?;
-                Some(Rungs::of(body, &held.old)?)
+                Some(Rungs::of(body, &self.old)?)
             }
             false => None,
         };
         let payload = &record[stored.payload.clone()];
+        let links = self.held.links.len();
         if entry.is_none() {
-            while let Some(link) = held.old.get(held.links.len()) {
+            while let Some(link) = self.old.get(self.held.links.len() - links) {
                 let Link::Copied(done) = self.linked(*link)? else {
                     break;
                 };
-                held.links.push(done);
+                self.held.links.push(done);
             }
-            if held.links.len() == held.old.len() {
+            if self.held.links.len() - links == self.old.len() {
+                let held = mem::take(&mut self.held);
                 let staged = Staged {
                     raw: stored.raw,
                     payload,
                     packed: stored.packed,
-                    links: &held.links,
+                    links: &held.links[links..],
                 };
-                let done = self.emit(ptr, staged, None)?;
-                self.recycle(held);
-                return Ok(Step::Done(done));
+                let done = self.emit(ptr, staged, None);
+                self.held = held;
+                self.held.links.truncate(links);
+                return Ok(Step::Done(done?));
             }
         }
-        held.payload.clear();
-        held.payload.extend_from_slice(payload);
-        Ok(Step::Descend(Pending {
+        let pending = Pending {
             from: ptr,
             raw: stored.raw,
             packed: stored.packed,
-            next: held.links.len(),
-            held,
+            next: self.held.links.len() - links,
+            payload: self.held.payload.len(),
+            old: self.held.old.len(),
+            links,
             entry,
-        }))
+        };
+        self.held.payload.extend_from_slice(payload);
+        self.held.old.extend_from_slice(&self.old);
+        Ok(Step::Descend(pending))
+    }
+
+    fn prefetch(&self, links: &[Ptr]) {
+        for link in links {
+            self.copied.prefetch(&link.hash);
+            if let Some(units) = &self.units {
+                units.prefetch(&link.hash, link.offset);
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -981,7 +1021,7 @@ impl CopySink<'_> {
 
     fn hands_out(&self, pending: &Pending) -> bool {
         pending.entry.is_none()
-            && !pending.held.old.iter().any(|link| {
+            && !self.held.old[pending.old..].iter().any(|link| {
                 link.offset == 0
                     || self.pruned.contains(&link.hash)
                     || self
@@ -1002,23 +1042,24 @@ impl CopySink<'_> {
             Link::Entry => true,
             Link::Object => false,
         };
-        let mut stack = match self.read(root, entry)? {
+        let base = self.frames.len();
+        match self.read(root, entry)? {
             Step::Done(done) => return Ok(done),
             Step::Descend(pending) if unit && self.hands_out(&pending) => {
-                self.recycle(pending.held);
+                self.held.release(&pending);
                 return self.dispatch(root);
             }
-            Step::Descend(pending) => vec![pending],
-        };
+            Step::Descend(pending) => self.frames.push(pending),
+        }
         loop {
-            let top = stack.last_mut().expect("stack is not empty");
-            if top.next < top.held.old.len() {
-                let link = top.held.old[top.next];
+            let top = *self.frames.last().expect("stack is not empty");
+            if top.old + top.next < self.held.old.len() {
+                let link = self.held.old[top.old + top.next];
                 let unit = self.dispatches();
                 let rooted = top.entry.is_some();
                 let linked = match top.entry {
                     Some(rungs) if rungs.skip() == Some(top.next) => {
-                        let skipped = self.skipped(&top.held.links, rungs, link);
+                        let skipped = self.skipped(&self.held.links[top.links..], rungs, link);
                         Link::parent(skipped.map_err(|error| self.first(error))?)
                     }
                     Some(rungs) if top.next >= rungs.parents() => Link::parent(self.parent(link)),
@@ -1036,48 +1077,44 @@ impl CopySink<'_> {
                     reached => match self.read(link, matches!(reached, Link::Entry))? {
                         Step::Done(done) => done,
                         Step::Descend(pending) if unit && self.hands_out(&pending) => {
-                            self.recycle(pending.held);
+                            self.held.release(&pending);
                             self.dispatch(link)?
                         }
                         Step::Descend(pending) => {
-                            stack.push(pending);
+                            self.frames.push(pending);
                             continue;
                         }
                     },
                 };
-                let top = stack.last_mut().expect("stack is not empty");
-                top.held.links.push(done);
-                top.next += 1;
+                self.held.links.push(done);
+                self.frames.last_mut().expect("stack is not empty").next += 1;
                 continue;
             }
-            let mut done = stack.pop().expect("stack is not empty");
+            let done = self.frames.pop().expect("stack is not empty");
             self.flush()?;
-            self.resolve(&mut done.held.links)?;
+            let mut held = mem::take(&mut self.held);
+            let resolved = self.resolve(&mut held.links[done.links..]);
             let below = done
                 .entry
-                .map(|rungs| Self::below(done.from, &done.held.links, rungs));
+                .map(|rungs| Self::below(done.from, &held.links[done.links..], rungs));
             let staged = Staged {
                 raw: done.raw,
-                payload: &done.held.payload,
+                payload: &held.payload[done.payload..],
                 packed: done.packed,
-                links: &done.held.links,
+                links: &held.links[done.links..],
             };
-            let ptr = self.emit(done.from, staged, below)?;
-            self.recycle(done.held);
-            match stack.last_mut() {
-                Some(parent) => {
-                    parent.held.links.push(ptr);
-                    parent.next += 1;
-                }
-                None => return Ok(ptr),
+            let ptr = resolved.and_then(|()| self.emit(done.from, staged, below));
+            held.release(&done);
+            self.held = held;
+            let ptr = ptr?;
+            if self.frames.len() == base {
+                return Ok(ptr);
             }
-        }
-    }
-
-    fn recycle(&mut self, mut held: Buffers) {
-        if self.spare.len() < SPARE && held.payload.capacity() <= SPARE_BYTES {
-            held.links.clear();
-            self.spare.push(held);
+            let parent = self.frames.last().expect("stack is not empty");
+            self.copied.prefetch(&parent.from.hash);
+            self.prefetch(&self.held.links[parent.links..]);
+            self.held.links.push(ptr);
+            self.frames.last_mut().expect("stack is not empty").next += 1;
         }
     }
 }
@@ -1151,7 +1188,9 @@ impl<'a> Copier<'a> {
                 bytes: Vec::new(),
                 body: Vec::new(),
                 cache: EntryCache::default(),
-                spare: Vec::new(),
+                old: Vec::new(),
+                frames: Vec::new(),
+                held: Held::default(),
                 copied: Copies::default(),
                 walked: HashMap::default(),
                 reached: HashMap::new(),
@@ -1186,6 +1225,10 @@ impl<'a> Copier<'a> {
             let root = branch.root;
             closures.chain(&branch.log);
             let unread = sink.unread(&name, &branch.log, earlier);
+            if let Some(unread) = unread {
+                let versions = unread.last.saturating_sub(unread.first).saturating_add(1);
+                edge.reserve(3 * versions.min(RESERVE) as usize);
+            }
             if let (Some(units), Some(unread)) = (sink.units.as_mut(), unread) {
                 units.read_ahead(&unread);
             }
@@ -1252,6 +1295,8 @@ impl<'a> Copier<'a> {
         let head = encoder.finish();
         sink.needs.clear();
         sink.cache.clear();
+        sink.held.trim();
+        sink.frames = Vec::new();
         let head = head?;
         sink.flush()?;
         if let Some(units) = &mut sink.units {

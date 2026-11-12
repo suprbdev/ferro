@@ -422,7 +422,7 @@ impl Node {
 }
 
 type Seed = (u64, Option<u64>, Hash, u64);
-type Walks = Vec<(u64, Option<u64>)>;
+type Bounds = (u64, Option<u64>);
 
 /// A walk over the commits that merges brought into branches, from their merge links down.
 ///
@@ -440,7 +440,8 @@ pub(crate) struct Closures {
 /// The bounds an entry was walked with, and where it sits on a chain [`Closures::chain`] recorded.
 #[derive(Default)]
 struct Walked {
-    bounds: Walks,
+    first: Option<Bounds>,
+    more: Vec<Bounds>,
     place: Option<(usize, u64)>,
 }
 
@@ -493,7 +494,10 @@ impl Closures {
             None => None,
         };
         let walked = self.walked.entry(key).or_default();
-        walked.bounds.push((floor, after));
+        match walked.first {
+            None => walked.first = Some((floor, after)),
+            Some(_) => walked.more.push((floor, after)),
+        }
         walked.place = walked.place.or(place);
     }
 
@@ -506,18 +510,21 @@ impl Closures {
     }
 
     fn covered(&self, ptr: Ptr, floor: u64, after: Option<u64>) -> bool {
-        let walks = self
-            .walked
-            .get(&self.key(ptr))
-            .map_or(&[][..], |walked| walked.bounds.as_slice());
-        walks.iter().any(|(walked, bound)| {
-            *walked <= floor
-                && match (bound, after) {
-                    (None, _) => true,
-                    (Some(_), None) => false,
-                    (Some(bound), Some(after)) => bound <= &after,
-                }
-        })
+        let Some(walked) = self.walked.get(&self.key(ptr)) else {
+            return false;
+        };
+        walked
+            .first
+            .iter()
+            .chain(&walked.more)
+            .any(|(walked, bound)| {
+                *walked <= floor
+                    && match (bound, after) {
+                        (None, _) => true,
+                        (Some(_), None) => false,
+                        (Some(bound), Some(after)) => bound <= &after,
+                    }
+            })
     }
 
     /// Walks every queued start, lowest floor first, and every merge link reached on the way,
