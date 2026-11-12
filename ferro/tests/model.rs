@@ -3840,3 +3840,711 @@ mod failed_loads {
         .unwrap();
     }
 }
+
+mod diffed {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ferro::{Change, Data, Keep, Map, Options, Record, Set, Table};
+
+    use crate::common::{
+        Fragile, Rng, cases, defuse, fast, frames_past_the_anchor, fuse, roomy, seal_frame,
+        uncached,
+    };
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    struct Row {
+        #[key]
+        id: u32,
+        note: Vec<u8>,
+    }
+
+    #[derive(Data, Clone, Default)]
+    struct Root {
+        bytes: Map<u64, Vec<u8>>,
+        set: Set<u64>,
+        rows: Table<Row>,
+        nested: Map<u32, Map<u32, u32>>,
+    }
+
+    #[derive(Clone, Default, Debug, PartialEq)]
+    struct Model {
+        bytes: BTreeMap<u64, Vec<u8>>,
+        set: BTreeSet<u64>,
+        rows: BTreeMap<u32, Vec<u8>>,
+        nested: BTreeMap<u32, BTreeMap<u32, u32>>,
+    }
+
+    type Changes<K, W> = Vec<(K, Option<W>, Option<W>)>;
+
+    fn wanted<K: Ord + Clone, W: Clone + PartialEq>(
+        old: &BTreeMap<K, W>,
+        new: &BTreeMap<K, W>,
+    ) -> Changes<K, W> {
+        let keys: BTreeSet<&K> = old.keys().chain(new.keys()).collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                let (before, after) = (old.get(key), new.get(key));
+                (before != after).then(|| (key.clone(), before.cloned(), after.cloned()))
+            })
+            .collect()
+    }
+
+    fn got<K: Clone, V: Data, W>(
+        changes: impl Iterator<Item = Change<K, V>>,
+        f: impl Fn(&V) -> W,
+    ) -> Changes<K, W> {
+        changes
+            .map(|change| {
+                let shape = match &change {
+                    Change::Added(..) => (false, true),
+                    Change::Removed(..) => (true, false),
+                    Change::Changed(..) => (true, true),
+                };
+                let before = change.before().map(|value| f(value));
+                let after = change.after().map(|value| f(value));
+                assert_eq!((before.is_some(), after.is_some()), shape);
+                (change.key().clone(), before, after)
+            })
+            .collect()
+    }
+
+    fn inner(map: &Map<u32, u32>) -> BTreeMap<u32, u32> {
+        map.iter().map(|(key, value)| (key, *value)).collect()
+    }
+
+    fn keyed(set: &BTreeSet<u64>) -> BTreeMap<u64, ()> {
+        set.iter().map(|key| (*key, ())).collect()
+    }
+
+    fn check(old: &Root, a: &Model, new: &Root, b: &Model, rng: &mut Rng) {
+        let want = wanted(&a.bytes, &b.bytes);
+        assert_eq!(got(old.bytes.diff(&new.bytes), Vec::clone), want, "bytes");
+        let cut = rng.below(want.len() as u64 + 2) as usize;
+        let prefix = got(old.bytes.diff(&new.bytes).take(cut), Vec::clone);
+        assert_eq!(prefix[..], want[..cut.min(want.len())], "bytes prefix");
+        assert_eq!(
+            got(old.set.diff(&new.set), |_| ()),
+            wanted(&keyed(&a.set), &keyed(&b.set)),
+            "set"
+        );
+        let rows = got(old.rows.diff(&new.rows), |row: &Row| {
+            (row.id, row.note.clone())
+        });
+        let rows: Changes<u32, Vec<u8>> = rows
+            .into_iter()
+            .map(|(key, before, after)| {
+                for (id, _) in before.iter().chain(after.iter()) {
+                    assert_eq!(*id, key);
+                }
+                (key, before.map(|row| row.1), after.map(|row| row.1))
+            })
+            .collect();
+        assert_eq!(rows, wanted(&a.rows, &b.rows), "rows");
+        let nested = got(old.nested.diff(&new.nested), Map::clone);
+        let flat: Changes<u32, BTreeMap<u32, u32>> = nested
+            .iter()
+            .map(|(key, before, after)| {
+                (*key, before.as_ref().map(inner), after.as_ref().map(inner))
+            })
+            .collect();
+        assert_eq!(flat, wanted(&a.nested, &b.nested), "nested");
+        for (key, before, after) in &nested {
+            if let (Some(before), Some(after)) = (before, after) {
+                assert_eq!(
+                    got(before.diff(after), |value| *value),
+                    wanted(&a.nested[key], &b.nested[key]),
+                    "inner {key}"
+                );
+            }
+        }
+        assert!(new.bytes.diff(&new.bytes).next().is_none(), "self bytes");
+        assert!(new.nested.diff(&new.nested).next().is_none(), "self nested");
+    }
+
+    fn both(old: &Root, a: &Model, new: &Root, b: &Model, rng: &mut Rng) {
+        check(old, a, new, b, rng);
+        check(new, b, old, a, rng);
+    }
+
+    fn value(rng: &mut Rng) -> Vec<u8> {
+        let len = match rng.below(100) {
+            0..=39 => rng.below(24),
+            40..=59 => 480 + rng.below(64),
+            60..=79 => 990 + rng.below(80),
+            80..=95 => 1100 + rng.below(4000),
+            96..=98 => 65_400 + rng.below(250),
+            _ => 66_000 + rng.below(4000),
+        } as usize;
+        if rng.chance(25) {
+            return vec![rng.next() as u8; len];
+        }
+        (0..len).map(|_| rng.next() as u8).collect()
+    }
+
+    fn edit(root: &mut Root, model: &mut Model, rng: &mut Rng, keys: u64) {
+        let key = rng.below(keys);
+        match rng.below(14) {
+            0..=3 => {
+                let value = value(rng);
+                root.bytes.insert(key, value.clone());
+                model.bytes.insert(key, value);
+            }
+            4 => {
+                root.bytes.remove(&key);
+                model.bytes.remove(&key);
+            }
+            5 => {
+                if let Some(value) = model.bytes.get(&key) {
+                    root.bytes.insert(key, value.clone());
+                }
+            }
+            6 => {
+                let end = key + rng.below(40);
+                for key in key..end {
+                    let value = value(rng);
+                    root.bytes.insert(key, value.clone());
+                    model.bytes.insert(key, value);
+                }
+            }
+            7 => {
+                let end = key + rng.below(60);
+                for key in key..end {
+                    root.bytes.remove(&key);
+                    model.bytes.remove(&key);
+                }
+            }
+            8 => {
+                root.set.insert(key);
+                model.set.insert(key);
+            }
+            9 => {
+                root.set.remove(&key);
+                model.set.remove(&key);
+            }
+            10 => {
+                let note = value(rng);
+                root.rows.insert(Row {
+                    id: key as u32,
+                    note: note.clone(),
+                });
+                model.rows.insert(key as u32, note);
+            }
+            11 => {
+                root.rows.remove(&(key as u32));
+                model.rows.remove(&(key as u32));
+            }
+            _ => {
+                let outer = (key % 48) as u32;
+                let at = rng.below(300) as u32;
+                let mut map = root
+                    .nested
+                    .get(&outer)
+                    .map(|map| (*map).clone())
+                    .unwrap_or_default();
+                let mut wanted = model.nested.get(&outer).cloned().unwrap_or_default();
+                if rng.chance(70) {
+                    let value = rng.next() as u32;
+                    map.insert(at, value);
+                    wanted.insert(at, value);
+                } else {
+                    map.remove(&at);
+                    wanted.remove(&at);
+                }
+                if wanted.is_empty() {
+                    root.nested.remove(&outer);
+                    model.nested.remove(&outer);
+                } else {
+                    root.nested.insert(outer, map);
+                    model.nested.insert(outer, wanted);
+                }
+            }
+        }
+    }
+
+    fn stored_run(seed: u64, options: fn() -> Options, commits: usize, keys: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diffed.ferro");
+        let open = || options().open::<Root>(&path).unwrap();
+        let mut db = open();
+        let mut rng = Rng::new(seed);
+        let mut model = Model::default();
+        let mut earlier: Vec<(Root, Model)> = vec![(Root::default(), Model::default())];
+        for commit in 0..commits {
+            let mut working = model.clone();
+            db.update(|root| {
+                for _ in 0..rng.below(30) {
+                    edit(root, &mut working, &mut rng, keys);
+                }
+                if rng.chance(25) {
+                    let (old, old_model) = &earlier[rng.below(earlier.len() as u64) as usize];
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let mut rng = Rng::new(seed ^ commit as u64);
+                        both(old, old_model, root, &working, &mut rng);
+                    }));
+                    if let Err(payload) = result {
+                        eprintln!("seed {seed} commit {commit} dirty");
+                        panic::resume_unwind(payload);
+                    }
+                }
+            })
+            .unwrap();
+            model = working;
+            let snapshot = db.read();
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let (old, old_model) = &earlier[rng.below(earlier.len() as u64) as usize];
+                both(old, old_model, &snapshot, &model, &mut rng);
+                let (other, other_model) = &earlier[rng.below(earlier.len() as u64) as usize];
+                both(old, old_model, other, other_model, &mut rng);
+            }));
+            if let Err(payload) = result {
+                eprintln!("seed {seed} commit {commit}");
+                panic::resume_unwind(payload);
+            }
+            earlier.push(((*snapshot).clone(), model.clone()));
+            if earlier.len() > 8 {
+                earlier.remove(1);
+            }
+            drop(snapshot);
+            match rng.below(20) {
+                0 => {
+                    drop(db);
+                    db = open();
+                }
+                1 | 2 => {
+                    db.compact(Keep::Last(2)).unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn diffs_of_stored_versions_match_the_model() {
+        for seed in 0..u64::from(cases(6)) {
+            stored_run(seed, fast, 120, 3000);
+        }
+    }
+
+    #[test]
+    fn diffs_of_stored_versions_match_the_model_uncached() {
+        for seed in 100..100 + u64::from(cases(4)) {
+            stored_run(seed, uncached, 80, 3000);
+        }
+    }
+
+    #[test]
+    fn diffs_of_stored_versions_match_the_model_in_a_roomy_cache() {
+        for seed in 200..200 + u64::from(cases(4)) {
+            stored_run(seed, roomy, 120, 600);
+        }
+    }
+
+    fn threaded_run(seed: u64, options: fn() -> Options, commits: usize, keys: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = options()
+            .open::<Root>(dir.path().join("threads.ferro"))
+            .unwrap();
+        let models = Mutex::new(BTreeMap::from([(db.version(), Model::default())]));
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (db, models, done) = (&db, &models, &done);
+            scope.spawn(move || {
+                let written = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let mut rng = Rng::new(seed);
+                    let mut model = Model::default();
+                    for _ in 0..commits {
+                        let mut working = model.clone();
+                        db.update(|root| {
+                            for _ in 0..rng.below(30) {
+                                edit(root, &mut working, &mut rng, keys);
+                            }
+                        })
+                        .unwrap();
+                        model = working;
+                        models.lock().unwrap().insert(db.version(), model.clone());
+                    }
+                }));
+                done.store(true, Ordering::SeqCst);
+                if let Err(payload) = written {
+                    panic::resume_unwind(payload);
+                }
+            });
+            scope.spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    db.compact(Keep::Last(2)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            for reader in 0..3u64 {
+                scope.spawn(move || {
+                    let mut rng = Rng::new(seed ^ ((reader + 1) << 32));
+                    let mut held: Vec<(Root, Model)> = Vec::new();
+                    while !done.load(Ordering::SeqCst) {
+                        let snapshot = db.read();
+                        let version = snapshot.version();
+                        let model = loop {
+                            if let Some(model) = models.lock().unwrap().get(&version).cloned() {
+                                break model;
+                            }
+                            if done.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            std::thread::yield_now();
+                        };
+                        for (old, old_model) in &held {
+                            both(old, old_model, &snapshot, &model, &mut rng);
+                        }
+                        held.push(((*snapshot).clone(), model));
+                        if held.len() > 4 {
+                            held.remove(rng.below(4) as usize);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn diffs_held_across_commits_and_cycles_on_other_threads_match_the_model() {
+        for seed in 300..300 + u64::from(cases(3)) {
+            threaded_run(seed, fast, 150, 2000);
+        }
+    }
+
+    fn branches_run(seed: u64, options: fn() -> Options, commits: usize, keys: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let main = options()
+            .open::<Root>(dir.path().join("branches.ferro"))
+            .unwrap();
+        let mut rng = Rng::new(seed);
+        let mut base = Model::default();
+        main.update(|root| {
+            for _ in 0..400 {
+                edit(root, &mut base, &mut rng, keys);
+            }
+        })
+        .unwrap();
+        let forks: Vec<_> = (0..4)
+            .map(|index| main.fork(&format!("b{index}")).unwrap())
+            .collect();
+        let models: Vec<Mutex<BTreeMap<u64, Model>>> = forks
+            .iter()
+            .map(|fork| Mutex::new(BTreeMap::from([(fork.version(), base.clone())])))
+            .collect();
+        let running = std::sync::atomic::AtomicUsize::new(forks.len());
+        std::thread::scope(|scope| {
+            let (main, running) = (&main, &running);
+            for (index, (fork, models)) in forks.iter().zip(&models).enumerate() {
+                let base = base.clone();
+                scope.spawn(move || {
+                    let written = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let mut rng = Rng::new(seed ^ ((index as u64 + 7) << 40));
+                        let mut model = base;
+                        for _ in 0..commits {
+                            let mut working = model.clone();
+                            fork.update(|root| {
+                                for _ in 0..rng.below(20) {
+                                    edit(root, &mut working, &mut rng, keys);
+                                }
+                            })
+                            .unwrap();
+                            model = working;
+                            models.lock().unwrap().insert(fork.version(), model.clone());
+                        }
+                    }));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    if let Err(payload) = written {
+                        panic::resume_unwind(payload);
+                    }
+                });
+            }
+            scope.spawn(move || {
+                while running.load(Ordering::SeqCst) > 0 {
+                    main.compact(Keep::Last(3)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(7));
+                }
+            });
+            for reader in 0..2u64 {
+                let (forks, models) = (&forks, &models);
+                scope.spawn(move || {
+                    let mut rng = Rng::new(seed ^ ((reader + 1) << 32));
+                    let mut held: Vec<(Root, Model)> = Vec::new();
+                    while running.load(Ordering::SeqCst) > 0 {
+                        let index = rng.below(forks.len() as u64) as usize;
+                        let snapshot = forks[index].read();
+                        let version = snapshot.version();
+                        let model = loop {
+                            if let Some(model) = models[index].lock().unwrap().get(&version).cloned()
+                            {
+                                break model;
+                            }
+                            if running.load(Ordering::SeqCst) == 0 {
+                                return;
+                            }
+                            std::thread::yield_now();
+                        };
+                        for (old, old_model) in &held {
+                            both(old, old_model, &snapshot, &model, &mut rng);
+                        }
+                        held.push(((*snapshot).clone(), model));
+                        if held.len() > 5 {
+                            held.remove(rng.below(5) as usize);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn diffs_across_branches_written_at_once_match_the_model() {
+        for seed in 500..500 + u64::from(cases(3)) {
+            branches_run(seed, fast, 60, 2000);
+            branches_run(seed, uncached, 30, 2000);
+        }
+    }
+
+    #[test]
+    fn diffs_held_across_commits_and_cycles_on_other_threads_match_the_model_uncached() {
+        for seed in 400..400 + u64::from(cases(2)) {
+            threaded_run(seed, uncached, 80, 2000);
+        }
+    }
+
+    #[test]
+    fn a_diff_whose_loads_fail_goes_on_where_it_stopped() {
+        crate::common::quiet_ferro_panics();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fragile.ferro");
+        let db = uncached().open::<Map<u64, Fragile>>(&path).unwrap();
+        let mut rng = Rng::new(77);
+        let mut old = BTreeMap::new();
+        db.update(|map| {
+            for key in 0..3000u64 {
+                let value = Fragile(key, "x".repeat(rng.below(700) as usize));
+                map.insert(key, value.clone());
+                old.insert(key, value);
+            }
+        })
+        .unwrap();
+        let first = db.version();
+        let mut new = old.clone();
+        db.update(|map| {
+            for _ in 0..300 {
+                let key = rng.below(3200);
+                if rng.chance(30) {
+                    map.remove(&key);
+                    new.remove(&key);
+                } else {
+                    let value = Fragile(key, "y".repeat(rng.below(700) as usize));
+                    map.insert(key, value.clone());
+                    new.insert(key, value);
+                }
+            }
+        })
+        .unwrap();
+        let want = wanted(&old, &new);
+        for seed in 0..40u64 {
+            let mut rng = Rng::new(seed);
+            let (before, after) = (db.at(first).unwrap(), db.read());
+            let mut diff = before.diff(&after);
+            let mut found = Vec::new();
+            let mut failures = 0;
+            loop {
+                if rng.chance(30) {
+                    fuse(rng.below(6) as u32, rng.chance(50));
+                }
+                let step = panic::catch_unwind(AssertUnwindSafe(|| diff.next()));
+                defuse();
+                match step {
+                    Ok(Some(change)) => found.push(change),
+                    Ok(None) => break,
+                    Err(_) => failures += 1,
+                }
+            }
+            assert!(failures > 0);
+            assert_eq!(got(found.into_iter(), Fragile::clone), want, "seed {seed}");
+        }
+    }
+
+    fn noise(seed: u64, len: usize) -> Vec<u8> {
+        let mut rng = Rng::new(seed);
+        (0..len).map(|_| rng.next() as u8).collect()
+    }
+
+    #[test]
+    fn records_around_the_read_sizes_read_and_diff_whole() {
+        let lens: Vec<usize> = (1000..1050)
+            .chain(2030..2070)
+            .chain(5110..5130)
+            .chain(65_470..65_560)
+            .chain([131_072, 131_073])
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sizes.ferro");
+        let db = fast().open::<Map<u64, Vec<u8>>>(&path).unwrap();
+        let mut old = BTreeMap::new();
+        db.update(|map| {
+            for (key, len) in lens.iter().enumerate() {
+                let value = noise(key as u64, *len);
+                map.insert(key as u64, value.clone());
+                old.insert(key as u64, value);
+            }
+        })
+        .unwrap();
+        let first = db.version();
+        let mut new = old.clone();
+        db.update(|map| {
+            for (key, len) in lens.iter().enumerate() {
+                let key = key as u64;
+                match key % 5 {
+                    0 => {
+                        map.remove(&key);
+                        new.remove(&key);
+                    }
+                    1 => {
+                        let value = noise(key + 7_000, len + 1);
+                        map.insert(key, value.clone());
+                        new.insert(key, value);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .unwrap();
+        drop(db);
+        for options in [uncached, fast, uncached] {
+            let db = options().open::<Map<u64, Vec<u8>>>(&path).unwrap();
+            let (before, after) = (db.at(first).unwrap(), db.read());
+            for (key, value) in &new {
+                assert_eq!(after.get(key).as_deref(), Some(value), "get {key}");
+            }
+            let read: BTreeMap<u64, Vec<u8>> =
+                before.iter().map(|(key, value)| (key, (*value).clone())).collect();
+            assert_eq!(read, old);
+            assert_eq!(got(before.diff(&after), Vec::clone), wanted(&old, &new));
+            assert_eq!(got(after.diff(&before), Vec::clone), wanted(&new, &old));
+            let empty = Map::<u64, Vec<u8>>::default();
+            assert_eq!(
+                got(empty.diff(&after), Vec::clone),
+                wanted(&BTreeMap::new(), &new)
+            );
+            db.verify_typed().unwrap();
+        }
+    }
+
+    fn header_of(image: &[u8], body_end: usize) -> Option<(usize, usize, u64)> {
+        let read = |pos: &mut usize| {
+            let mut value = 0u64;
+            for shift in (0..63).step_by(7) {
+                let byte = *image.get(*pos)?;
+                *pos += 1;
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return Some(value);
+                }
+            }
+            None
+        };
+        for start in body_end.saturating_sub(70_000)..body_end {
+            let mut pos = start;
+            let Some(stored) = read(&mut pos) else {
+                continue;
+            };
+            let width = pos - start;
+            if read(&mut pos) != Some(0) {
+                continue;
+            }
+            if pos as u64 + stored == body_end as u64 {
+                return Some((start, width, stored));
+            }
+        }
+        None
+    }
+
+    fn put_varint(out: &mut [u8], mut value: u64) -> bool {
+        let width = out.len();
+        for (index, byte) in out.iter_mut().enumerate() {
+            let more = if index + 1 == width { 0 } else { 0x80 };
+            *byte = (value & 0x7f) as u8 | more;
+            value >>= 7;
+        }
+        value == 0
+    }
+
+    #[test]
+    fn a_record_whose_length_field_is_damaged_fails_its_read() {
+        for (len, claimed) in [
+            (3_000usize, 9_000u64),
+            (3_000, 3_010),
+            (3_000, 16_000),
+            (20_000, 60_000),
+            (20_000, 65_000),
+            (20_000, 20_050),
+            (20_000, 19_000),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("damaged.ferro");
+            let value = noise(len as u64, len);
+            {
+                let db = fast().open::<Map<u64, Vec<u8>>>(&path).unwrap();
+                db.update(|map| {
+                    map.insert(1, value.clone());
+                    for key in 2..60 {
+                        map.insert(key, noise(key, 40 + key as usize * 30));
+                    }
+                })
+                .unwrap();
+                db.update(|map| {
+                    map.insert(100, noise(100, 2_000));
+                })
+                .unwrap();
+            }
+            let mut image = std::fs::read(&path).unwrap();
+            let frames = frames_past_the_anchor(&image);
+            let at = image
+                .windows(64)
+                .position(|window| window == &value[..64])
+                .unwrap();
+            let (start, width, stored) = header_of(&image, at + len).unwrap();
+            assert!(
+                put_varint(&mut image[start..start + width], claimed),
+                "{len} {claimed}"
+            );
+            assert_ne!(stored, claimed);
+            for (from, to) in frames {
+                if (from..to).contains(&start) {
+                    seal_frame(&mut image, from, to);
+                }
+            }
+            std::fs::write(&path, &image).unwrap();
+            for options in [uncached, fast] {
+                let db = options().open::<Map<u64, Vec<u8>>>(&path).unwrap();
+                let map = db.read();
+                let result = panic::catch_unwind(AssertUnwindSafe(|| map.try_get(&1)));
+                match result {
+                    Ok(Err(_)) => {}
+                    Ok(Ok(found)) => panic!(
+                        "{len} claimed {claimed}: read {:?} bytes",
+                        found.map(|value| value.len())
+                    ),
+                    Err(_) => panic!("{len} claimed {claimed}: try_get panicked"),
+                }
+                let empty = Map::<u64, Vec<u8>>::default();
+                let diffed = panic::catch_unwind(AssertUnwindSafe(|| {
+                    empty
+                        .diff(&map)
+                        .map(|change| change.after().map(|value| value.len()))
+                        .count()
+                }));
+                assert!(
+                    diffed.is_err(),
+                    "{len} claimed {claimed}: diff read a damaged value"
+                );
+            }
+        }
+    }
+}
