@@ -28,7 +28,7 @@ cache](#reads-past-the-cache) were measured on 2026-11-09 beside other work, as 
 | Single-key commits, `Durability::Buffered`, one writer on each of 16 branches | about 135,000 per second |
 | Single-key commit, `Durability::Buffered` | 24 µs |
 | Bytes written per single-key commit | 3.5 KB |
-| `diff` | 3.8 µs per changed key |
+| `diff` | 3.8 µs per changed key; 8,400 instructions rather than 20,600 since 2026-11-12, as [Diffs](../internals/read-path.md#diffs) measures |
 | Booking hold commit, `Durability::Buffered` | 86 µs of CPU, 14 µs of it in the closure |
 | Booking confirm commit, `Durability::Buffered` | 106 µs of CPU, 14 µs of it in the closure |
 

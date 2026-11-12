@@ -934,17 +934,6 @@ impl<K, V, S> Node<K, V, S> {
     }
 
     #[inline]
-    fn slot(&self, index: usize) -> Slot<V, S>
-    where
-        S: Clone,
-    {
-        match &self.cells {
-            Cells::Column(column) => Slot::Packed(column.clone(), index as u32),
-            Cells::Slots(slots) => slots[index].clone(),
-        }
-    }
-
-    #[inline]
     fn entry_summary(&self, index: usize) -> S
     where
         S: Summary<K, V>,
@@ -5463,10 +5452,8 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// ```
     pub fn diff(&self, newer: &Map<K, V, S>) -> Diff<K, V, S> {
         Diff {
-            old_store: self.store.clone(),
-            new_store: newer.store.clone(),
-            old: vec![Step::Sub(self.root.clone())],
-            new: vec![Step::Sub(newer.root.clone())],
+            old: Side::new(self.store.clone(), &self.root),
+            new: Side::new(newer.store.clone(), &newer.root),
         }
     }
 
@@ -7301,11 +7288,6 @@ where
     Ok(writes)
 }
 
-enum Step<K, V, S> {
-    Sub(Link<K, V, S>),
-    Entry(K, Slot<V, S>),
-}
-
 /// An iterator over the [`Change`]s between two versions of a [`Map`], in key order, made by
 /// [`Map::diff`].
 ///
@@ -7317,65 +7299,240 @@ enum Step<K, V, S> {
 ///
 /// A step that cannot load a node or value from the file, or finds one damaged, panics.
 pub struct Diff<K, V, S = ()> {
-    old_store: Option<Store>,
-    new_store: Option<Store>,
-    old: Vec<Step<K, V, S>>,
-    new: Vec<Step<K, V, S>>,
+    old: Side<K, V, S>,
+    new: Side<K, V, S>,
 }
 
-enum Action {
+/// One version a [`Diff`] walks: its root until the walk opens it, then the nodes open from the
+/// root down, each with the position of its next item, `2 * i` for its child `i` and `2 * i + 1`
+/// for its entry `i`.
+///
+/// A side is kept settled: the item at its head is never an absent child, and a node walked to
+/// its end is closed, so [`Side::head`] reads the next item without a loop.
+struct Side<K, V, S> {
+    store: Option<Store>,
+    root: Option<Link<K, V, S>>,
+    path: Vec<Unfolded<K, V, S>>,
+}
+
+/// A node a [`Side`] has open, with the position of its next item.
+type Unfolded<K, V, S> = (Shared<Node<K, V, S>>, usize);
+
+/// The item at the head of a [`Side`]: a subtree, an entry of a node by its index, or nothing
+/// once the side is walked.
+enum Head<'a, K, V, S> {
     Done,
-    ExpandOld,
-    ExpandNew,
-    SkipBoth,
-    TakeOld,
-    TakeNew,
-    Compare,
+    Sub(&'a Link<K, V, S>),
+    Entry(&'a Node<K, V, S>, usize),
 }
 
-fn expand<K: Data + Ord, V: Data, S: Data>(store: Option<&Store>, steps: &mut Vec<Step<K, V, S>>) {
-    let Some(Step::Sub(link)) = steps.pop() else {
-        return;
-    };
-    let Some(node) = fatal(load(store, &link)) else {
-        return;
-    };
-    for index in (0..=node.keys.len()).rev() {
-        steps.push(Step::Sub(node.child(index).clone()));
-        if index > 0 {
-            steps.push(Step::Entry(
-                node.keys[index - 1].clone(),
-                node.slot(index - 1),
-            ));
+/// What a step of a [`Diff`] does: open the subtree at the head of one side, or move past the
+/// heads of the sides it names, handing out the change it found there, if any.
+enum Move<K, V> {
+    OpenOld,
+    OpenNew,
+    Pass(bool, bool, Option<Change<K, V>>),
+}
+
+impl<K: Data, V: Data, S: Data> Side<K, V, S> {
+    fn new(store: Option<Store>, root: &Link<K, V, S>) -> Self {
+        Side {
+            store,
+            root: (!matches!(root, Link::Empty)).then(|| root.clone()),
+            path: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn head(&self) -> Head<'_, K, V, S> {
+        if let Some(root) = &self.root {
+            return Head::Sub(root);
+        }
+        match self.path.last() {
+            None => Head::Done,
+            Some((node, position)) if position % 2 == 0 => Head::Sub(node.child(position / 2)),
+            Some((node, position)) => Head::Entry(node, position / 2),
+        }
+    }
+
+    /// The value of entry `index` of `node`, a node of this side.
+    fn value(&self, node: &Node<K, V, S>, index: usize) -> Val<V> {
+        fatal(node.value(self.store.as_ref(), index))
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        if self.root.take().is_some() {
+            return;
+        }
+        if let Some((_, position)) = self.path.last_mut() {
+            *position += 1;
+        }
+        self.settle();
+    }
+
+    #[inline]
+    fn settle(&mut self) {
+        while let Some((node, position)) = self.path.last_mut() {
+            if *position > 2 * node.keys.len() {
+                self.path.pop();
+            } else if *position % 2 == 0 && matches!(node.child(*position / 2), Link::Empty) {
+                *position += 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Opens the subtree at the head, moving the head past it to the subtree's first item.
+    ///
+    /// The node comes as a get reaches it, through the link's memo, the cache or the file, and
+    /// the link's memo is left as such a get leaves it.
+    fn open(&mut self) {
+        let depth = self.path.len();
+        let link = match (&self.root, self.path.last()) {
+            (Some(root), _) => root,
+            (None, Some((node, position))) => node.child(position / 2),
+            (None, None) => return,
+        };
+        let node = fatal(resident(self.store.as_ref(), link, depth));
+        if self.root.take().is_none()
+            && let Some((_, position)) = self.path.last_mut()
+        {
+            *position += 1;
+        }
+        if let Some(node) = node {
+            self.path.push((node, 0));
+        }
+        self.settle();
     }
 }
 
+/// Whether entry `i` of `a`, read through `a_store`, and entry `j` of `b`, read through `b_store`,
+/// hold the same value as stored, as [`differing`] tells it.
+#[inline]
+fn same_entry<K, V: Data, S: Data>(
+    (a, i, a_store): (&Node<K, V, S>, usize, Option<&Store>),
+    (b, j, b_store): (&Node<K, V, S>, usize, Option<&Store>),
+) -> bool {
+    match (a.lend(i), b.lend(j)) {
+        (Some(x), Some(y)) => ptr::eq(x, y) || V::same_encoding(x, y),
+        _ => fatal(differing((a, i, a_store), (b, j, b_store))).is_none(),
+    }
+}
+
+/// The values of entry `i` of `a`, read through `a_store`, and of entry `j` of `b`, read through
+/// `b_store`, unless the two are the same as stored: one value shared by both nodes, one spilled
+/// object, or two values that [`Data::same_encoding`] calls equal.
+fn differing<K, V: Data, S: Data>(
+    (a, i, a_store): (&Node<K, V, S>, usize, Option<&Store>),
+    (b, j, b_store): (&Node<K, V, S>, usize, Option<&Store>),
+) -> Result<Option<(Val<V>, Val<V>)>> {
+    if let (Some(x), Some(y)) = (a.lend(i), b.lend(j)) {
+        if ptr::eq(x, y) || V::same_encoding(x, y) {
+            return Ok(None);
+        }
+    } else if let (Cells::Slots(x), Cells::Slots(y)) = (&a.cells, &b.cells)
+        && x[i].shares(&y[j])
+    {
+        return Ok(None);
+    } else {
+        let (x, y) = (a.value(a_store, i)?, b.value(b_store, j)?);
+        if x.shares(&y) || V::same_encoding(&x, &y) {
+            return Ok(None);
+        }
+        return Ok(Some((x, y)));
+    }
+    Ok(Some((a.value(a_store, i)?, b.value(b_store, j)?)))
+}
+
 impl<K: Data + Ord, V: Data, S: Data> Diff<K, V, S> {
-    fn action(&self) -> Action {
-        match (self.old.last(), self.new.last()) {
-            (None, None) => Action::Done,
-            (Some(Step::Sub(_)), None) => Action::ExpandOld,
-            (None, Some(Step::Sub(_))) => Action::ExpandNew,
-            (Some(Step::Entry(..)), None) => Action::TakeOld,
-            (None, Some(Step::Entry(..))) => Action::TakeNew,
-            (Some(Step::Sub(_)), Some(Step::Entry(..))) => Action::ExpandOld,
-            (Some(Step::Entry(..)), Some(Step::Sub(_))) => Action::ExpandNew,
-            (Some(Step::Sub(a)), Some(Step::Sub(b))) => {
+    /// Moves both sides past the items they share at their heads within the nodes open at the
+    /// top of each, in step: entries with one key and the same value, subtrees with one hash and
+    /// absent children, stopping at the first that differ or at the end of either node.
+    fn pass_shared(&mut self) {
+        let Side {
+            store: a_store,
+            path: a_path,
+            ..
+        } = &mut self.old;
+        let Side {
+            store: b_store,
+            path: b_path,
+            ..
+        } = &mut self.new;
+        let (Some((a, i)), Some((b, j))) = (a_path.last_mut(), b_path.last_mut()) else {
+            return;
+        };
+        let (a_end, b_end) = (2 * a.keys.len(), 2 * b.keys.len());
+        let (mut x, mut y) = (*i, *j);
+        while x <= a_end && y <= b_end {
+            let shared = match (x % 2, y % 2) {
+                (0, 0) => a.child(x / 2).same_as(b.child(y / 2)),
+                (1, 1) => {
+                    a.keys[x / 2] == b.keys[y / 2]
+                        && same_entry((a, x / 2, a_store.as_ref()), (b, y / 2, b_store.as_ref()))
+                }
+                _ => false,
+            };
+            if !shared {
+                break;
+            }
+            x += 1;
+            y += 1;
+        }
+        (*i, *j) = (x, y);
+        self.old.settle();
+        self.new.settle();
+    }
+
+    fn step(&self) -> Option<Move<K, V>> {
+        let (old, new) = (&self.old, &self.new);
+        Some(match (old.head(), new.head()) {
+            (Head::Done, Head::Done) => return None,
+            (Head::Sub(_), Head::Done | Head::Entry(..)) => Move::OpenOld,
+            (Head::Done | Head::Entry(..), Head::Sub(_)) => Move::OpenNew,
+            (Head::Sub(a), Head::Sub(b)) => {
                 if a.same_as(b) {
-                    Action::SkipBoth
+                    Move::Pass(true, true, None)
                 } else if a.count() >= b.count() {
-                    Action::ExpandOld
+                    Move::OpenOld
                 } else {
-                    Action::ExpandNew
+                    Move::OpenNew
                 }
             }
-            (Some(Step::Entry(a, _)), Some(Step::Entry(b, _))) => match a.cmp(b) {
-                Ordering::Less => Action::TakeOld,
-                Ordering::Greater => Action::TakeNew,
-                Ordering::Equal => Action::Compare,
+            (Head::Entry(a, i), Head::Done) => Move::Pass(
+                true,
+                false,
+                Some(Change::Removed(a.keys[i].clone(), old.value(a, i))),
+            ),
+            (Head::Done, Head::Entry(b, j)) => Move::Pass(
+                false,
+                true,
+                Some(Change::Added(b.keys[j].clone(), new.value(b, j))),
+            ),
+            (Head::Entry(a, i), Head::Entry(b, j)) => match a.keys[i].cmp(&b.keys[j]) {
+                Ordering::Less => Move::Pass(
+                    true,
+                    false,
+                    Some(Change::Removed(a.keys[i].clone(), old.value(a, i))),
+                ),
+                Ordering::Greater => Move::Pass(
+                    false,
+                    true,
+                    Some(Change::Added(b.keys[j].clone(), new.value(b, j))),
+                ),
+                Ordering::Equal => {
+                    let found = fatal(differing(
+                        (a, i, old.store.as_ref()),
+                        (b, j, new.store.as_ref()),
+                    ));
+                    let change = found
+                        .map(|(before, after)| Change::Changed(a.keys[i].clone(), before, after));
+                    Move::Pass(true, true, change)
+                }
             },
-        }
+        })
     }
 }
 
@@ -7384,38 +7541,23 @@ impl<K: Data + Ord, V: Data, S: Data> Iterator for Diff<K, V, S> {
 
     fn next(&mut self) -> Option<Change<K, V>> {
         loop {
-            match self.action() {
-                Action::Done => return None,
-                Action::ExpandOld => expand(self.old_store.as_ref(), &mut self.old),
-                Action::ExpandNew => expand(self.new_store.as_ref(), &mut self.new),
-                Action::SkipBoth => {
-                    self.old.pop();
-                    self.new.pop();
+            match self.step()? {
+                Move::OpenOld => self.old.open(),
+                Move::OpenNew => self.new.open(),
+                Move::Pass(true, true, None) => {
+                    self.old.advance();
+                    self.new.advance();
+                    self.pass_shared();
                 }
-                Action::TakeOld => {
-                    if let Some(Step::Entry(key, slot)) = self.old.pop() {
-                        let value = fatal(read_slot(self.old_store.as_ref(), &slot));
-                        return Some(Change::Removed(key, value));
+                Move::Pass(old, new, change) => {
+                    if old {
+                        self.old.advance();
                     }
-                }
-                Action::TakeNew => {
-                    if let Some(Step::Entry(key, slot)) = self.new.pop() {
-                        let value = fatal(read_slot(self.new_store.as_ref(), &slot));
-                        return Some(Change::Added(key, value));
+                    if new {
+                        self.new.advance();
                     }
-                }
-                Action::Compare => {
-                    let old = self.old.pop();
-                    let new = self.new.pop();
-                    if let (Some(Step::Entry(key, a)), Some(Step::Entry(_, b))) = (old, new) {
-                        if a.shares(&b) {
-                            continue;
-                        }
-                        let before = fatal(read_slot(self.old_store.as_ref(), &a));
-                        let after = fatal(read_slot(self.new_store.as_ref(), &b));
-                        if !V::same_encoding(&before, &after) {
-                            return Some(Change::Changed(key, before, after));
-                        }
+                    if change.is_some() {
+                        return change;
                     }
                 }
             }
@@ -8872,6 +9014,40 @@ mod tests {
         assert_eq!(before.get(&7).as_deref(), Some(&7));
         assert_eq!(after.get(&7).as_deref(), Some(&70));
         assert_eq!(db.read().get(&7).as_deref(), Some(&71));
+    }
+
+    #[test]
+    fn a_diff_reads_only_the_nodes_on_the_path_that_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diff.ferro");
+        let db = crate::Db::<Map<u64, u64>>::open(&path).unwrap();
+        db.update(|map| {
+            for key in 0..4096u64 {
+                map.insert(key, key);
+            }
+        })
+        .unwrap();
+        let first = db.version();
+        db.update(|map| {
+            map.insert(7, 70);
+        })
+        .unwrap();
+        drop(db);
+        let reopen = || {
+            let db = crate::Db::<Map<u64, u64>>::open(&path).unwrap();
+            let (old, new) = (db.at(first).unwrap(), db.read());
+            (db, old, new)
+        };
+        let (db, old, new) = reopen();
+        let reads = crate::store::fresh_reads();
+        let changes: Vec<Change<u64, u64>> = old.diff(&new).collect();
+        let diffed = crate::store::fresh_reads() - reads;
+        assert_eq!(changes, [Change::Changed(7, Val::new(7), Val::new(70))]);
+        drop((db, old, new));
+        let (_db, old, new) = reopen();
+        let paths = path_reads(&old, 7) + path_reads(&new, 7);
+        assert!(paths > 2);
+        assert_eq!(diffed, paths);
     }
 
     #[test]

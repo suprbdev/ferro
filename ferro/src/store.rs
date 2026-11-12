@@ -152,6 +152,8 @@ const WINDOW_BEHIND: u64 = 4 << 10;
 const WINDOW_AHEAD: u64 = 4 << 10;
 /// How close to the start of a streaming [`Window`] a read must land for it to read wider.
 const WINDOW_NEAR: u64 = 64 << 10;
+/// The longest record a [`Window`] reads again whole when its first read stops short of it.
+const RECORD_AHEAD: usize = 64 << 10;
 /// How many bytes before a record [`Store::check_record`] reads with it.
 const CHECK_BEHIND: u64 = 16 << 10;
 /// How many bytes from a record's start [`Store::check_record`] reads, enough for nearly every
@@ -1857,6 +1859,24 @@ impl Window {
         Ok(&self.bytes[(offset - start) as usize..])
     }
 
+    /// Reads the window again for a record at `offset` in `store`'s `file` that [`Window::fill`]
+    /// read only the start of, from `offset` to `len` bytes past it, never past `tail`, and
+    /// returns its bytes.
+    fn reread(
+        &mut self,
+        file: &File,
+        store: u64,
+        offset: u64,
+        tail: u64,
+        len: usize,
+    ) -> Result<&[u8]> {
+        self.store = 0;
+        self.read(file, offset, tail.min(offset.saturating_add(len as u64)))?;
+        self.store = store;
+        self.start = offset;
+        Ok(&self.bytes)
+    }
+
     /// Reads the window for a record at `offset` in `store`'s `file` from [`CHECK_BEHIND`] bytes
     /// before it to [`CHECK_AHEAD`] bytes from it, never past `tail`, and returns its bytes from
     /// `offset`.
@@ -1881,6 +1901,20 @@ impl Window {
         }
         file.read_exact_at(&mut self.bytes, start)
     }
+}
+
+/// How many bytes from its start the record at the start of `bytes` takes at most, from its
+/// header, or `None` if the header does not parse within them.
+fn record_end(bytes: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    let stored = usize::try_from(varint_within(bytes, &mut pos)?).ok()?;
+    let flagged = varint_within(bytes, &mut pos)?;
+    if flagged & 1 == 1 {
+        varint_within(bytes, &mut pos)?;
+    }
+    let links = usize::try_from(flagged >> 1).ok()?;
+    pos.checked_add(stored)?
+        .checked_add(links.checked_mul(HASH_BYTES + MAX_VARINT)?)
 }
 
 /// Reads a whole record from `bytes`, which start at `start` in the log, filling `links`, or
@@ -4434,7 +4468,8 @@ impl Store {
     ///
     /// The record's bytes come from the frames a catch-up kept, from the [`Window`] this thread
     /// last read from the file if it holds the record whole and the record checks, or from a new
-    /// read, which [`Window::fill`] widens while the reads stream through the file.
+    /// read, which [`Window::fill`] widens while the reads stream through the file and
+    /// [`Window::reread`] makes again to the record's end when the record runs past it.
     fn read_lent<R>(&self, ptr: Ptr, f: impl FnOnce(&[u8], &[Ptr]) -> Result<R>) -> Result<R> {
         let tail = self.readable_past(ptr.offset)?;
         if ptr.offset < LOG_START || ptr.offset >= tail {
@@ -4487,11 +4522,22 @@ impl Store {
             window.streaming.set(true);
             return f(body, links);
         }
-        let bytes = match held.is_empty() {
+        let mut bytes = match held.is_empty() {
             true => window.fill(&self.inner.file, id, ptr.offset, tail)?,
             false => held,
         };
-        match stored_within(bytes, ptr.offset, links) {
+        let mut stored = stored_within(bytes, ptr.offset, links);
+        if stored.is_none()
+            && held.is_empty()
+            && let Some(end) =
+                record_end(bytes).filter(|end| (bytes.len() + 1..=RECORD_AHEAD).contains(end))
+        {
+            bytes = window
+                .reread(&self.inner.file, id, ptr.offset, tail, end)
+                .unwrap_or_default();
+            stored = stored_within(bytes, ptr.offset, links);
+        }
+        match stored {
             Some(stored) => f(checked_body(bytes, &stored, links, unpacked, ptr)?, links),
             None => {
                 let file = Some(&*self.inner.file);
@@ -8030,6 +8076,11 @@ mod tests {
             |ptr: Ptr| store.read_lent(ptr, |body, links| Ok((body.to_vec(), links.to_vec())));
         let wanted = |index: usize| (objects[index].body.clone(), objects[index].links.clone());
         drop(WINDOW.take());
+        assert_eq!(lent(ptrs[2]).unwrap(), wanted(2));
+        let window = WINDOW.take();
+        assert_eq!(window.start, ptrs[2].offset);
+        assert!(window.bytes.len() > 3 * READ_AHEAD);
+        drop(window);
         for (index, ptr) in ptrs.iter().enumerate() {
             assert_eq!(lent(*ptr).unwrap(), wanted(index));
         }

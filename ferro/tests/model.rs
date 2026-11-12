@@ -2021,6 +2021,10 @@ mod summarized {
                     if rng.chance(15) {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             check_reads(root, &working, pool, &mut Rng::new(seed ^ commit as u64));
+                            if let Some((old, old_model)) = earlier.last() {
+                                check_diff(old, old_model, root, &working);
+                                check_diff(root, &working, old, old_model);
+                            }
                         }));
                         if let Err(payload) = result {
                             eprintln!("seed {seed} commit {commit} dirty after {trail:?}");
@@ -2200,6 +2204,9 @@ mod summarized {
                 }
                 if rng.chance(30) {
                     check_reads(root, &working, &pool, &mut Rng::new(seed ^ round as u64));
+                    if let Some((old, old_model)) = earlier.last() {
+                        check_diff(old, old_model, root, &working);
+                    }
                 }
             })
             .unwrap();

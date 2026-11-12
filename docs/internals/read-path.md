@@ -467,6 +467,19 @@ makes reads fail inside overwritten values that sit between the leaves a scan re
 of `refresh_fault` now fail any read that covers their offset, since the record they target may
 come in a wider read that starts before it.
 
+A record longer than the bytes read went to `read_within`, which copied the window into a buffer of
+its own, read the rest of the record onto it and built an `Object` to decode from. `read_lent` now
+reads such a record again into the window, from its start to the end its header gives, counting
+each link at its longest varint, when that is at most 64 KiB, and parses it there, so a node of
+more than 1 KiB costs a second read but no copy or allocation. A longer record, a header that does
+not parse, and a second read that fails still go to `read_within`, which reads only the bytes the
+record holds. In the diff that [Diffs](#diffs) measures, 3.8% of the nodes read from the file ran
+past their first 1 KiB, and this took 2.5% off the diff's instructions. `ferro-bench`'s cold gets
+ran 3.9% fewer instructions with the 1 MiB cache and 2.8% fewer with 5 MiB, at times within the
+spread of three alternating runs at a load average of 20.
+`a_read_through_the_window_lends_only_records_that_check` checks that a record of 3 KiB lands
+whole in the window.
+
 `Decoder::varint` read a varint of nine or ten bytes, which a random `u64` takes, with a branch on
 whether the ninth byte ends it, wrong half the time. It now reads the first eight bytes as before
 and the last one or two without a branch, and falls back to the loop for anything but the shortest
@@ -546,6 +559,69 @@ Measured and left out:
   KiB, slower than the AVX-512 one it picks here. Records hashed several at once, a lane each, would
   be faster, but that needs a BLAKE3 of ferro's own or the `blake3` crate's hidden `platform`
   module, whose API it does not promise.
+
+## Diffs
+
+`Map::diff` walks both versions at once in key order and opens a subtree only where the two do not
+share it by hash, so it reads the nodes that differ and no others. In the [versioned
+comparison](../../benchmarks/compare/versioned/RESULTS.md), which diffs two versions of a
+100,000-key `Map<u64, String>` 1,000 single-key commits apart, 995 keys changed, it opens 1,597
+nodes on each side, holding 40,392 keys between them, and every one of them differs from the node
+the other side holds there. `a_diff_reads_only_the_nodes_on_the_path_that_changed` checks that a
+diff of one changed key reads exactly the nodes on its two paths.
+
+The diff used to keep a stack of steps for each side. Opening a node pushed every child link and
+every entry, a clone of each key, a `Link` of about 100 bytes for each child and a slot for each
+value, which for a node read from the file was the node's column, so each entry cost two `Arc`
+increments, the copies and their drops before it was compared, and comparing two values made a
+`Val` of each. It loaded each node from the cache by hash, past the link's memo. Now each side
+keeps the nodes it has open from the root down, each with the position of its next item, and reads
+the key, value or link at its head in place. A node is reached as a get reaches it, through the
+link's memo where there is one and the cache or the file where not, and leaves the memo as a get
+would. Once both heads pass an item they share, `pass_shared` runs through the two open nodes in
+step for as long as entries keep one key and the same value and children one hash, and compares
+values by reference, the same slot or `same_encoding`, so a `Val` is made only for a change the
+diff hands out.
+
+Measured with a tool that builds the comparison's file once, then in a fresh process repeats the
+comparison's reads, so that version 0 is cached and 815 of the nodes on version 1's side come from
+the file, times the first diff, then times the same diff again with every node cached; and, apart,
+times the diff on a freshly opened file with nothing cached. Medians of seven alternating runs
+against the build before, at a load average of 19 on 32 threads, with user-space instructions:
+
+| Diff of 995 changes in 100,000 keys | Before | After |
+| --- | ---: | ---: |
+| First, after the comparison's reads | 8.32 ms, 25.7M instructions | 4.11 ms, 18.2M |
+| Again, every node cached | 5.52 ms, 12.8M instructions | 0.40 ms, 5.3M |
+| Fresh file, nothing cached | 9.68 ms, 61.7M instructions | 7.50 ms, 53.9M |
+| The comparison's own ferro side, `diff_ms` | 6.51 ms | 3.80 ms |
+| `ferro-bench`, `diff` on 1M keys, per change | 9.74 µs, 20,589 instructions | 2.77 µs, 8,367 |
+
+The comparison's ferro side ran seven times alternating with the build before, at load averages
+of 17.5 to 19.7, and its diff took 3.31 to 5.19 ms against 6.02 to 7.63. `ferro-bench` ran three
+times each, alternating, at load averages of 19 to 21; its diff is the second of two of the same
+versions, with every node cached. Of the instructions saved on the first diff, the walk in place
+took 4.1M, running through shared items in step 1.7M, comparing values without a `Result` in
+between 1.3M and reading long records whole 0.4M. Afterwards about 43% of the first diff's time
+goes to reading the nodes that are not cached, 17.5% to BLAKE3 and 19% to decoding, a `String` a
+value; 20% to comparing the values of the two sides, mostly waiting on the cached side's strings;
+and 12% to looking nodes up in the cache by hash below a parent read from the file, which has no
+memos yet.
+
+Measured and left out:
+
+- Reading the nodes the cache does not hold without decoding their values: their keys decoded and
+  their values and children located in the bytes, compared as bytes with the other side's, or by
+  encoding the other side's decoded value to a `HashSink` and comparing that, and kept out of the
+  cache. The first diff ran 20.2M instructions against 19.9M for the walk at the time and took
+  about a tenth less time, but a second diff of the same versions read every such node again and
+  ran 20.0M instructions against 6.6M, so a diff fills the cache as a read does.
+- Prefetching the heap of each value of two nodes before comparing them, tried with a check for
+  `String` in place of a hook on `Data`: the first diff took about 15% less time and the cached
+  one 30% less, in runs too noisy to be sure, for 0.5M more instructions. It needs a method on
+  `Data` for values that keep their bytes on the heap, which only those types would implement.
+- Reading the nodes in batches. The 815 reads from the page cache took 0.28 ms between them in a
+  test of random 1 KiB `pread`s over the file, about a tenth of the first diff.
 
 ## Measured and left out
 
