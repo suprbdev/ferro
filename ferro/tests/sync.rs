@@ -7436,3 +7436,78 @@ fn a_table_past_the_links_a_check_holds_is_held_to_its_rows() {
         assert_eq!(fresh.version(), 0, "{case}");
     }
 }
+
+#[test]
+fn a_commit_of_a_mib_or_more_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = open(&dir, "a.ferro");
+    let b = open(&dir, "b.ferro");
+    a.commit(text(6, 2 << 20), |root| {
+        root.insert(1, "one".to_string());
+    })
+    .unwrap();
+    let bundle = a.bundle(&b.have().unwrap()).unwrap();
+    let pulled = b.receive("a", &bundle, refuse).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(b.read().get(&1).as_deref().map(String::as_str), Some("one"));
+}
+
+type BlobShelves = (String, Vec<Map<u64, u64>>);
+
+#[test]
+fn a_root_of_a_mib_or_more_with_a_few_links_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer: Db<BlobShelves> = fast().open(dir.path().join("peer.ferro")).unwrap();
+    let mine: Db<BlobShelves> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    let mut one = Map::new();
+    one.insert(1, 2);
+    peer.update(|root| {
+        root.0 = text(5, 3 << 20);
+        root.1 = vec![one.clone(); 30];
+    })
+    .unwrap();
+    let pulled = from_peer(&mine, &peer).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(mine.read().1[29].get(&1).as_deref(), Some(&2));
+    mine.verify_typed().unwrap();
+}
+
+#[test]
+fn a_root_of_a_mib_or_more_with_more_links_than_a_check_holds_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer: Db<BlobShelves> = fast().open(dir.path().join("peer.ferro")).unwrap();
+    let mine: Db<BlobShelves> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    let mut one = Map::new();
+    one.insert(1, 2);
+    peer.update(|root| {
+        root.0 = text(5, 3 << 20);
+        root.1 = vec![one.clone(); 1_100];
+    })
+    .unwrap();
+    let pulled = from_peer(&mine, &peer).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    assert_eq!(mine.read().1[1_099].get(&1).as_deref(), Some(&2));
+    mine.verify_typed().unwrap();
+}
+
+#[test]
+fn a_spilled_value_of_a_mib_or_more_followed_by_records_in_its_slack_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer: Db<Map<u64, BlobShelves>> = fast().open(dir.path().join("peer.ferro")).unwrap();
+    let mine: Db<Map<u64, BlobShelves>> = fast().open(dir.path().join("mine.ferro")).unwrap();
+    let mut one = Map::new();
+    one.insert(1, 2);
+    peer.update(|root| {
+        root.insert(7, (text(5, 3 << 20), vec![one.clone(); 1_100]));
+        root.insert(8, (text(6, 600), vec![one.clone(); 3]));
+    })
+    .unwrap();
+    let pulled = from_peer(&mine, &peer).unwrap();
+    assert_eq!(pulled.outcome, Outcome::FastForward);
+    let landed = mine.read();
+    let big = landed.get(&7).unwrap();
+    assert_eq!(big.0.len(), 3 << 20);
+    assert_eq!(big.1[1_099].get(&1).as_deref(), Some(&2));
+    assert_eq!(landed.get(&8).unwrap().1.len(), 3);
+    mine.verify_typed().unwrap();
+}

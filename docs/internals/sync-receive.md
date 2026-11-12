@@ -171,7 +171,11 @@ its exact length, and compressed again if it arrived uncompressed, as described 
 [Applying](sync.md#applying), into a buffer a tenth larger than the body before it shrinks to fit,
 so the largest value sent bounds memory too, at about three times its size. A record whose body is
 1 MiB or more is written to its staging frame from the bytes it arrived as rather than copied into
-the staging buffer. Its links are held resolved up to 1,024 of them, 40 KiB, and
+the staging buffer, and its links follow it to the file before the next object is read, so that a
+check finds the whole record there. Left in the buffer, past the end of what was written, they
+could not be read until a later object filled the frame, and a pull whose commit, root or value of
+1 MiB or more had links and was followed only by objects small enough to fit the room its frame had
+left was refused as corrupt. Its links are held resolved up to 1,024 of them, 40 KiB, and
 past that only as the bytes they arrived as, a byte or two for a link by place, since its record is
 resolved and written a MiB at a time once they are in. The checks read an object of more than 1,024
 links back the same way, its body whole and its links one at a time where its record keeps them, as

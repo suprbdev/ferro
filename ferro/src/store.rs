@@ -6075,7 +6075,9 @@ impl Staging {
     /// is asked for a staging frame whenever the one being filled cannot hold it, before the first
     /// link is taken from `links`. Its links are then written, and hashed, as they come, and in
     /// the log written out whenever [`STAGED_ROOM`] of them wait, so a record of many links is
-    /// never held whole.
+    /// never held whole. In the log, a payload of [`STAGED_ROOM`] or more is written to the file
+    /// as it is, and the record's links follow it there before this returns, so that
+    /// [`open`](Staging::open) finds the whole record in the file.
     ///
     /// # Errors
     ///
@@ -6108,7 +6110,8 @@ impl Staging {
                 Error::Bundle("it carries more objects than one receive can hold".into())
             })?;
         let offset = self.start + self.buf.len() as u64;
-        if logged && payload.len() as u64 >= STAGED_ROOM {
+        let direct = logged && payload.len() as u64 >= STAGED_ROOM;
+        if direct {
             append_lengths(
                 &mut self.buf,
                 payload.len(),
@@ -6122,7 +6125,7 @@ impl Staging {
             append_head(&mut self.buf, payload, packed.is_some(), body.len(), count);
         }
         let mut hashing = Hashing::new(&mut self.joined, body, count);
-        let (mut written, mut split) = (0, false);
+        let (mut written, mut split) = (0, direct);
         for link in links {
             let link = match link {
                 LinkTo::Put(hash, id) => Ptr {
@@ -6563,7 +6566,8 @@ impl StagedLinks<'_> {
         if at.pos < at.window_at || end > held {
             let want = ((self.tail - at.pos) as usize).min(LINKS_WINDOW);
             at.window.resize(want, 0);
-            file.read_exact_at(&mut at.window, at.pos)?;
+            file.read_exact_at(&mut at.window, at.pos)
+                .inspect_err(|_| at.window.clear())?;
             at.window_at = at.pos;
         }
         let from = (at.pos - at.window_at) as usize;
