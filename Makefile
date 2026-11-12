@@ -18,10 +18,15 @@ STRESS_ROUNDS ?= 25
 STRESS_COPIES ?= 12
 STRESS_THREADS ?= 16
 LINTS ?= -W clippy::undocumented_unsafe_blocks -W clippy::missing_safety_doc
+GO_IMAGE ?= golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c
+VERSIONED = $(CURDIR)/benchmarks/compare/target/versioned
+GO_BUILD = docker run --rm --memory=16g --memory-swap=16g --user $$(id -u):$$(id -g) -e HOME=/work/go \
+	-e GOPATH=/work/go -e GOCACHE=/work/go/cache -e GOTOOLCHAIN=local -e GOFLAGS=-mod=readonly -v $(VERSIONED):/work
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-debug check test test-lib test-one test-pkg test-stress lint lint-windows fmt fmt-check doc doc-check ci act \
 	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-covered bench-combine bench-compare \
+	compare-versioned \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
 	info log verify space compact fuzz fuzz-seeds fuzz-lint clean clean-tmp
 
@@ -124,6 +129,14 @@ bench-combine: ## Compare ways to combine two index lookups by key
 
 bench-compare: ## Compare ferro with SQLite, redb and fjall
 	cd benchmarks/compare && $(RUN) run --release -- $(ARGS)
+
+compare-versioned: ## Compare ferro's history, branches, sync and verify with immudb and Dolt, both in Docker
+	@mkdir -p $(VERSIONED)/go $(VERSIONED)/bin $(VERSIONED)/runs
+	$(GO_BUILD) -e CGO_ENABLED=0 -v $(CURDIR)/benchmarks/compare/versioned/immudb:/src:ro -w /src $(GO_IMAGE) \
+		go build -trimpath -o /work/bin/immudb .
+	$(GO_BUILD) -e CGO_ENABLED=1 -v $(CURDIR)/benchmarks/compare/versioned/dolt:/src:ro -w /src $(GO_IMAGE) \
+		go build -tags gms_pure_go -trimpath -o /work/bin/dolt .
+	cd benchmarks/compare && $(RUN) run --release --bin versioned -- --image $(GO_IMAGE) $(ARGS)
 
 quickstart: ## Run the library's quickstart example
 	$(RUN) run --release -p ferro --example quickstart

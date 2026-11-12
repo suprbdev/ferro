@@ -1,5 +1,7 @@
 # ferro vs embedded stores
 
+For history reads, diffs, branches, sync and verification against immudb and Dolt, see [versioned/RESULTS.md](versioned/RESULTS.md).
+
 Run: `cd benchmarks/compare && cargo run --release` (7 engines x 3 rounds, rotated order, each in a fresh directory and fresh process, medians reported). The `ferro-extend` engine loads ferro with one `Map::extend` instead of a loop of `insert`.
 
 Measured 2026-11-05. Hardware: AMD RYZEN AI MAX+ 395 (16 cores, 32 threads, two CCDs of 8 cores with 32 MiB of L3 each, `performance` governor), 124 GB RAM, Crucial P310 2 TB NVMe with ext4 (`noatime`), Linux 7.2.14-arch1-1. rustc 1.92.0 and cargo 1.92.0, release profile. Data dir is `benchmarks/compare/target/runs` on that disk.
