@@ -242,6 +242,7 @@ median of:
 
 | Tool, runs | Workload | Result |
 | --- | --- | --- |
+| `batch`, 10 | 100 commits of 1,000 random keys into a map growing to 100,000, then 100 of new keys and 100 of keys it holds, fsync, measured on 2026-11-12 at a load average of 3 to 7 | 2.96, 4.39 and 4.58 ms a commit, against 4.30, 6.06 and 6.43 ms before the parallel flush kept its threads, as [Threads kept between flushes](../internals/tree.md#threads-kept-between-flushes) describes |
 | `bulk`, 5 | 1M random keys inserted in one commit | 0.66 s: 0.48 s of inserts and 0.19 s to commit and drop the tree, 342 MiB peak RSS, against 0.73 s, 0.53 s, 0.20 s and 378 MiB on 2026-11-04 |
 | `tables`, 7 | Booking hold, confirm and cancel, Buffered | 86, 106 and 146 µs of CPU, 14, 14 and 26 µs of it in the closure, 13,362 bytes a write |
 | `covered`, 3 of 3 rounds | A balance update on 200,000 rows, a plain `tier` index against one covering `balance` | 7,660 against 10,415 bytes and 52 against 67 µs of CPU, indexes of 3.90 against 4.56 MiB |

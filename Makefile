@@ -25,7 +25,7 @@ GO_BUILD = docker run --rm --memory=16g --memory-swap=16g --user $$(id -u):$$(id
 
 .DEFAULT_GOAL := help
 .PHONY: help build build-debug check test test-lib test-one test-pkg test-stress lint lint-windows fmt fmt-check doc doc-check ci act \
-	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-merge bench-covered bench-combine bench-compare \
+	bench bench-reads bench-scaling bench-heap bench-tables bench-bulk bench-batch bench-merge bench-covered bench-combine bench-compare \
 	compare-versioned \
 	quickstart tracker shop shop-load chat chat-load notes notes-scale booking booking-stress queue-bench \
 	info log verify space compact fuzz fuzz-seeds fuzz-lint clean clean-tmp
@@ -117,6 +117,9 @@ bench-tables: ## Benchmark booking-style multi-table commits
 
 bench-bulk: ## Benchmark a bulk load phase by phase
 	$(RUN) run --release -p ferro-bench --bin bulk -- $(ARGS)
+
+bench-batch: ## Benchmark commits of 1000 keys at a time
+	$(RUN) run --release -p ferro-bench --bin batch -- $(ARGS)
 
 bench-merge: ## Benchmark merge-base searches
 	$(RUN) run --release -p ferro-bench --bin merge -- $(ARGS)

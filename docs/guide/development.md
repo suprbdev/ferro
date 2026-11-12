@@ -31,7 +31,7 @@ machine passes the cap; set `JOBS` when `MEM` is not given in G.
 | `make fmt`, `make fmt-check` | Format the workspace with rustfmt, or fail if any file is not formatted. |
 | `make doc`, `make doc-check` | The library's API docs, or a build of them that fails on any rustdoc warning, such as a broken link. |
 | `make bench` | The main benchmark, appending to `target/bench/results.jsonl`. |
-| `make bench-reads`, `bench-scaling`, `bench-heap`, `bench-tables`, `bench-bulk`, `bench-merge`, `bench-covered`, `bench-combine` | The `ferro-bench` tools of those names. |
+| `make bench-reads`, `bench-scaling`, `bench-heap`, `bench-tables`, `bench-bulk`, `bench-batch`, `bench-merge`, `bench-covered`, `bench-combine` | The `ferro-bench` tools of those names. |
 | `make bench-compare` | ferro against SQLite, redb and fjall. |
 | `make fuzz-seeds`, `make fuzz FUZZ=open` | Fuzzing, as described in [Fuzzing and testing](../internals/testing.md). |
 | `make fuzz-lint` | rustfmt and clippy on the fuzz crate, which is its own workspace, on stable. |

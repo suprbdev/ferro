@@ -79,6 +79,7 @@ extern crate self as ferro;
 
 pub mod admin;
 pub mod codec;
+mod crew;
 pub mod db;
 mod dense;
 mod epoch;

@@ -22,7 +22,8 @@ numbers. This index lists them by subsystem.
 
 - Fanout 4 and 16, and BLAKE3 for key levels: [Shape and fanout](tree.md#shape-and-fanout).
 - Prefetch variants, splitting in place, longer linear search, unsafe uniqueness checks, other free
-  orders, arenas, buffered inserts, dropping on a background thread, freeing in parallel, rayon, and
+  orders, arenas, buffered inserts, dropping on a background thread, freeing in parallel, rayon,
+  overlapping a batch's cache fill and drop with its sync, a lower bar for the parallel flush, and
   turning LZ4 off: [Measured and rejected](tree.md#measured-and-rejected).
 - Rebuilding node vectors for a batch: [Batches](tree.md#batches-extend-fromiterator-and-apply).
 - Lower spill thresholds: [Spilled values](tree.md#spilled-values).

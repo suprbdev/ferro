@@ -110,6 +110,10 @@ tree of about 190 MB to drop. Timed in one run on 2026-11-05, with timers around
 | Register the records for deduplication and fill the node cache | 13 ms | the committing thread |
 | Drop the working tree | 109 ms | the committing thread |
 
+The append and the decode of the cached copies now overlap, on threads a crew keeps between
+flushes, as [Threads kept between flushes](tree.md#threads-kept-between-flushes) describes, which
+took the commit in `bulk` from 103 to 95 ms.
+
 The drop is most of it, and freeing about 2.4M allocations in address order is most of the drop, as
 [Dropping a large tree](tree.md#dropping-a-large-tree) describes. Smaller slots and a prefetch of
 each node's flag line in the drop's walk took the drop to 96 ms in `bulk`, median of five

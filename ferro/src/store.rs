@@ -56,7 +56,7 @@ use crate::codec::{
 };
 use crate::dense::{Ascending, Column};
 use crate::error::{Error, Result};
-use crate::map::SPILL_BYTES;
+use crate::map::{SPILL_BYTES, prefetch};
 use crate::platform::{self, FileExt};
 use crate::reclaim::sibling;
 use crate::shared::{Erased, Shared, Weak};
@@ -5203,6 +5203,14 @@ impl Dedupe {
         Some(u64::from_le_bytes(ways[0].offset)).filter(|offset| *offset != 0)
     }
 
+    /// Asks the processor for the line of the set `hash` falls in, ahead of a lookup.
+    fn prefetch(&self, hash: &Hash) {
+        let (chunk, set) = self.index(hash);
+        if let Some(sets) = self.chunks[chunk].get() {
+            prefetch(std::ptr::from_ref(&sets[set]).addr());
+        }
+    }
+
     /// Records `hash` at `offset` at the front of its set, pushing the older way out of a full one.
     fn insert(&self, hash: Hash, offset: u64) {
         let (chunk, set) = self.index(&hash);
@@ -5550,6 +5558,12 @@ impl Sink for Txn {
             return Ok(ptr);
         }
         Ok(self.record(hash, staged))
+    }
+
+    fn prefetch(&self, hash: &Hash) {
+        if !self.unshared {
+            self.store.inner.dedupe.prefetch(hash);
+        }
     }
 
     fn remember(&mut self, ptr: Ptr, value: Erased, weight: u32) {

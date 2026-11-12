@@ -174,28 +174,89 @@ flush below keeps none, so a bulk load holds no more memory than before.
 
 A dirty node of at least 4096 keys with two or more dirty children and at least 256 dirty nodes
 under it is flushed in three phases. First, every dirty subtree under 4096 keys is encoded, hashed
-and LZ4 compressed on up to 16 scoped threads, each into its own buffer, and the nodes above them on
-the calling thread. Second, the calling thread appends the records to the transaction in the order a
-one-thread flush would, so the file comes out byte for byte the same. Third, the threads decode the
-cached copies from those buffers, which also checks every value and leaves the same `Weak` memos and
-hints a one-thread flush leaves, as described under [The read path](read-path.md#memos), and the
-calling thread hands them to the cache in the same order. The first phase encodes against a sink
-that refuses writes and links, so a value that holds a dirty collection or a raw `Ptr` sends the
-node back to the one-thread path. The threads are scoped and the caller blocks on them: a commit
-holds the branch lock, and a work-stealing pool thread waiting on a join could pick up another task
-that commits to the same database and deadlock. At 1M keys the commit went from 476 to 98 ms and
-`root_hash` on a dirty map from 209 to 32 ms. The decoded copies land on the threads' heaps, so
-where they are built matters: building them in the first phase, next to scratch buffers that are
-freed later, spread them over 2.5 times as many pages and made the next scans 10 to 15% slower.
-Built in the third phase, after each subtree's buffers are released, the first pass of gets, scans
-and ranges after a bulk load is as fast as before or up to 7% faster, and peak memory rose 2%, from
-362 to 371 MiB at 1M keys. Each phase spawns its threads, so a 10,000-row table commit, with little
-to share out, gains up to 5% for 50% more CPU time. The rule first stopped at two dirty children, so
-a commit that changed two keys under different children of a large tree's root spawned threads in
-both phases to flush a handful of nodes. A booking confirm, which moves a booking from one status to
-another in an index of several thousand entries, did that on every commit, and lost a third of its
-CPU time outside the closure and nearly half of its wall time to it. 256 dirty nodes are about a
-millisecond of work on one thread.
+and LZ4 compressed on the calling thread and up to 15 threads of a crew, each into its own buffer,
+and the nodes above them on the calling thread. Second, the calling thread appends the records to
+the transaction in the order a one-thread flush would, so the file comes out byte for byte the same.
+Third, the crew decodes the cached copies from those buffers, which also checks every value and
+leaves the same `Weak` memos and hints a one-thread flush leaves, as described under [The read
+path](read-path.md#memos), and the calling thread hands them to the cache in the same order. A
+subtree is decoded as soon as its records are in, while the calling thread appends the next, so the
+second and third phases overlap, and once it has appended the last record the calling thread decodes
+what is left with the crew, then the nodes above the subtrees. The first phase encodes against a
+sink that refuses writes and links, so a value that holds a dirty collection or a raw `Ptr` sends
+the node back to the one-thread path. The caller blocks until the crew is done with its work: a
+commit holds the branch lock, and a work-stealing pool thread waiting on a join could pick up
+another task that commits to the same database and deadlock, which the crew cannot, as described
+under [Threads kept between flushes](#threads-kept-between-flushes). At 1M keys the commit went from
+476 to 98 ms and `root_hash` on a dirty map from 209 to 32 ms. The decoded copies land on the
+threads' heaps, so where they are built matters: building them in the first phase, next to scratch
+buffers that are freed later, spread them over 2.5 times as many pages and made the next scans 10 to
+15% slower. Built in the third phase, after each subtree's buffers are released, the first pass of
+gets, scans and ranges after a bulk load is as fast as before or up to 7% faster, and peak memory
+rose 2%, from 362 to 371 MiB at 1M keys. Each phase used to spawn its threads, so a 10,000-row table
+commit, with little to share out, gained up to 5% for 50% more CPU time. The rule first stopped at
+two dirty children, so a commit that changed two keys under different children of a large tree's
+root spawned threads in both phases to flush a handful of nodes. A booking confirm, which moves a
+booking from one status to another in an index of several thousand entries, did that on every
+commit, and lost a third of its CPU time outside the closure and nearly half of its wall time to it.
+256 dirty nodes are about a millisecond of work on one thread.
+
+## Threads kept between flushes
+
+A commit of 1,000 random keys into a map of 100,000, which the versioned harness in
+`benchmarks/compare` makes 100 of to load its map, took 4.81 ms against immudb's 4.46 (#151).
+`ferro-bench`'s `batch` tool makes the same commits. With timers around each phase, Buffered, on a
+machine shared with other work, the median commit of the load spent 1,240 µs in the closure's
+inserts, 525 µs staging, 354 µs appending the records, 500 µs decoding the cached copies, 361 µs
+placing and writing the frame and filling the node cache, and 585 µs dropping the working tree.
+Each threaded phase spawned 15 scoped threads, which took 120 to 160 µs of the committing thread
+before it took a subtree of its own, and over 200 such commits the process spent 0.97 s of system
+time against 0.12 s with the flush on one thread.
+
+The parallel flush now runs on a crew: threads started the first time a flush needs them, up to 15,
+and parked between flushes. A caller lists its work with the seats crew threads may take, wakes two
+idle ones, and each thread that takes a seat wakes two more while seats are left, so neither the
+caller nor any one thread pays for every wake. The caller drains the same queue, so it never waits
+for a thread to start or wake, and finishes alone when every crew thread is busy with other callers'
+work. A crew thread runs only work that a caller is blocked on and taking from too, never a task of
+its own, so it cannot pick up a commit as a work-stealing pool thread could, and work that calls the
+crew again from a crew thread finishes as well. The caller returns once every crew thread that took
+its work has left it, and a panic on one carries on in the caller.
+
+The decode of the cached copies used to wait for the last record to be appended, and now starts on
+each subtree as soon as its records are in, as described under [Parallel flush](#parallel-flush). A
+third of the append went to waiting for the set of the deduplication table that each record is
+looked up in, so the append now asks for the sets of a node's children before it looks them up.
+
+`batch`, medians of ten runs alternating with the build before, measured on 2026-11-12 at a load
+average of 3 to 7 on 32 threads, time and CPU time a commit:
+
+| Commits | Durability | Before | After |
+| --- | --- | ---: | ---: |
+| 100 of 1,000 new keys, the map growing to 100,000 | Fsync | 4.30 ms, 11.1 ms of CPU | 2.96 ms (-31%), 7.6 ms of CPU |
+| 100 more of 1,000 new keys | Fsync | 6.06 ms, 16.1 ms | 4.39 ms (-28%), 11.9 ms |
+| 100 of 1,000 keys the map holds | Fsync | 6.43 ms, 15.9 ms | 4.58 ms (-29%), 12.8 ms |
+| The same three | Buffered | 3.75, 5.47 and 5.85 ms | 2.72, 3.92 and 4.01 ms (-27, -28 and -32%) |
+
+Instructions outside the closure fell 1.6 to 2.2%, and the rest is the threads no longer spawned and
+the waits that overlap. Commits of 10,000 keys into maps of up to 500,000 took 9 to 20% less time,
+and commits of 100 keys, some of which fan out, 3 to 9%. In two sets of six and eight runs of the
+versioned harness's ferro child alternating with the build before, at load averages of 17 to 23, the
+1,000-key commit took 5.50 and 6.10 ms against 7.20 and 7.32, the load 0.58 and 0.64 s against 0.72
+and 0.73, and the files came out the same size, while its reads, diff, verify, merge and clone moved
+within the spread of their runs. In `bulk` at 1M keys the commit after the inserts took 95 ms
+against 103, and 419 ms of CPU against 488, and single-key commits, gets, scans and ranges did not
+move beyond the spread of five runs. Peak RSS rose from 342 to 346 MiB, and the booking commits of
+`tables`, which do not fan out, stayed within the spread of their runs.
+
+What is left of a 1,000-key commit is mostly on the calling thread. The inserts are about 40% of
+it, waiting on the node cache's lookup and the copy of each stored node they change, which a loop
+of `insert` cannot overlap from one key to the next. Filling the node cache and dropping the working
+tree take about 15% each, and the staging the crew shares about 10%. A batch commit writes the same
+bytes as before, 418 KB for 1,000 keys into 50,000 on average, nearly all of it new leaves and their
+parents; of the encodings measured under [Bytes of a small commit](commit-bytes.md), compact nodes,
+which write 13% fewer bytes in a bulk load, where leaves dominate as they do here, would shrink it
+most, and none was built.
 
 ## Inserts and prefetch hints
 
@@ -328,6 +389,18 @@ already in key order would save only the sort, about 33 ms at 1M pairs, so it wa
   to 900 ms on 2 to 16, since every free takes the lock of the arena that allocated it.
 - rayon. As fast as the scoped threads, but it can deadlock as above, and its `par_sort_by` did not
   beat the standard stable sort on 1M shuffled pairs, about 33 ms either way.
+- Handing the cache fill and the drop of the working tree to a crew thread while a Fsync commit
+  waits for its fdatasync, and waiting for them before the commit returns: within 8% of the plain
+  commit either way across the three phases of `batch` in ten alternating runs, for up to 11% more
+  CPU time. The job took 700 to 900 µs against a sync of about 470, frees on a thread other than the
+  one that allocated cost more, and the next writer on the branch could find the cache unfilled.
+- Fanning out from 64 or 128 dirty nodes rather than 256, now that the crew starts no threads:
+  commits of 60 keys used 2.5 times the CPU time for at most 9% less time, and commits of 100 and
+  200 keys moved by -9 to +16%.
+- An LZ4 encoder of ferro's own with a smaller table for node bodies. Not built: allocating and
+  clearing the table is about a tenth of what LZ4 runs on a node, and finding the matches the rest.
+- Hashing staged nodes a level at a time through `HashBatch`. Not built: hashing is about a fifth
+  of the staging, which the crew already spreads over up to 16 threads.
 - Reserving the transaction buffer up front, and keeping LZ4 off when it does not pay. The first
   changed nothing measurable, and without LZ4 a 1M-key load is 17% larger and a table row 80%
   larger, so compression stays and runs on the threads.
@@ -335,22 +408,21 @@ already in key order would save only the sort, about 33 ms at 1M pairs, so it wa
 ## Batches: `Extend`, `FromIterator` and `apply`
 
 `Extend`, `FromIterator` and `apply`, which also takes deletes, sort the batch and keep the last
-edit per key. Batches of 16,384 keys or more hash their key levels on the scoped threads described
-above. An empty map is assembled bottom-up in one pass, which gives the same tree as inserting key
-by key. A non-empty map takes the batch in one descent: each node sorts the edits into its gaps,
-applies the ones at its own level in place, and passes each group to one child, so a subtree no edit
-falls in stays shared and a node is walked once however many edits it receives, or twice on a root
-changed earlier in the transaction, as [Edits that fail halfway](#edits-that-fail-halfway)
-describes. Editing the node in place, not rebuilding its vectors from the old and new entries, is
-what makes this pay: the rebuilding form was up to 28% slower than per-key inserts. The gain is
-modest, because a touched node has to be read and copied either way and `flush` costs three to four
-times the tree work. At 1M keys the closure takes 5 to 25% less time than sorted per-key inserts
-from 1,000 to 100,000 edits and 30 to 37% less for 1M edits, the commit as a whole 0 to 22% less,
-and batches under 1,000 edits show no difference. A 50,000 page wiki import, 20M posting entries,
-gained 4% in its posting phase. The metrics load test gained nothing measurable, since chunk merging
-dominates there, so its ingest keeps plain inserts. `retain` collects its deletes and applies them
-the same way. A disjoint batch needs no special case, since the same descent walks one edge of the
-tree.
+edit per key. Batches of 16,384 keys or more hash their key levels on the crew described above. An
+empty map is assembled bottom-up in one pass, which gives the same tree as inserting key by key. A
+non-empty map takes the batch in one descent: each node sorts the edits into its gaps, applies the
+ones at its own level in place, and passes each group to one child, so a subtree no edit falls in
+stays shared and a node is walked once however many edits it receives, or twice on a root changed
+earlier in the transaction, as [Edits that fail halfway](#edits-that-fail-halfway) describes.
+Editing the node in place, not rebuilding its vectors from the old and new entries, is what makes
+this pay: the rebuilding form was up to 28% slower than per-key inserts. The gain is modest, because
+a touched node has to be read and copied either way and `flush` costs three to four times the tree
+work. At 1M keys the closure takes 5 to 25% less time than sorted per-key inserts from 1,000 to
+100,000 edits and 30 to 37% less for 1M edits, the commit as a whole 0 to 22% less, and batches
+under 1,000 edits show no difference. A 50,000 page wiki import, 20M posting entries, gained 4% in
+its posting phase. The metrics load test gained nothing measurable, since chunk merging dominates
+there, so its ingest keeps plain inserts. `retain` collects its deletes and applies them the same
+way. A disjoint batch needs no special case, since the same descent walks one edge of the tree.
 
 ## Spilled values
 

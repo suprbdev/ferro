@@ -569,6 +569,9 @@ pub trait Sink {
         };
         self.put(object, hash)
     }
+    /// Hints that an object whose hash is `hash` is about to be stored, so that the sink can
+    /// start fetching what it looks the hash up in. The default does nothing.
+    fn prefetch(&self, _hash: &Hash) {}
     /// Checks that `ptr`, which a value being encoded holds, names an object in the sink's file.
     /// The default accepts every link.
     ///

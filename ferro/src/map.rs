@@ -80,7 +80,7 @@ use std::any::{Any, TypeId, type_name};
 use std::borrow::Borrow;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::hash;
@@ -2601,14 +2601,20 @@ fn flush_with<K: Data, V: Data, S: Summary<K, V>>(
             nesting,
         };
         if let Ok(mut staged) = stage_tree(node, &stager) {
-            emit_staged(&mut staged, &mut Arena::default(), sink)?;
-            let written = Link::stored(staged.ptr, node.count, staged.total.clone());
-            if let Some(store) = &stager.store {
-                let settled = settle_tree(&mut staged, depth, store)?;
-                if dense && depth >= PIN_DEPTH {
-                    memoize(&written, &settled);
+            let written = match &stager.store {
+                Some(store) => {
+                    let settled = emit_settle(&mut staged, depth, store, sink)?;
+                    let written = Link::stored(staged.ptr, node.count, staged.total.clone());
+                    if dense && depth >= PIN_DEPTH {
+                        memoize(&written, &settled);
+                    }
+                    written
                 }
-            }
+                None => {
+                    emit_staged(&mut staged, &mut Arena::default(), sink)?;
+                    Link::stored(staged.ptr, node.count, staged.total.clone())
+                }
+            };
             remember(staged, sink);
             return Ok(written);
         }
@@ -3180,6 +3186,9 @@ fn emit_staged<K, V, S>(
     } = deferred;
     let arena = arena.as_deref_mut().unwrap_or(outer);
     let base = placed.links.start;
+    for (_, _, child) in children.iter() {
+        sink.prefetch(&child.placed.hash);
+    }
     for (at, spill) in spills.iter() {
         arena.links[base + at] = arena.put(spill, sink)?;
     }
@@ -3194,34 +3203,159 @@ fn emit_staged<K, V, S>(
     Ok(())
 }
 
-fn settle_tree<K: Data, V: Data, S: Data>(
+/// The subtrees of a flush whose records are in the transaction, waiting for a thread to decode
+/// their cached copies, and whether the last of them is in.
+struct Ready<'t, 'a, K, V, S> {
+    queue: parking_lot::Mutex<Waiting<'t, 'a, K, V, S>>,
+    more: parking_lot::Condvar,
+    failed: parking_lot::Mutex<Option<Error>>,
+}
+
+/// The subtrees in a [`Ready`] queue, each with its depth, in the order their records went in.
+struct Waiting<'t, 'a, K, V, S> {
+    subtrees: VecDeque<Owned<'t, 'a, K, V, S>>,
+    closed: bool,
+}
+
+type Owned<'t, 'a, K, V, S> = (&'t mut Deferred<'a, K, V, S>, usize);
+
+impl<'t, 'a, K: Data, V: Data, S: Data> Ready<'t, 'a, K, V, S> {
+    fn push(&self, task: Owned<'t, 'a, K, V, S>) {
+        self.queue.lock().subtrees.push_back(task);
+        self.more.notify_one();
+    }
+
+    fn close(&self) {
+        self.queue.lock().closed = true;
+        self.more.notify_all();
+    }
+
+    /// Decodes the cached copies of each subtree as it comes in, until the last is in and taken.
+    fn settle(&self, store: &Store) {
+        loop {
+            let next = {
+                let mut queue = self.queue.lock();
+                loop {
+                    if let Some(next) = queue.subtrees.pop_front() {
+                        break Some(next);
+                    }
+                    if queue.closed {
+                        break None;
+                    }
+                    self.more.wait(&mut queue);
+                }
+            };
+            let Some((task, depth)) = next else {
+                return;
+            };
+            if let Err(error) = settle_owned(task, depth, store) {
+                self.failed.lock().get_or_insert(error);
+            }
+        }
+    }
+}
+
+/// Closes a [`Ready`] queue when dropped, so that the threads waiting on it return even if the
+/// records are not all in.
+struct Closing<'r, 't, 'a, K: Data, V: Data, S: Data>(&'r Ready<'t, 'a, K, V, S>);
+
+impl<K: Data, V: Data, S: Data> Drop for Closing<'_, '_, '_, K, V, S> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// Puts the records of a staged tree into `sink` in the order [`emit_staged`] would, and decodes
+/// their cached copies: those of each subtree a thread staged on the crew, as soon as its records
+/// are in, while this thread appends the next, and then those of the nodes above, on this thread.
+fn emit_settle<K: Data, V: Data, S: Data>(
     root: &mut Deferred<'_, K, V, S>,
     depth: usize,
     store: &Store,
+    sink: &mut dyn Sink,
 ) -> Result<Shared<Node<K, V, S>>> {
-    let mut tasks = Vec::new();
-    for (_, _, child) in &mut root.children {
-        owned(child, depth + 1, &mut tasks);
+    let mut spine = root.arena.take().ok_or(Error::Detached)?;
+    let helpers = match ALONE.get() {
+        true => 0,
+        false => workers().min(subtrees(root)).saturating_sub(1),
+    };
+    let ready = Ready {
+        queue: parking_lot::Mutex::new(Waiting {
+            subtrees: VecDeque::new(),
+            closed: false,
+        }),
+        more: parking_lot::Condvar::new(),
+        failed: parking_lot::Mutex::new(None),
+    };
+    let work = || ready.settle(store);
+    let emitted = {
+        let tasks = &mut *root;
+        crate::crew::run(helpers, MAX_WORKERS - 1, &work, || {
+            let closing = Closing(&ready);
+            let emitted = emit_spine(tasks, depth, &mut spine, sink, &mut |task| ready.push(task));
+            drop(closing);
+            ready.settle(store);
+            emitted
+        })
+    };
+    let failed = ready.failed.into_inner();
+    emitted?;
+    if let Some(error) = failed {
+        return Err(error);
     }
-    parallel(tasks, |(task, depth)| settle_owned(task, depth, store))
-        .into_iter()
-        .collect::<Result<()>>()?;
-    let arena = root.arena.take().ok_or(Error::Detached)?;
-    settle_spine(root, depth, &arena, store, &mut Vec::new())
+    settle_spine(root, depth, &spine, store, &mut Vec::new())
 }
 
-fn owned<'t, 'a, K, V, S>(
+/// How many subtrees a thread staged under a node staged on the calling thread.
+fn subtrees<K, V, S>(deferred: &Deferred<'_, K, V, S>) -> usize {
+    deferred
+        .children
+        .iter()
+        .map(|(_, _, child)| match child.arena {
+            Some(_) => 1,
+            None => subtrees(child),
+        })
+        .sum()
+}
+
+/// [`emit_staged`] for a node staged on the calling thread, whose arena is `spine`, which hands
+/// each subtree a thread staged to `ready` once its records are in.
+fn emit_spine<'t, 'a, K, V, S>(
     deferred: &'t mut Deferred<'a, K, V, S>,
     depth: usize,
-    tasks: &mut Vec<(&'t mut Deferred<'a, K, V, S>, usize)>,
-) {
-    if deferred.arena.is_some() {
-        tasks.push((deferred, depth));
-    } else {
-        for (_, _, child) in &mut deferred.children {
-            owned(child, depth + 1, tasks);
+    spine: &mut Arena,
+    sink: &mut dyn Sink,
+    ready: &mut dyn FnMut(Owned<'t, 'a, K, V, S>),
+) -> Result<Ptr> {
+    let Deferred {
+        node,
+        placed,
+        spills,
+        children,
+        ptr,
+        ..
+    } = deferred;
+    let base = placed.links.start;
+    for (_, _, child) in children.iter() {
+        sink.prefetch(&child.placed.hash);
+    }
+    for (at, spill) in spills.iter() {
+        spine.links[base + at] = spine.put(spill, sink)?;
+    }
+    for (at, _, child) in children {
+        if child.arena.is_some() {
+            emit_staged(child, spine, sink)?;
+            spine.links[base + *at] = child.ptr;
+            ready((child, depth + 1));
+        } else {
+            spine.links[base + *at] = emit_spine(child, depth + 1, spine, sink, ready)?;
         }
     }
+    *ptr = match node.origin {
+        Some(origin) if origin.hash == placed.hash => origin,
+        _ => spine.put(placed, sink)?,
+    };
+    Ok(*ptr)
 }
 
 fn settle_owned<K: Data, V: Data, S: Data>(
@@ -3336,6 +3470,7 @@ fn parallel<T: Send, R: Send>(tasks: Vec<T>, work: impl Fn(T) -> R + Sync) -> Ve
     if threads < 2 {
         return tasks.into_iter().map(work).collect();
     }
+    let count = tasks.len();
     let queue = parking_lot::Mutex::new(tasks.into_iter().enumerate());
     let drain = || {
         let mut done = Vec::new();
@@ -3347,17 +3482,13 @@ fn parallel<T: Send, R: Send>(tasks: Vec<T>, work: impl Fn(T) -> R + Sync) -> Ve
             done.push((index, work(task)));
         }
     };
-    let mut done = std::thread::scope(|scope| {
-        let helpers: Vec<_> = (1..threads).map(|_| scope.spawn(drain)).collect();
-        let mut done = drain();
-        for helper in helpers {
-            match helper.join() {
-                Ok(more) => done.extend(more),
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
-        }
-        done
-    });
+    let results = parking_lot::Mutex::new(Vec::with_capacity(count));
+    let work = || {
+        let done = drain();
+        results.lock().extend(done);
+    };
+    crate::crew::run(threads - 1, MAX_WORKERS - 1, &work, work);
+    let mut done = results.into_inner();
     done.sort_unstable_by_key(|(index, _)| *index);
     done.into_iter().map(|(_, result)| result).collect()
 }
