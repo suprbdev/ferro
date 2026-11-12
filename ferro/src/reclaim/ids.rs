@@ -190,6 +190,94 @@ mod tests {
         assert_eq!(ids.get(&hash(10_000)), None);
     }
 
+    fn crowded(seed: u32) -> Hash {
+        let mut hash = [0u8; 20];
+        let word = u64::from(seed / 4).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        hash[..8].copy_from_slice(&word.to_le_bytes());
+        hash[8] = 7;
+        hash[12] = (seed % 4 / 2) as u8;
+        hash[16] = (seed % 2) as u8;
+        hash
+    }
+
+    #[test]
+    fn readers_racing_grows_find_every_published_hash_and_no_other() {
+        use std::sync::atomic::AtomicU32;
+        const WRITERS: u32 = 2;
+        const EACH: u32 = 20_000;
+        for _ in 0..3 {
+            let ids = Ids::new();
+            let published: Vec<AtomicU32> = (0..WRITERS).map(|_| AtomicU32::new(0)).collect();
+            let given: Vec<[AtomicU32; 2]> = (0..WRITERS * EACH)
+                .map(|_| [AtomicU32::new(u32::MAX), AtomicU32::new(u32::MAX)])
+                .collect();
+            let done = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                for writer in 0..WRITERS {
+                    let (ids, published, given) = (&ids, &published, &given);
+                    scope.spawn(move || {
+                        for at in 0..EACH {
+                            let seed = writer * EACH + at;
+                            let got = ids.insert(&crowded(seed), seed);
+                            given[seed as usize][0].store(got, Ordering::Relaxed);
+                            let twin = (seed + EACH) % (WRITERS * EACH);
+                            let other = ids.insert(&crowded(twin), twin + 1_000_000);
+                            given[twin as usize][1].store(other, Ordering::Relaxed);
+                            published[writer as usize].store(at + 1, Ordering::Release);
+                        }
+                    });
+                }
+                for reader in 0..2u32 {
+                    let (ids, published, done) = (&ids, &published, &done);
+                    scope.spawn(move || {
+                        let mut state = 0x9e37_79b9u32.wrapping_mul(reader + 1);
+                        while !done.load(Ordering::Relaxed) {
+                            state ^= state << 13;
+                            state ^= state >> 17;
+                            state ^= state << 5;
+                            let writer = state % WRITERS;
+                            let count = published[writer as usize].load(Ordering::Acquire);
+                            let at = (state >> 8) % EACH;
+                            let seed = writer * EACH + at;
+                            let got = ids.get(&crowded(seed));
+                            if at < count {
+                                assert!(
+                                    got == Some(seed) || got == Some(seed + 1_000_000),
+                                    "published seed {seed} read as {got:?}"
+                                );
+                            } else {
+                                assert!(
+                                    got.is_none()
+                                        || got == Some(seed)
+                                        || got == Some(seed + 1_000_000),
+                                    "unpublished seed {seed} read as {got:?}"
+                                );
+                            }
+                            let absent = crowded(WRITERS * EACH + (state >> 4) % 1000);
+                            assert_eq!(ids.get(&absent), None);
+                        }
+                    });
+                }
+                scope.spawn(|| {
+                    while published
+                        .iter()
+                        .any(|count| count.load(Ordering::Acquire) < EACH)
+                    {
+                        std::thread::yield_now();
+                    }
+                    done.store(true, Ordering::Relaxed);
+                });
+            });
+            for seed in 0..WRITERS * EACH {
+                let got = ids.get(&crowded(seed)).unwrap();
+                assert!(got == seed || got == seed + 1_000_000);
+                let [first, second] = &given[seed as usize];
+                assert_eq!(first.load(Ordering::Relaxed), got);
+                assert_eq!(second.load(Ordering::Relaxed), got);
+            }
+        }
+    }
+
     #[test]
     fn threads_agree_on_each_number() {
         let ids = Ids::new();

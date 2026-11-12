@@ -1397,14 +1397,24 @@ impl Units {
         (offset != 0).then_some(offset)
     }
 
-    /// Starts fetching into the cache what [`Units::placed`] reads first for `hash`, or, for a
-    /// link that holds `pending`, what [`Units::pending`] does.
-    pub(super) fn prefetch(&self, hash: &Hash, pending: u64) {
-        match u32::try_from(u64::MAX - pending) {
-            Ok(index) if pending >= PENDING => {
+    /// Starts fetching into the cache what [`Units::placed`] reads first for `hash`.
+    pub(super) fn prefetch(&self, hash: &Hash) {
+        self.shared.claims.ids.prefetch(hash);
+    }
+
+    /// Starts fetching into the cache what [`Units::pending`] reads first for `link`, a link the
+    /// walk wrote into a copy, if it holds an offset [`Units::dispatch`] returned, and otherwise
+    /// what [`Units::placed`] reads first for its hash.
+    ///
+    /// A link read from the source goes to [`Units::prefetch`] instead, since its offset is
+    /// whatever the record says, and one in the range of pending offsets would allocate the
+    /// chunk of roots it names.
+    pub(super) fn prefetch_copy(&self, link: Ptr) {
+        match u32::try_from(u64::MAX - link.offset) {
+            Ok(index) if link.offset >= PENDING => {
                 prefetch(std::ptr::from_ref(self.shared.roots.get(index)).addr());
             }
-            _ => self.shared.claims.ids.prefetch(hash),
+            _ => self.prefetch(&link.hash),
         }
     }
 
@@ -1518,5 +1528,48 @@ impl Drop for Units {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reclaim::Copier;
+    use crate::store::StoreOptions;
+
+    #[test]
+    fn fetching_ahead_for_links_read_from_the_source_allocates_no_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) =
+            Store::open(&dir.path().join("db.ferro"), StoreOptions::default()).unwrap();
+        let options = StoreOptions {
+            copy_threads: 2,
+            ..StoreOptions::default()
+        };
+        let copier = Copier::create(&store, &dir.path().join("copy"), &options, None).unwrap();
+        let start: u64 = 4096;
+        let links: Vec<Ptr> = (0..64u64)
+            .map(|k| Ptr {
+                hash: [0; HASH_BYTES],
+                offset: start.wrapping_sub(start + 1 + k * CHUNK as u64),
+            })
+            .collect();
+        copier.sink.prefetch(&links);
+        let units = copier
+            .sink
+            .units
+            .as_ref()
+            .expect("a copy on two threads has units");
+        let allocated = units
+            .shared
+            .roots
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.get().is_some())
+            .count();
+        assert_eq!(
+            allocated, 0,
+            "{allocated} chunks of 256 KiB allocated by prefetches"
+        );
     }
 }

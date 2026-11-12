@@ -925,7 +925,16 @@ impl CopySink<'_> {
         for link in links {
             self.copied.prefetch(&link.hash);
             if let Some(units) = &self.units {
-                units.prefetch(&link.hash, link.offset);
+                units.prefetch(&link.hash);
+            }
+        }
+    }
+
+    fn prefetch_copies(&self, links: &[Ptr]) {
+        for link in links {
+            self.copied.prefetch(&link.hash);
+            if let Some(units) = &self.units {
+                units.prefetch_copy(*link);
             }
         }
     }
@@ -1112,7 +1121,7 @@ impl CopySink<'_> {
             }
             let parent = self.frames.last().expect("stack is not empty");
             self.copied.prefetch(&parent.from.hash);
-            self.prefetch(&self.held.links[parent.links..]);
+            self.prefetch_copies(&self.held.links[parent.links..]);
             self.held.links.push(ptr);
             self.frames.last_mut().expect("stack is not empty").next += 1;
         }
