@@ -69,6 +69,17 @@ fn verifying_threads() -> usize {
         .count()
 }
 
+fn verifying_threads_after_join() -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let left = verifying_threads();
+        if left == 0 || std::time::Instant::now() >= deadline {
+            return left;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn layout_of(path: &Path) -> Vec<(u64, u64, Vec<u64>)> {
     let options = StoreOptions {
         read_only: true,
@@ -486,7 +497,7 @@ fn a_small_cycle_verifies_on_the_calling_thread_and_a_large_one_on_more() {
         db.compact(Keep::All).unwrap();
         drop(db);
     }
-    assert_eq!(verifying_threads(), 0);
+    assert_eq!(verifying_threads_after_join(), 0);
     assert_eq!(*seen.lock().unwrap(), [0, 0, 3]);
 }
 

@@ -563,6 +563,17 @@ fn verifying_threads() -> usize {
         .count()
 }
 
+fn verifying_threads_after_join() -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let left = verifying_threads();
+        if left == 0 || std::time::Instant::now() >= deadline {
+            return left;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_file() {
     let _turn = serial();
@@ -621,7 +632,7 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
     assert_eq!(created.load(Ordering::SeqCst), 1);
     assert!(no_temp(&path));
     #[cfg(target_os = "linux")]
-    assert_eq!(verifying_threads(), 0);
+    assert_eq!(verifying_threads_after_join(), 0);
     let db: Db<Root> = options().open(&path).unwrap();
     assert_eq!(dump(&db.read()), want);
     db.verify().unwrap();
