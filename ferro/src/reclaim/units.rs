@@ -38,6 +38,12 @@
 //! units, and before it would wait for work. A thread checking ahead hands other threads only links
 //! of records already checked, and stops at a failure.
 //!
+//! A unit that followed the links of a record that then failed may hold objects that only the
+//! damage led it to, which the walk copying it never reaches. Once any check has failed, a unit is
+//! placed only when it and every unit split from it are discovered and each object they link is
+//! placed already or held by one of them that copies itself, and otherwise the walk copies its
+//! tree where it falls, as it copies a tainted unit.
+//!
 //! A slot is numbered by hash in [`Ids`], which any thread reads without a lock, and each thread
 //! remembers the numbers of the hashes it met lately. A thread numbers every link of a record it
 //! reads at once, fetching their slots into the cache together, and a claim compares and lowers
@@ -452,6 +458,7 @@ struct Placer {
     job: Job,
     objects: u64,
     failed: Option<String>,
+    refused: Option<Key>,
 }
 
 enum Progress {
@@ -656,6 +663,7 @@ struct Shared {
     failure: Mutex<Option<Failure>>,
     cancel: AtomicBool,
     checking: AtomicBool,
+    refused: AtomicBool,
     clean: HashSet<Hash, ByHash>,
     taint: ArcSwap<HashSet<Hash, ByHash>>,
     threads: usize,
@@ -864,6 +872,9 @@ impl Shared {
         if checked.is_err() {
             *checks = Checks::new(CHECK_BYTES);
         }
+        if !passed {
+            self.refused.store(true, Ordering::Release);
+        }
         marks.clear();
         *failed |= !passed;
         if units.is_empty() {
@@ -1010,6 +1021,20 @@ impl Shared {
                 Found::Tainted => return Ok(Progress::Tainted(unit)),
                 Found::Copied { children, records } => (children, records),
             };
+            if *next == 0 {
+                if placer.refused == Some(unit.key) {
+                    return Ok(Progress::Tainted(unit));
+                }
+                if self.refused.load(Ordering::Acquire) {
+                    let Some(family) = family(&unit) else {
+                        return Ok(Progress::Waiting);
+                    };
+                    if !self.resolves(&family) {
+                        placer.refused = Some(unit.key);
+                        return Ok(Progress::Tainted(unit));
+                    }
+                }
+            }
             if let Some(child) = children.get(*next) {
                 *next += 1;
                 placer.cursor.push((child.clone(), 0));
@@ -1028,6 +1053,35 @@ impl Shared {
         if placer.cursor.is_empty() {
             self.placed.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// Whether the root of each unit of `family`, a unit and every unit split from it, and every
+    /// object their records link, are placed already or held by one of them that copies itself.
+    /// They are unless a unit claimed objects through the links of a record whose check then
+    /// failed, which keeps them from the units that reach them, and the walk then copies the
+    /// family's tree itself.
+    fn resolves(&self, family: &[Arc<Unit>]) -> bool {
+        let mut copying: Vec<Key> = family
+            .iter()
+            .filter(|unit| matches!(unit.found.get(), Some(Found::Copied { .. })))
+            .map(|unit| unit.key)
+            .collect();
+        copying.sort_unstable();
+        let found = |id: u32| {
+            self.claims.offset(id).load(Ordering::Acquire) != 0
+                || copying.binary_search(&self.claims.held(id)).is_ok()
+        };
+        family.iter().all(|unit| {
+            let Some(Found::Copied { records, .. }) = unit.found.get() else {
+                return true;
+            };
+            let root = self.claims.ids.get(&unit.root.hash);
+            root.is_some_and(found)
+                && records.list.iter().enumerate().all(|(index, rec)| {
+                    self.claims.held(rec.slot) != unit.key
+                        || records.links(index).iter().all(|id| found(*id))
+                })
+        })
     }
 
     fn place_records(
@@ -1350,6 +1404,20 @@ impl Shared {
     }
 }
 
+/// The units of `unit`'s family, itself and the units its discovery split it into and theirs, or
+/// `None` while one of them is not yet discovered.
+fn family(unit: &Arc<Unit>) -> Option<Vec<Arc<Unit>>> {
+    let mut family = vec![unit.clone()];
+    let mut at = 0;
+    while let Some(member) = family.get(at).cloned() {
+        if let Found::Copied { children, .. } = member.found.get()? {
+            family.extend(children.iter().cloned());
+        }
+        at += 1;
+    }
+    Some(family)
+}
+
 fn misplaced(at: u64) -> Error {
     Error::Corrupt(format!(
         "the copy of the record at {at} did not land where it was placed"
@@ -1406,6 +1474,7 @@ impl Units {
                 failure: Mutex::default(),
                 cancel: AtomicBool::new(false),
                 checking: AtomicBool::new(false),
+                refused: AtomicBool::new(false),
                 clean: HashSet::default(),
                 taint: ArcSwap::default(),
                 threads,
@@ -1682,6 +1751,7 @@ impl Units {
         let mut placer = self.shared.placer.lock();
         self.shared.pop(&mut placer);
         placer.end = end;
+        placer.refused = None;
     }
 
     /// Waits for every placed record to be written.

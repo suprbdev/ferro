@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -383,6 +383,75 @@ fn many_damaged_records_fail_alike_at_every_thread_count() {
             );
         }
     }
+}
+
+#[test]
+fn a_link_offset_damaged_onto_another_record_copies_alike_at_every_thread_count() {
+    let _turn = serial();
+    let dir = dir();
+    let source = dir.path().join("source.ferro");
+    build(&source, 700, 500, 300);
+    let bytes = fs::read(&source).unwrap();
+    let records = layout_of(&source);
+    let mut parents: HashMap<u64, Vec<u64>> = HashMap::new();
+    for (offset, _, links) in &records {
+        for link in links {
+            parents.entry(*link).or_default().push(*offset);
+        }
+    }
+    let inner: Vec<_> = records
+        .iter()
+        .filter(|record| !record.2.is_empty())
+        .collect();
+    let path = dir.path().join("retargeted.ferro");
+    let mut rng = Rng::new(0x11fe);
+    let mut cases = 0;
+    for _ in 0..1_000_000 {
+        if cases == 24 {
+            break;
+        }
+        let (from, _, links) = inner[rng.below(inner.len() as u64) as usize];
+        let index = rng.below(links.len() as u64) as usize;
+        let target = links[index];
+        let mut shared = parents[&target].clone();
+        shared.sort_unstable();
+        if shared.len() < 2 || shared[0] != *from || shared[1] - from > 32 << 10 {
+            continue;
+        }
+        let (onto, _, below) = inner[rng.below(inner.len() as u64) as usize];
+        let onto = *onto;
+        let only_below = below
+            .iter()
+            .any(|child| parents[child].iter().max() == Some(&onto));
+        if onto >= *from || onto == target || !only_below {
+            continue;
+        }
+        let slot = &common::link_slots(&bytes, *from as usize).0[index];
+        let Some(patch) = common::distance_bytes(*from, onto, slot.len) else {
+            continue;
+        };
+        let mut damaged = bytes.clone();
+        damaged[slot.at..slot.at + slot.len].copy_from_slice(&patch);
+        fs::write(&path, &damaged).unwrap();
+        let db: Db<Root> = options(1).open(&path).unwrap();
+        let alone = db.compact(Keep::All);
+        drop(db);
+        if alone.is_err() {
+            continue;
+        }
+        let want = fs::read(&path).unwrap();
+        cases += 1;
+        for run in 0..8 {
+            fs::write(&path, &damaged).unwrap();
+            let db: Db<Root> = options(8).open(&path).unwrap();
+            let outcome = db.compact(Keep::All);
+            drop(db);
+            let context = format!("the link at {from} to {target} moved onto {onto}, run {run}");
+            assert!(outcome.is_ok(), "{context}: {outcome:?}");
+            assert!(fs::read(&path).unwrap() == want, "{context}");
+        }
+    }
+    assert_eq!(cases, 24);
 }
 
 #[cfg(target_os = "linux")]

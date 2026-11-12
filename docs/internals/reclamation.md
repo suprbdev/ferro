@@ -966,6 +966,30 @@ four, against 4.3 and 14.7 MB before, the one whose link claims 16 MiB at 38.5 a
 which compares the copies and errors of one thread and four, ran its 8,649 seeds and 107,187 runs
 in ten minutes without a failure.
 
+Following a record's links before it is checked lets a unit claim objects that only damage leads
+to. A link's offset is not part of its record's hash, so a record that passes can name the offset
+of another object's record, which a thread then reads under the link's hash and whose links it
+follows, claiming objects that later units reach. The unit is tainted once that record fails, but
+the walk copying it finds the object the link named placed already by an earlier unit and never
+reads the record, so what the unit claimed beyond it stayed claimed and unplaced, and a later unit
+failed with "the copy reached the record at ... before a record it links" where one thread and the
+build before copied the file. On 24 such files, 162 of 1,440 copies on 8 threads failed. Once any
+check has failed, the placer takes a unit only when the unit and every unit split from it are
+discovered and each object they link is placed already or held by one of them that copies itself,
+and otherwise the walk copies the unit's tree where it falls, as it copies a tainted unit. It looks
+at every unit, not only those the walk dispatched, before the units split from it are placed: such
+claims can also keep a child out of a split, whose tree the unit would then place after its
+siblings', and a sibling whose check fails only after its parent was looked at can still have
+claimed what a later sibling links. A copy that meets no failed check skips the test: alternating
+copies of the table rows took 0.282 s against 0.267 at 8 threads and 0.269 against 0.277 at 16,
+medians of 32 on 16 cores at a load average of 85 to 94, and the copies are the same bytes at 1, 8
+and 16 threads. `reclaim_threads.rs` moves the offset of a link to an object a newer version also
+links onto another record that has links, keeps 24 such files that one thread copies, and expects
+the same bytes on 8 threads, 8 times each. It failed in each of 11 runs before, and passed 30 of 30
+at 8 threads and at 16 after, and 54,000 copies on 8 threads of three files with one to three bits
+flipped gave what one thread gave before the queue. [Measured and left
+out](#measured-and-left-out) has the other way to keep such claims out.
+
 `ferro-bench --bin reclaim copy`, one copy per run, alternating with the build before on
 2026-11-12, pinned to cores 0-15 of a machine other work was sharing, medians of 16 runs for the
 table rows at a load average of 11 to 14 and of 12 for the values at 10 to 11, with the
@@ -1097,6 +1121,12 @@ threads identical to the one the build before made on one, keeping everything an
   takes no lock. Claims took 3,005 to 3,122 samples of the threads' user time against 3,611 to
   3,748 with the tables, three copies each at 16 threads, but the threads' samples came to 16,129
   to 16,333 against 15,689 to 16,294.
+- Claiming the objects a record links only once the record is checked, so that no unit claims
+  through a record that fails. A thread then checked what it held before it claimed through each
+  record still queued, and most records of history lie on one version's path, so it checked 2 to 4
+  records at a time where it had checked about 250. Alternating copies of the table rows took 0.484
+  s against 0.419 at 4 threads, 0.312 against 0.289 at 8 and 0.296 against 0.281 at 16, medians of
+  14 to 28 on 16 cores at a load average of 23 to 27, on 2026-11-12.
 
 ## Generations
 
