@@ -69,6 +69,7 @@ fn verifying_threads() -> usize {
         .count()
 }
 
+#[cfg(target_os = "linux")]
 fn verifying_threads_after_join() -> usize {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
