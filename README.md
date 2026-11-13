@@ -190,7 +190,8 @@ Each is a workspace package, run with `cargo run --release -p <name>`. `tracker`
 
 ## Documentation
 
-The [documentation index](docs/README.md) lists every file.
+The [documentation index](docs/README.md) lists every file, and the [changelog](CHANGELOG.md) what
+each release changed.
 
 - Guides: [getting started](docs/guide/getting-started.md),
   [collections](docs/guide/collections.md), [tables and indexes](docs/guide/tables.md), [history and
