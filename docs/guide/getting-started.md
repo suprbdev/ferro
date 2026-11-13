@@ -16,6 +16,10 @@ example apps depend on it by path:
 ferro = { path = "../../ferro" }
 ```
 
+The code the derives generate reaches ferro as `::ferro`. A crate that depends on it under another
+name, or reaches it through a re-export, puts `#[ferro(crate = "path")]` on each type that derives
+`Data` or `Record`, such as `#[ferro(crate = "crate::storage::engine")]`.
+
 ## A first database
 
 ```rust

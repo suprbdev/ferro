@@ -78,6 +78,8 @@
 
 extern crate self as ferro;
 
+#[doc(hidden)]
+pub mod __derive;
 pub mod admin;
 pub mod codec;
 mod crew;

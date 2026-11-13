@@ -72,3 +72,16 @@ a test in another package needs `ferro` with the feature among its dev-dependenc
 example has. Since a workspace build turns the feature on for every package in it, `make lint` and
 `make lint-windows` run clippy on `-p ferro --lib` after the workspace, which checks the library
 without the feature, and `make doc-check` builds the API docs without it.
+
+## What the derives call
+
+The code that `#[derive(Data)]` and `#[derive(Record)]` generate names the public API and
+`ferro::__derive`, a hidden module that semantic versioning does not cover. Every other function,
+type and trait the generated code calls is there, and its module docs list the hidden items of
+`Data`, `TableData` and `IndexEach` that the derives implement or call, which stay on their traits.
+A change to the generated code changes `__derive` with it. The items live beside the internals they
+use, in `codec::pairing`, `map::edits` and `table::derive`, which only the crate can name, and
+`__derive` re-exports them, so they have no other public path.
+
+The generated code reaches ferro as `::ferro`, or by the path `#[ferro(crate = "...")]` gives on
+the type, which both derives read. `ferro/tests/derive.rs` derives through a re-export with it.

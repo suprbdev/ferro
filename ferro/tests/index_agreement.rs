@@ -49,15 +49,18 @@ impl Data for Spliced {
             whole.into_object()
         };
         let mut fields = Vec::new();
-        Decoder::new(&whole.body, &whole.links).fields_sharing_tags(|tag, r| {
-            let bytes = r.take(r.remaining())?.to_vec();
-            let mut links = Vec::new();
-            while let Ok(link) = r.link() {
-                links.push(link);
-            }
-            fields.push((tag, bytes, links));
-            Ok(())
-        })?;
+        ferro::__derive::fields_sharing_tags(
+            &mut Decoder::new(&whole.body, &whole.links),
+            |tag, r| {
+                let bytes = r.take(r.remaining())?.to_vec();
+                let mut links = Vec::new();
+                while let Ok(link) = r.link() {
+                    links.push(link);
+                }
+                fields.push((tag, bytes, links));
+                Ok(())
+            },
+        )?;
         w.mark_unsettled();
         w.varint(fields.len() as u64);
         for (tag, bytes, links) in fields {

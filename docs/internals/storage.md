@@ -88,7 +88,7 @@ whatever it holds, which is how a removed field and a field from a newer version
 missing field reads as its default, an unknown variant tag fails as before, and a `Box`, an `Arc`,
 a transparent newtype or `Bytes` in place of a `Vec<u8>` read what the field held, since they
 encode alike. A table stores every index under one tag, so it reads its fields with
-`Decoder::fields_sharing_tags`, which lets tags repeat but not descend, and still skips an index
+`__derive::fields_sharing_tags`, which lets tags repeat but not descend, and still skips an index
 under a fingerprint its type does not know. A local read of a root, a node or a spilled value does
 not check that the object ends where its value does: bytes left over change no value read from it,
 `verify_typed` reports them, and `admin::space` reads roots as a type that reads nothing. A
@@ -339,9 +339,9 @@ and 608 to 2,080 in a debug one, the most for `BTreeMap` children, and drops in 
 to 816. The derive's debug frames were larger before: a decode kept a slot for each field's `Result`
 in the closure that reads the fields, and the temporaries of building the value in the frame that
 recurses, so a struct of 34 fields took 16,928 bytes a level and `Option<Box<Node>>` 4,768. A field
-now decodes through `codec::decode_into`, whose frame holds one field's temporaries and only while
-that field decodes, the value is built in a closure called once the fields are read, and a visit
-checks its required fields the same way.
+now decodes through `__derive::decode_into`, whose frame holds one field's temporaries and only
+while that field decodes, the value is built in a closure called once the fields are read, and a
+visit checks its required fields the same way.
 
 So at the limit a decode takes up to 12 MB of stack in a release build and 21 MB in a debug one,
 for a struct of a few dozen fields at every level, and that is the most a value, forged or not, can

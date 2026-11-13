@@ -127,7 +127,7 @@ rebuilds it instead of reading the old map with new types. The rebuild on decode
 indexes, and checks the ones it rebuilds. If two existing rows share a value it fails with
 `Error::Decode` naming the index, because a constraint the data breaks cannot be honoured, so that
 version does not open until the data or the attribute changes. The rebuild reads the rows through
-`table::stored_rows`, which returns a damaged row node as an error, so `Db::open` fails with it
+`__derive::stored_rows`, which returns a damaged row node as an error, so `Db::open` fails with it
 instead of panicking.
 
 ### Ranges and prefixes
@@ -136,7 +136,7 @@ instead of panicking.
 unique index come with `keys`, `covered`, `uncovered`, both ends, a length known at once and a place
 in `and` and `or`, as a non-unique index's do. The derive builds the walk itself, with `Map::range`
 on the index for a range and `Map::range_by` on the value's first field for a prefix, and hands the
-`Iter` to `table::unique_rows`, or `unique_rows_covered` with the projection `covered_by_x` uses,
+`Iter` to `__derive::unique_rows`, or `unique_rows_covered` with the projection `covered_by_x` uses,
 together with a function that gives the value a row holds, which a combination uses to test a row
 against the lookup, as described under [Ranges and prefixes in a
 combination](#ranges-and-prefixes-in-a-combination). Rows come in value order, and a composite's
@@ -733,7 +733,7 @@ plan it would choose and the finders it would hand over, from the same lengths a
 
 A range or prefix lookup is not in key order, so it cannot be walked beside another side, but
 whether it holds a key can be tested. For every index the derive generates a function, of the type
-`table::Indexed`, that calls a closure on each value the index holds for a row: the field, a
+`__derive::Indexed`, that calls a closure on each value the index holds for a row: the field, a
 composite's fields as a tuple, each element of an `#[index(each)]` field, and nothing for a unique
 `Option` field that holds `None`. The helpers behind the range and prefix lookups, `index_range`,
 `index_where`, `unique_rows` and `unique_rows_covered`, wrap their cursor in one that keeps that

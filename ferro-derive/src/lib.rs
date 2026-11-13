@@ -1,7 +1,9 @@
 //! The derive macros behind `ferro::Data` and `ferro::Record`.
 //!
 //! Use them through the `ferro` crate, which re-exports both, as `use ferro::{Data, Record};`.
-//! The code they generate names `::ferro`, so the crate must be a dependency under that name.
+//! The code they generate names `::ferro`, and the items it calls in `ferro::__derive`, which is
+//! not part of ferro's API. A crate that has ferro under another name, or through a re-export,
+//! gives its path with `#[ferro(crate = "...")]` on the type.
 //!
 //! - [`Data`](derive@Data) encodes a struct or an enum by field name, so the type can change while
 //!   the data it wrote keeps loading.
@@ -195,7 +197,7 @@ fn check_fields(fields: &[Field], removed: &[LitStr]) -> syn::Result<()> {
     )
 }
 
-fn encode_stmts(fields: &[Field], access: &[TokenStream2]) -> TokenStream2 {
+fn encode_stmts(ferro: &Path, fields: &[Field], access: &[TokenStream2]) -> TokenStream2 {
     let mut stored: Vec<(u16, &TokenStream2)> = fields
         .iter()
         .zip(access)
@@ -205,7 +207,7 @@ fn encode_stmts(fields: &[Field], access: &[TokenStream2]) -> TokenStream2 {
     stored.sort_by_key(|(tag, _)| *tag);
     let count = stored.len() as u64;
     let writes = stored.iter().map(|(tag, a)| {
-        quote! { __w.field(#tag, |__w| ::ferro::Data::encode(#a, __w))?; }
+        quote! { __w.field(#tag, |__w| #ferro::Data::encode(#a, __w))?; }
     });
     quote! {
         __w.varint(#count);
@@ -213,7 +215,11 @@ fn encode_stmts(fields: &[Field], access: &[TokenStream2]) -> TokenStream2 {
     }
 }
 
-fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStream2>) {
+fn decode_stmts(
+    ferro: &Path,
+    fields: &[Field],
+    vars: &[Ident],
+) -> (TokenStream2, Vec<TokenStream2>) {
     let mut decls = Vec::new();
     let mut arms = Vec::new();
     let mut values = Vec::new();
@@ -222,7 +228,7 @@ fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStr
         let value = match &field.fallback {
             Fallback::Skip => quote! { ::std::default::Default::default() },
             Fallback::Required => {
-                quote! { ::ferro::codec::required(#var.take(), #name)? }
+                quote! { #ferro::codec::required(#var.take(), #name)? }
             }
             Fallback::Default => quote! {
                 match #var.take() {
@@ -244,7 +250,7 @@ fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStr
                 quote! { let mut #var: ::std::option::Option<#ty> = ::std::option::Option::None; },
             );
             arms.push(quote! {
-                #tag => ::ferro::codec::decode_into(&mut #var, __r),
+                #tag => #ferro::__derive::decode_into(&mut #var, __r),
             });
         }
         values.push(value);
@@ -259,7 +265,7 @@ fn decode_stmts(fields: &[Field], vars: &[Ident]) -> (TokenStream2, Vec<TokenStr
     (stmts, values)
 }
 
-fn visit_stmts(fields: &[Field]) -> TokenStream2 {
+fn visit_stmts(ferro: &Path, fields: &[Field]) -> TokenStream2 {
     let stored: Vec<&Field> = fields.iter().filter(|f| f.stored()).collect();
     let seen: Vec<Ident> = (0..stored.len())
         .map(|i| format_ident!("__seen{}", i))
@@ -270,7 +276,7 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
         quote! {
             #tag => {
                 #seen = true;
-                ::ferro::codec::visit_field::<#ty>(__r)
+                #ferro::__derive::visit_field::<#ty>(__r)
             }
         }
     });
@@ -282,8 +288,8 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
             let ty = &field.ty;
             let name = &field.name;
             quote! {
-                if !#seen && <#ty as ::ferro::Data>::missing().is_none() {
-                    return ::std::result::Result::Err(::ferro::Error::MissingField(#name));
+                if !#seen && <#ty as #ferro::Data>::missing().is_none() {
+                    return ::std::result::Result::Err(#ferro::Error::MissingField(#name));
                 }
             }
         });
@@ -293,7 +299,7 @@ fn visit_stmts(fields: &[Field]) -> TokenStream2 {
             #(#arms)*
             _ => ::std::result::Result::Ok(()),
         })?;
-        (|| -> ::ferro::Result<()> {
+        (|| -> #ferro::Result<()> {
             #(#required)*
             ::std::result::Result::Ok(())
         })()?;
@@ -360,12 +366,20 @@ fn construct(
     }
 }
 
-fn bound_generics(generics: &Generics) -> Generics {
+fn bound_generics(ferro: &Path, generics: &Generics) -> Generics {
     let mut generics = generics.clone();
     for param in generics.type_params_mut() {
-        param.bounds.push(syn::parse_quote!(::ferro::Data));
+        param.bounds.push(syn::parse_quote!(#ferro::Data));
     }
     generics
+}
+
+fn linked_path(path: &Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 fn vars(count: usize) -> Vec<Ident> {
@@ -375,13 +389,16 @@ fn vars(count: usize) -> Vec<Ident> {
 struct Container {
     transparent: bool,
     removed: Vec<LitStr>,
+    krate: Path,
 }
 
 fn parse_container(attrs: &[Attribute]) -> syn::Result<Container> {
     let mut out = Container {
         transparent: false,
         removed: Vec::new(),
+        krate: syn::parse_quote!(::ferro),
     };
+    let mut named = false;
     for attr in attrs {
         if !attr.path().is_ident("ferro") {
             continue;
@@ -392,6 +409,14 @@ fn parse_container(attrs: &[Attribute]) -> syn::Result<Container> {
                 Ok(())
             } else if meta.path.is_ident("removed") {
                 out.removed.extend(removed_list(&meta)?);
+                Ok(())
+            } else if meta.path.is_ident("crate") {
+                if named {
+                    return Err(meta.error("a type takes one crate path"));
+                }
+                named = true;
+                let lit: LitStr = meta.value()?.parse()?;
+                out.krate = lit.parse()?;
                 Ok(())
             } else {
                 Err(meta.error("unknown ferro attribute"))
@@ -407,9 +432,9 @@ fn parse_container(attrs: &[Attribute]) -> syn::Result<Container> {
     Ok(out)
 }
 
-fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
+fn expand_transparent(ferro: &Path, input: &DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
-    let generics = bound_generics(&input.generics);
+    let generics = bound_generics(ferro, &input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let Data::Struct(data) = &input.data else {
         return Err(syn::Error::new(
@@ -440,48 +465,48 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let build = construct(quote! { Self }, &fields, &data.fields, &[quote! { __v }]);
     let ty = &field.ty;
     Ok(quote! {
-        impl #impl_generics ::ferro::Data for #name #ty_generics #where_clause {
-            fn encode(&self, __w: &mut ::ferro::codec::Encoder<'_>) -> ::ferro::Result<()> {
-                ::ferro::Data::encode(#access, __w)
+        impl #impl_generics #ferro::Data for #name #ty_generics #where_clause {
+            fn encode(&self, __w: &mut #ferro::codec::Encoder<'_>) -> #ferro::Result<()> {
+                #ferro::Data::encode(#access, __w)
             }
 
-            fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                let __v = ::ferro::Data::decode(__r)?;
+            fn decode(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<Self> {
+                let __v = #ferro::Data::decode(__r)?;
                 ::std::result::Result::Ok(#build)
             }
 
-            fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
-                <#ty as ::ferro::Data>::visit(__r)
+            fn visit(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<()> {
+                <#ty as #ferro::Data>::visit(__r)
             }
 
-            const OPTIONAL: bool = <#ty as ::ferro::Data>::OPTIONAL;
+            const OPTIONAL: bool = <#ty as #ferro::Data>::OPTIONAL;
 
             fn absent(&self) -> bool {
-                ::ferro::Data::absent(#access)
+                #ferro::Data::absent(#access)
             }
 
             fn missing() -> ::std::option::Option<Self> {
-                ::ferro::Data::missing().map(|__v| #build)
+                #ferro::Data::missing().map(|__v| #build)
             }
 
-            fn describe(__d: &mut ::ferro::codec::Description) {
+            fn describe(__d: &mut #ferro::codec::Description) {
                 __d.named::<Self>(|__d| __d.of::<#ty>());
             }
 
             fn same_encoding(&self, __other: &Self) -> bool {
-                ::ferro::Data::same_encoding(#access, #other)
+                #ferro::Data::same_encoding(#access, #other)
             }
 
-            fn tables(__t: &mut ::ferro::codec::Tabled) {
+            fn tables(__t: &mut #ferro::__derive::Tabled) {
                 __t.named::<Self>(|__t| __t.of::<#ty>());
             }
 
             fn pair(
-                __old: &mut ::ferro::codec::Decoder<'_>,
-                __new: &mut ::ferro::codec::Decoder<'_>,
-                __p: &mut ::ferro::codec::Pairing<'_>,
-            ) -> ::ferro::Result<()> {
-                <#ty as ::ferro::Data>::pair(__old, __new, __p)
+                __old: &mut #ferro::codec::Decoder<'_>,
+                __new: &mut #ferro::codec::Decoder<'_>,
+                __p: &mut #ferro::__derive::Pairing<'_>,
+            ) -> #ferro::Result<()> {
+                <#ty as #ferro::Data>::pair(__old, __new, __p)
             }
         }
     })
@@ -489,11 +514,12 @@ fn expand_transparent(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
 fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
     let container = parse_container(&input.attrs)?;
+    let ferro = &container.krate;
     if container.transparent {
-        return expand_transparent(&input);
+        return expand_transparent(ferro, &input);
     }
     let name = &input.ident;
-    let generics = bound_generics(&input.generics);
+    let generics = bound_generics(ferro, &input.generics);
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let (encode, decode, visit, describe, same, pair, tables) = match &input.data {
         Data::Struct(data) => {
@@ -525,20 +551,20 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                             quote! { #index }
                         }
                     };
-                    quote! { && ::ferro::Data::same_encoding(&self.#member, &__other.#member) }
+                    quote! { && #ferro::Data::same_encoding(&self.#member, &__other.#member) }
                 });
             let same = quote! { true #(#same)* };
-            let encode = encode_stmts(&fields, &members);
+            let encode = encode_stmts(ferro, &fields, &members);
             let vs = vars(fields.len());
-            let (stmts, values) = decode_stmts(&fields, &vs);
+            let (stmts, values) = decode_stmts(ferro, &fields, &vs);
             let build = construct(quote! { Self }, &fields, &data.fields, &values);
-            let visit = visit_stmts(&fields);
+            let visit = visit_stmts(ferro, &fields);
             let described = describe_stmts(&fields);
             (
                 quote! { #encode ::std::result::Result::Ok(()) },
                 quote! {
                     #stmts
-                    (|| -> ::ferro::Result<Self> { ::std::result::Result::Ok(#build) })()
+                    (|| -> #ferro::Result<Self> { ::std::result::Result::Ok(#build) })()
                 },
                 quote! { #visit ::std::result::Result::Ok(()) },
                 quote! {
@@ -627,27 +653,27 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                     .iter()
                     .zip(vs.iter().zip(&others))
                     .filter(|(field, _)| field.stored())
-                    .map(|(_, (v, o))| quote! { && ::ferro::Data::same_encoding(#v, #o) });
+                    .map(|(_, (v, o))| quote! { && #ferro::Data::same_encoding(#v, #o) });
                 same_arms.push(quote! {
                     (#pattern, #other_pattern) => true #(#same)*,
                 });
                 let access: Vec<TokenStream2> = vs.iter().map(|v| quote! { #v }).collect();
-                let body = encode_stmts(&fields, &access);
+                let body = encode_stmts(ferro, &fields, &access);
                 encode_arms.push(quote! {
                     #pattern => {
                         __w.u16(#vtag);
                         #body
                     }
                 });
-                let (stmts, values) = decode_stmts(&fields, &vs);
+                let (stmts, values) = decode_stmts(ferro, &fields, &vs);
                 let build = construct(quote! { Self::#vident }, &fields, &variant.fields, &values);
                 decode_arms.push(quote! {
                     #vtag => {
                         #stmts
-                        (|| -> ::ferro::Result<Self> { ::std::result::Result::Ok(#build) })()
+                        (|| -> #ferro::Result<Self> { ::std::result::Result::Ok(#build) })()
                     }
                 });
-                let visit = visit_stmts(&fields);
+                let visit = visit_stmts(ferro, &fields);
                 visit_arms.push(quote! {
                     #vtag => {
                         #visit
@@ -689,7 +715,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                 }
             };
             let unknown = quote! {
-                __other => ::std::result::Result::Err(::ferro::Error::Decode(
+                __other => ::std::result::Result::Err(#ferro::Error::Decode(
                     ::std::format!("unknown variant tag {} for {}", __other, ::std::stringify!(#name))
                 )),
             };
@@ -732,20 +758,20 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
     Ok(quote! {
-        impl #impl_generics ::ferro::Data for #name #ty_generics #where_clause {
-            fn encode(&self, __w: &mut ::ferro::codec::Encoder<'_>) -> ::ferro::Result<()> {
+        impl #impl_generics #ferro::Data for #name #ty_generics #where_clause {
+            fn encode(&self, __w: &mut #ferro::codec::Encoder<'_>) -> #ferro::Result<()> {
                 #encode
             }
 
-            fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
+            fn decode(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<Self> {
                 #decode
             }
 
-            fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
+            fn visit(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<()> {
                 #visit
             }
 
-            fn describe(__d: &mut ::ferro::codec::Description) {
+            fn describe(__d: &mut #ferro::codec::Description) {
                 __d.named::<Self>(|__d| {
                     #describe
                 });
@@ -756,17 +782,17 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
                 #same
             }
 
-            fn tables(__t: &mut ::ferro::codec::Tabled) {
+            fn tables(__t: &mut #ferro::__derive::Tabled) {
                 __t.named::<Self>(|__t| {
                     #tables
                 });
             }
 
             fn pair(
-                __old: &mut ::ferro::codec::Decoder<'_>,
-                __new: &mut ::ferro::codec::Decoder<'_>,
-                __p: &mut ::ferro::codec::Pairing<'_>,
-            ) -> ::ferro::Result<()> {
+                __old: &mut #ferro::codec::Decoder<'_>,
+                __new: &mut #ferro::codec::Decoder<'_>,
+                __p: &mut #ferro::__derive::Pairing<'_>,
+            ) -> #ferro::Result<()> {
                 #pair
             }
         }
@@ -857,6 +883,23 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// #[derive(Data, Clone)]
 /// #[ferro(transparent)]
 /// struct Cache(#[ferro(skip)] u32);
+/// ```
+///
+/// On a struct or an enum, `#[ferro(crate = "path")]` gives the path the generated code reaches
+/// ferro by, `::ferro` without it, for a crate that depends on ferro under another name or
+/// reaches it through a re-export. A type that derives `Record` too gives it once, for both:
+///
+/// ```
+/// mod storage {
+///     pub use ferro as engine;
+/// }
+///
+/// #[derive(storage::engine::Data, Clone)]
+/// #[ferro(crate = "crate::storage::engine")]
+/// struct Point {
+///     x: i32,
+/// }
+/// # fn main() {}
 /// ```
 ///
 /// Options can share one attribute, as in `#[ferro(rename = "total", default)]`. Any other option
@@ -1043,18 +1086,18 @@ impl Indexed {
         quote! { (#(#clones,)*) }
     }
 
-    fn same_cover(&self) -> TokenStream2 {
+    fn same_cover(&self, ferro: &Path) -> TokenStream2 {
         let same = self
             .stored()
             .into_iter()
-            .map(|(ident, _)| quote! { ::ferro::table::same_stored(&__o.#ident, &__n.#ident) });
+            .map(|(ident, _)| quote! { #ferro::__derive::same_stored(&__o.#ident, &__n.#ident) });
         quote! { true #(&& #same)* }
     }
 
-    fn kind_word(&self) -> TokenStream2 {
+    fn kind_word(&self, ferro: &Path) -> TokenStream2 {
         let optional = |sparse: &str, dense: &str| match self.sole() {
             Some((_, ty)) => quote! {
-                if <#ty as ::ferro::Data>::OPTIONAL { #sparse } else { #dense }
+                if <#ty as #ferro::Data>::OPTIONAL { #sparse } else { #dense }
             },
             None => quote! { #dense },
         };
@@ -1069,11 +1112,12 @@ impl Indexed {
 
     fn fingerprint(
         &self,
+        ferro: &Path,
         key_ty: &Type,
         stored_name: &dyn Fn(&Ident) -> String,
         default_of: &dyn Fn(&Ident) -> Option<TokenStream2>,
     ) -> TokenStream2 {
-        let kind = self.kind_word();
+        let kind = self.kind_word(ferro);
         let described = |fields: Vec<&(Ident, Type)>| {
             let count = fields.len() as u64;
             let parts = fields.into_iter().map(|(ident, ty)| {
@@ -1098,7 +1142,7 @@ impl Indexed {
         let keyed = described(self.fields.iter().collect());
         let covered = described(self.stored());
         quote! {
-            ::ferro::table::index_fingerprint(|__d| {
+            #ferro::__derive::index_fingerprint(|__d| {
                 __d.word(#kind);
                 __d.of::<#key_ty>();
                 #keyed
@@ -1140,15 +1184,15 @@ impl Indexed {
         format_ident!("__{}_values", self.field())
     }
 
-    fn values(&self) -> TokenStream2 {
+    fn values(&self, ferro: &Path) -> TokenStream2 {
         if let (IndexKind::Each, Some((ident, _))) = (&self.kind, self.sole()) {
             return quote! {
-                ::ferro::table::IndexEach::values(&__r.#ident).iter().any(|__v| __f(__v))
+                #ferro::table::IndexEach::values(&__r.#ident).iter().any(|__v| __f(__v))
             };
         }
         if let (IndexKind::Unique, Some((ident, _))) = (&self.kind, self.sole()) {
             return quote! {
-                !::ferro::Data::absent(&__r.#ident) && __f(&__r.#ident)
+                !#ferro::Data::absent(&__r.#ident) && __f(&__r.#ident)
             };
         }
         match self.sole() {
@@ -1160,20 +1204,20 @@ impl Indexed {
         }
     }
 
-    fn project_path(&self) -> TokenStream2 {
+    fn project_path(&self, ferro: &Path) -> TokenStream2 {
         if self.cover.is_empty() {
-            let vt = self.value_ty();
-            quote! { ::ferro::table::plain::<#vt> }
+            let vt = self.value_ty(ferro);
+            quote! { #ferro::__derive::plain::<#vt> }
         } else {
             let project = self.project_fn();
             quote! { Self::#project }
         }
     }
 
-    fn found_path(&self, table: &Ident) -> TokenStream2 {
+    fn found_path(&self, ferro: &Path, table: &Ident) -> TokenStream2 {
         if self.cover.is_empty() {
-            let vt = self.value_ty();
-            quote! { ::ferro::table::plain::<#vt> }
+            let vt = self.value_ty(ferro);
+            quote! { #ferro::__derive::plain::<#vt> }
         } else {
             let project = self.project_fn();
             quote! { #table::#project }
@@ -1205,11 +1249,11 @@ impl Indexed {
         }
     }
 
-    fn value_ty(&self) -> TokenStream2 {
+    fn value_ty(&self, ferro: &Path) -> TokenStream2 {
         let tys = self.fields.iter().map(|(_, ty)| ty);
         match (&self.kind, self.sole()) {
             (IndexKind::Each, Some((_, ty))) => {
-                quote! { <#ty as ::ferro::table::IndexEach>::Value }
+                quote! { <#ty as #ferro::table::IndexEach>::Value }
             }
             (_, Some((_, ty))) => quote! { #ty },
             _ => quote! { (#(#tys),*) },
@@ -1227,9 +1271,9 @@ impl Indexed {
         }
     }
 
-    fn optional(&self) -> TokenStream2 {
+    fn optional(&self, ferro: &Path) -> TokenStream2 {
         match self.sole() {
-            Some((ident, _)) => quote! { ::ferro::table::present(&__r.#ident) },
+            Some((ident, _)) => quote! { #ferro::__derive::present(&__r.#ident) },
             None => {
                 let owned = self.owned();
                 quote! { ::std::option::Option::Some(#owned) }
@@ -1413,6 +1457,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             "Record does not support generics",
         ));
     }
+    let container = parse_container(&input.attrs)?;
+    let ferro = &container.krate;
+    let linked = linked_path(ferro);
     let name = &input.ident;
     let vis: &Visibility = &input.vis;
     let table = format_ident!("{}Table", name);
@@ -1531,18 +1578,18 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let stored_name = |ident: &Ident| -> String {
         field_of(ident).map_or_else(|| ident.unraw().to_string(), |field| field.name.clone())
     };
-    let rows_ty: Type = syn::parse_quote!(::ferro::Map<#key_ty, #name>);
+    let rows_ty: Type = syn::parse_quote!(#ferro::Map<#key_ty, #name>);
     let map_tys: Vec<Type> = indexes
         .iter()
         .map(|ix| {
-            let vt = ix.value_ty();
+            let vt = ix.value_ty(ferro);
             let st = ix.stored_ty();
             match ix.kind {
                 IndexKind::Unique if ix.stores_cover() => {
-                    syn::parse_quote!(::ferro::Map<#vt, (#key_ty, #st)>)
+                    syn::parse_quote!(#ferro::Map<#vt, (#key_ty, #st)>)
                 }
-                IndexKind::Unique => syn::parse_quote!(::ferro::Map<#vt, #key_ty>),
-                _ => syn::parse_quote!(::ferro::Map<(#vt, #key_ty), #st>),
+                IndexKind::Unique => syn::parse_quote!(#ferro::Map<#vt, #key_ty>),
+                _ => syn::parse_quote!(#ferro::Map<(#vt, #key_ty), #st>),
             }
         })
         .collect();
@@ -1550,13 +1597,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         |ident: &Ident| -> Option<TokenStream2> { field_of(ident).and_then(Field::default_value) };
     let fingerprints: Vec<TokenStream2> = indexes
         .iter()
-        .map(|ix| ix.fingerprint(&key_ty, &stored_name, &default_of))
+        .map(|ix| ix.fingerprint(ferro, &key_ty, &stored_name, &default_of))
         .collect();
     let index_fields: Vec<Ident> = indexes.iter().map(Indexed::field).collect();
     let entry_tys: Vec<TokenStream2> = indexes
         .iter()
         .map(|ix| {
-            let vt = ix.value_ty();
+            let vt = ix.value_ty(ferro);
             let st = ix.stored_ty();
             match ix.kind {
                 IndexKind::Unique if ix.stores_cover() => quote! { (#vt, (#key_ty, #st)) },
@@ -1568,7 +1615,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let (index_key_tys, index_value_tys): (Vec<TokenStream2>, Vec<TokenStream2>) = indexes
         .iter()
         .map(|ix| {
-            let vt = ix.value_ty();
+            let vt = ix.value_ty(ferro);
             let st = ix.stored_ty();
             match ix.kind {
                 IndexKind::Unique if ix.stores_cover() => {
@@ -1600,16 +1647,16 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let mut finds = Vec::new();
     for (slot, ix) in indexes.iter().enumerate() {
         let field = ix.field();
-        let vt = ix.value_ty();
+        let vt = ix.value_ty(ferro);
         let st = ix.stored_ty();
         let ct = ix.cover_ty();
         let owned = ix.owned();
         let stored_of = ix.stored_of();
-        let same_cover = ix.same_cover();
-        let project = ix.project_path();
+        let same_cover = ix.same_cover(ferro);
+        let project = ix.project_path(ferro);
         let same = ix.fields.iter().map(|(ident, _)| {
             if ix.cover.iter().any(|(covered, _)| covered == ident) {
-                quote! { ::ferro::table::same_stored(&__o.#ident, &__n.#ident) }
+                quote! { #ferro::__derive::same_stored(&__o.#ident, &__n.#ident) }
             } else {
                 quote! { __o.#ident == __n.#ident }
             }
@@ -1618,16 +1665,16 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let stored_alike = ix
             .stored()
             .into_iter()
-            .map(|(ident, _)| quote! { ::ferro::Data::same_encoding(&__o.#ident, &__n.#ident) });
+            .map(|(ident, _)| quote! { #ferro::Data::same_encoding(&__o.#ident, &__n.#ident) });
         let stored_alike = quote! { true #(&& #stored_alike)* };
         let indexed_alike = ix
             .fields
             .iter()
-            .map(|(ident, _)| quote! { ::ferro::Data::same_encoding(&__o.#ident, &__n.#ident) });
+            .map(|(ident, _)| quote! { #ferro::Data::same_encoding(&__o.#ident, &__n.#ident) });
         let each_delta = match (&ix.kind, ix.sole()) {
             (IndexKind::Each, Some((ident, _))) => quote! {
                 if #stored_alike {
-                    let (__left, __came) = ::ferro::table::IndexEach::delta(&__o.#ident, &__n.#ident, __differ)?;
+                    let (__left, __came) = #ferro::table::IndexEach::delta(&__o.#ident, &__n.#ident, __differ)?;
                     let __r = __o;
                     let __stored = #stored_of;
                     for __v in __left {
@@ -1673,7 +1720,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             });
         }
         let values_fn = ix.values_fn();
-        let values = ix.values();
+        let values = ix.values(ferro);
         methods.push(quote! {
             fn #values_fn(__r: &#name, __f: &mut dyn ::std::ops::FnMut(&#vt) -> bool) -> bool {
                 #values
@@ -1692,12 +1739,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__r) = __old {
-                                ::ferro::table::IndexSink::remove(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
+                                #ferro::__derive::IndexSink::remove(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
                             }
                         }
                         if !__same || !__same_cover {
                             if let ::std::option::Option::Some(__r) = __new {
-                                ::ferro::table::IndexSink::insert(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)), #stored_of);
+                                #ferro::__derive::IndexSink::insert(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)), #stored_of);
                             }
                         }
                     }
@@ -1715,17 +1762,17 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__r) = __old {
-                                ::ferro::table::IndexSink::remove(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
+                                #ferro::__derive::IndexSink::remove(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)));
                             }
                             if let ::std::option::Option::Some(__r) = __new {
-                                ::ferro::table::IndexSink::insert(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)), ());
+                                #ferro::__derive::IndexSink::insert(__sink, (#owned, ::std::clone::Clone::clone(&__r.#key_ident)), ());
                             }
                         }
                     }
                 });
             }
             IndexKind::Unique => {
-                let optional = ix.optional();
+                let optional = ix.optional(ferro);
                 let index_name = &ix.name;
                 let (entry, held, entry_ty) = if ix.stores_cover() {
                     (
@@ -1753,13 +1800,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         };
                         if !__same {
                             if let ::std::option::Option::Some(__value) = __old.and_then(|__r| #optional) {
-                                ::ferro::table::IndexSink::remove(__sink, __value);
+                                #ferro::__derive::IndexSink::remove(__sink, __value);
                             }
                         }
                         if !__same || !__same_cover {
                             if let ::std::option::Option::Some(__r) = __new {
                                 if let ::std::option::Option::Some(__value) = #optional {
-                                    ::ferro::table::IndexSink::insert(__sink, __value, #entry);
+                                    #ferro::__derive::IndexSink::insert(__sink, __value, #entry);
                                 }
                             }
                         }
@@ -1772,7 +1819,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                             if let ::std::option::Option::Some(__holder) = self.#field.get(&__value) {
                                 let __held: &#key_ty = #held;
                                 if *__held != __r.#key_ident && ::std::option::Option::Some(__held) != __moving {
-                                    return ::std::option::Option::Some(::ferro::table::Taken {
+                                    return ::std::option::Option::Some(#ferro::table::Taken {
                                         index: #index_name,
                                         holder: ::std::clone::Clone::clone(__held),
                                     });
@@ -1800,13 +1847,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let (bound_ty, entry_of) = match spelled {
                     Some(inner) => (
                         quote! { #inner },
-                        quote! { ::ferro::table::unique_some(&self.#field, value) },
+                        quote! { #ferro::__derive::unique_some(&self.#field, value) },
                     ),
                     None => (quote! { #vt }, quote! { self.#field.get(value) }),
                 };
                 methods.push(quote! {
                     #[doc = #index_doc]
-                    pub fn #field(&self) -> &::ferro::Map<#vt, #entry_ty> {
+                    pub fn #field(&self) -> &#ferro::Map<#vt, #entry_ty> {
                         &self.#field
                     }
 
@@ -1830,7 +1877,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     );
                     methods.push(quote! {
                         #[doc = #by_doc]
-                        pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
+                        pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<#ferro::Val<#name>>
                         where
                             #bound_ty: ::std::borrow::Borrow<__Q>,
                             __Q: ::std::cmp::Ord + ?::std::marker::Sized,
@@ -1846,7 +1893,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                             __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                         {
                             #entry_of.map(|__holder| {
-                                let (__key, __stored) = ::ferro::Val::into_owned(__holder);
+                                let (__key, __stored) = #ferro::Val::into_owned(__holder);
                                 (__key, Self::#project_fn(__stored))
                             })
                         }
@@ -1858,12 +1905,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                             self.rows.get::<#key_ty>(&*__holder)
                         },
                         None => quote! {
-                            ::ferro::table::unique_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
+                            #ferro::__derive::unique_eq::<#vt, #name, __Q>(&self.rows, &self.#field, value)
                         },
                     };
                     methods.push(quote! {
                         #[doc = #by_doc]
-                        pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<::ferro::Val<#name>>
+                        pub fn #by<__Q>(&self, value: &__Q) -> ::std::option::Option<#ferro::Val<#name>>
                         where
                             #bound_ty: ::std::borrow::Borrow<__Q>,
                             __Q: ::std::cmp::Ord + ?::std::marker::Sized,
@@ -1876,11 +1923,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     if ix.stores_cover() {
                         let project_fn = ix.project_fn();
                         quote! {
-                            ::ferro::table::unique_rows_covered::<#vt, #name, #st, #ct>(&self.rows, #entries, Self::#project_fn, Self::#values_fn)
+                            #ferro::__derive::unique_rows_covered::<#vt, #name, #st, #ct>(&self.rows, #entries, Self::#project_fn, Self::#values_fn)
                         }
                     } else {
                         quote! {
-                            ::ferro::table::unique_rows::<#vt, #name>(&self.rows, #entries, Self::#values_fn)
+                            #ferro::__derive::unique_rows::<#vt, #name>(&self.rows, #entries, Self::#values_fn)
                         }
                     }
                 };
@@ -1896,13 +1943,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     )
                 };
                 let range_rows = rows_of(match spelled {
-                    Some(_) => quote! { ::ferro::table::unique_some_range(&self.#field, range) },
+                    Some(_) => quote! { #ferro::__derive::unique_some_range(&self.#field, range) },
                     None => quote! { self.#field.range::<__Q, __R>(range) },
                 });
                 methods.push(quote! {
                     #[doc = #range_doc]
                     #[inline]
-                    pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name, #ct>
+                    pub fn #range<__Q, __R>(&self, range: __R) -> #ferro::table::IndexIter<#name, #ct>
                     where
                         #bound_ty: ::std::borrow::Borrow<__Q>,
                         __Q: ::std::cmp::Ord + ?::std::marker::Sized,
@@ -1926,7 +1973,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     methods.push(quote! {
                         #[doc = #prefix_doc]
                         #[inline]
-                        pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
+                        pub fn #prefix<__Q>(&self, value: &__Q) -> #ferro::table::IndexIter<#name, #ct>
                         where
                             #first: ::std::borrow::Borrow<__Q>,
                             __Q: ::std::cmp::Ord + ?::std::marker::Sized,
@@ -1941,7 +1988,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let ident = &ix.fields[0].0;
                 try_entries.push(quote! {
                     let __stored = #stored_of;
-                    for __v in ::ferro::table::each_values(&__r.#ident, __differ)? {
+                    for __v in #ferro::__derive::each_values(&__r.#ident, __differ)? {
                         __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ::std::clone::Clone::clone(&__stored)));
                     }
                 });
@@ -1949,7 +1996,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     {
                         let __collect = |__r: ::std::option::Option<&#name>| -> ::std::collections::BTreeSet<(#vt, #key_ty)> {
                             match __r {
-                                ::std::option::Option::Some(__r) => ::ferro::table::IndexEach::values(&__r.#ident)
+                                ::std::option::Option::Some(__r) => #ferro::table::IndexEach::values(&__r.#ident)
                                     .into_iter()
                                     .map(|__v| (__v, ::std::clone::Clone::clone(&__r.#key_ident)))
                                     .collect(),
@@ -1963,13 +2010,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         let __before = __collect(__old);
                         let __after = __collect(__new);
                         for __entry in __before.difference(&__after) {
-                            ::ferro::table::IndexSink::remove_ref(__sink, __entry);
+                            #ferro::__derive::IndexSink::remove_ref(__sink, __entry);
                         }
                         if let ::std::option::Option::Some(__r) = __new {
                             let __stored = #stored_of;
                             for __entry in &__after {
                                 if !__same_cover || !__before.contains(__entry) {
-                                    ::ferro::table::IndexSink::insert(__sink, ::std::clone::Clone::clone(__entry), ::std::clone::Clone::clone(&__stored));
+                                    #ferro::__derive::IndexSink::insert(__sink, ::std::clone::Clone::clone(__entry), ::std::clone::Clone::clone(&__stored));
                                 }
                             }
                         }
@@ -1979,7 +2026,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             IndexKind::Each => {
                 let ident = &ix.fields[0].0;
                 try_entries.push(quote! {
-                    for __v in ::ferro::table::each_values(&__r.#ident, __differ)? {
+                    for __v in #ferro::__derive::each_values(&__r.#ident, __differ)? {
                         __out.push(((__v, ::std::clone::Clone::clone(&__r.#key_ident)), ()));
                     }
                 });
@@ -1987,7 +2034,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     {
                         let __collect = |__r: ::std::option::Option<&#name>| -> ::std::collections::BTreeSet<(#vt, #key_ty)> {
                             match __r {
-                                ::std::option::Option::Some(__r) => ::ferro::table::IndexEach::values(&__r.#ident)
+                                ::std::option::Option::Some(__r) => #ferro::table::IndexEach::values(&__r.#ident)
                                     .into_iter()
                                     .map(|__v| (__v, ::std::clone::Clone::clone(&__r.#key_ident)))
                                     .collect(),
@@ -1997,10 +2044,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                         let __old = __collect(__old);
                         let __new = __collect(__new);
                         for __entry in __old.difference(&__new) {
-                            ::ferro::table::IndexSink::remove_ref(__sink, __entry);
+                            #ferro::__derive::IndexSink::remove_ref(__sink, __entry);
                         }
                         for __entry in __new.difference(&__old) {
-                            ::ferro::table::IndexSink::insert(__sink, ::std::clone::Clone::clone(__entry), ());
+                            #ferro::__derive::IndexSink::insert(__sink, ::std::clone::Clone::clone(__entry), ());
                         }
                     }
                 });
@@ -2014,7 +2061,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let covers = ix.covers();
         let combined = |method: &Ident| {
             format!(
-                "[`{table}::{method}`] as [`Matches`](ferro::table::Matches), to combine with `and` and `or`."
+                "[`{table}::{method}`] as [`Matches`]({linked}::table::Matches), to combine with `and` and `or`."
             )
         };
         let (range_doc, counts_doc) = match ix.kind {
@@ -2049,12 +2096,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             methods.push(quote! {
                 #[doc = #prefix_doc]
                 #[inline]
-                pub fn #prefix<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
+                pub fn #prefix<__Q>(&self, value: &__Q) -> #ferro::table::IndexIter<#name, #ct>
                 where
                     #first: ::std::borrow::Borrow<__Q>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::index_where::<#vt, #name, #st, #ct>(
+                    #ferro::__derive::index_where::<#vt, #name, #st, #ct>(
                         &self.rows,
                         &self.#field,
                         #project,
@@ -2079,123 +2126,125 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             methods.push(quote! {
                 #[doc = #some_doc]
                 #[inline]
-                pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
+                pub fn #some<__Q>(&self, value: &__Q) -> #ferro::table::IndexIter<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::index_eq_some::<#inner, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
+                    #ferro::__derive::index_eq_some::<#inner, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
                 }
 
                 #[doc = #some_after_doc]
                 #[inline]
-                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
+                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> #ferro::table::IndexIter<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
                     #key_ty: ::std::borrow::Borrow<__A>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                     __A: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::index_after_some::<#inner, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
+                    #ferro::__derive::index_after_some::<#inner, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
                 }
             });
-            let found = ix.found_path(&table);
+            let found = ix.found_path(ferro, &table);
             finds.push(quote! {
                 #[doc = #some_find_doc]
                 #[inline]
-                pub fn #some<__Q>(&self, value: &__Q) -> ::ferro::table::Matches<#name, #ct>
+                pub fn #some<__Q>(&self, value: &__Q) -> #ferro::table::Matches<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::match_eq_some::<#inner, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
+                    #ferro::__derive::match_eq_some::<#inner, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
                 }
 
                 #[doc = #some_after_find_doc]
                 #[inline]
-                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::Matches<#name, #ct>
+                pub fn #some_after<__Q, __A>(&self, value: &__Q, after: &__A) -> #ferro::table::Matches<#name, #ct>
                 where
                     #inner: ::std::borrow::Borrow<__Q>,
                     #key_ty: ::std::borrow::Borrow<__A>,
                     __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                     __A: ::std::cmp::Ord + ?::std::marker::Sized,
                 {
-                    ::ferro::table::match_after_some::<#inner, #name, #st, #ct, __Q, __A>(&self.table.rows, &self.table.#field, #found, value, after)
+                    #ferro::__derive::match_after_some::<#inner, #name, #st, #ct, __Q, __A>(&self.table.rows, &self.table.#field, #found, value, after)
                 }
             });
         }
-        let found = ix.found_path(&table);
+        let found = ix.found_path(ferro, &table);
         let by_find_doc = combined(&field);
         let after_find_doc = combined(&after);
         finds.push(quote! {
             #[doc = #by_find_doc]
             #[inline]
-            pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::Matches<#name, #ct>
+            pub fn #field<__Q>(&self, value: &__Q) -> #ferro::table::Matches<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
             {
-                ::ferro::table::match_eq::<#vt, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
+                #ferro::__derive::match_eq::<#vt, #name, #st, #ct, __Q>(&self.table.rows, &self.table.#field, #found, value)
             }
 
             #[doc = #after_find_doc]
             #[inline]
-            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::Matches<#name, #ct>
+            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> #ferro::table::Matches<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 #key_ty: ::std::borrow::Borrow<__A>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 __A: ::std::cmp::Ord + ?::std::marker::Sized,
             {
-                ::ferro::table::match_after::<#vt, #name, #st, #ct, __Q, __A>(&self.table.rows, &self.table.#field, #found, value, after)
+                #ferro::__derive::match_after::<#vt, #name, #st, #ct, __Q, __A>(&self.table.rows, &self.table.#field, #found, value, after)
             }
         });
         methods.push(quote! {
             #[doc = #counts_doc]
             pub fn #counts(&self) -> ::std::vec::Vec<(#vt, usize)> {
-                ::ferro::table::index_counts(&self.#field)
+                #ferro::__derive::index_counts(&self.#field)
             }
 
             #[doc = #by_doc]
             #[inline]
-            pub fn #field<__Q>(&self, value: &__Q) -> ::ferro::table::IndexIter<#name, #ct>
+            pub fn #field<__Q>(&self, value: &__Q) -> #ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
             {
-                ::ferro::table::index_eq::<#vt, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
+                #ferro::__derive::index_eq::<#vt, #name, #st, #ct, __Q>(&self.rows, &self.#field, #project, value)
             }
 
             #[doc = #after_doc]
             #[inline]
-            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> ::ferro::table::IndexIter<#name, #ct>
+            pub fn #after<__Q, __A>(&self, value: &__Q, after: &__A) -> #ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 #key_ty: ::std::borrow::Borrow<__A>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 __A: ::std::cmp::Ord + ?::std::marker::Sized,
             {
-                ::ferro::table::index_after::<#vt, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
+                #ferro::__derive::index_after::<#vt, #name, #st, #ct, __Q, __A>(&self.rows, &self.#field, #project, value, after)
             }
 
             #[doc = #range_doc]
             #[inline]
-            pub fn #range<__Q, __R>(&self, range: __R) -> ::ferro::table::IndexIter<#name, #ct>
+            pub fn #range<__Q, __R>(&self, range: __R) -> #ferro::table::IndexIter<#name, #ct>
             where
                 #vt: ::std::borrow::Borrow<__Q>,
                 __Q: ::std::cmp::Ord + ?::std::marker::Sized,
                 __R: ::std::ops::RangeBounds<__Q>,
             {
-                ::ferro::table::index_range::<#vt, #name, #st, #ct, __Q, __R>(&self.rows, &self.#field, #project, range, Self::#values_fn)
+                #ferro::__derive::index_range::<#vt, #name, #st, #ct, __Q, __R>(&self.rows, &self.#field, #project, range, Self::#values_fn)
             }
         });
     }
 
     let find = format_ident!("{}Find", name);
     let find_doc = format!(
-        "The equality lookups of [`{table}`], returning [`Matches`](ferro::table::Matches) that `and` and `or` combine by primary key. [`{table}::find`] makes one."
+        "The equality lookups of [`{table}`], returning [`Matches`]({linked}::table::Matches) that `and` and `or` combine by primary key. [`{table}::find`] makes one."
     );
-    let find_fn_doc = "A view of the equality lookups of every non-unique index, returning [`Matches`](ferro::table::Matches) that `and` and `or` combine by primary key, reading a row only for a key that matches or that is tested against a range or prefix lookup.";
+    let find_fn_doc = format!(
+        "A view of the equality lookups of every non-unique index, returning [`Matches`]({linked}::table::Matches) that `and` and `or` combine by primary key, reading a row only for a key that matches or that is tested against a range or prefix lookup."
+    );
     let find_items = if finds.is_empty() {
         quote! {}
     } else {
@@ -2253,7 +2302,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             .collect();
         quote! {
             fn add(&mut self, __row: &#name) {
-                #(let mut #fresh_vars = ::ferro::table::Fresh::new(&mut self.#index_fields);)*
+                #(let mut #fresh_vars = #ferro::__derive::Fresh::new(&mut self.#index_fields);)*
                 let __wrote = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     #(Self::#reindex_fns(&mut #fresh_vars, ::std::option::Option::None, ::std::option::Option::Some(__row));)*
                 }));
@@ -2272,7 +2321,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let clash_blocks = clashes.iter().map(|(_, block)| block);
 
     let encode_rows = quote! {
-        __w.field(#rows_tag, |__w| ::ferro::Data::encode(&self.rows, __w))?;
+        __w.field(#rows_tag, |__w| #ferro::Data::encode(&self.rows, __w))?;
     };
     let encode_indexes = if count == 0 {
         quote! {}
@@ -2282,7 +2331,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             for &__slot in __fingerprints.order() {
                 let __fingerprint = __fingerprints.get(__slot);
                 match __slot {
-                    #(#slots => __w.field(#index_tag, |__w| ::ferro::table::encode_index(__fingerprint, &self.#index_fields, __w))?,)*
+                    #(#slots => __w.field(#index_tag, |__w| #ferro::__derive::encode_index(__fingerprint, &self.#index_fields, __w))?,)*
                     _ => {}
                 }
             }
@@ -2305,7 +2354,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     } else {
         quote! {
             #index_tag => match __fingerprints.slot(__r) {
-                #(::std::option::Option::Some(#slots) => ::ferro::codec::decode_into(&mut #vars, __r)?,)*
+                #(::std::option::Option::Some(#slots) => #ferro::__derive::decode_into(&mut #vars, __r)?,)*
                 _ => __unknown = true,
             },
         }
@@ -2315,7 +2364,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     } else {
         quote! {
             #index_tag => match __fingerprints.slot(__r) {
-                #(::std::option::Option::Some(#slots) => ::ferro::codec::visit_field::<#map_tys>(__r)?,)*
+                #(::std::option::Option::Some(#slots) => #ferro::__derive::visit_field::<#map_tys>(__r)?,)*
                 _ => {}
             },
         }
@@ -2324,13 +2373,13 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         quote! {}
     } else {
         quote! {
-            if __stale.contains(&true) && __r.rebuilds() {
-                let __rows = ::ferro::table::stored_rows::<#name>(&__table.rows)?;
+            if __stale.contains(&true) && #ferro::__derive::rebuilds(__r) {
+                let __rows = #ferro::__derive::stored_rows::<#name>(&__table.rows)?;
                 for __row in __rows {
                     #(
                         if __stale[#clash_slots] {
                             if let ::std::option::Option::Some(__taken) = __table.#clash_fns(&*__row, ::std::option::Option::None) {
-                                return ::std::result::Result::Err(::ferro::Error::Decode(::std::format!(
+                                return ::std::result::Result::Err(#ferro::Error::Decode(::std::format!(
                                     "two rows of {} share a value of unique index {}",
                                     ::std::stringify!(#name),
                                     __taken.index,
@@ -2355,11 +2404,11 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         quote! {}
     } else {
         quote! {
-            fn __fingerprints() -> &'static ::ferro::table::Fingerprints<#count> {
-                static __FINGERPRINTS: ::std::sync::OnceLock<::ferro::table::Fingerprints<#count>> =
+            fn __fingerprints() -> &'static #ferro::__derive::Fingerprints<#count> {
+                static __FINGERPRINTS: ::std::sync::OnceLock<#ferro::__derive::Fingerprints<#count>> =
                     ::std::sync::OnceLock::new();
                 __FINGERPRINTS.get_or_init(|| {
-                    ::ferro::table::Fingerprints::new(::std::stringify!(#name), [#(#fingerprints),*])
+                    #ferro::__derive::Fingerprints::new(::std::stringify!(#name), [#(#fingerprints),*])
                 })
             }
         }
@@ -2369,9 +2418,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         let mut __unknown = false;
         let mut __rows: ::std::option::Option<#rows_ty> = ::std::option::Option::None;
         #(let mut #vars: ::std::option::Option<#map_tys> = ::std::option::Option::None;)*
-        __r.fields_sharing_tags(|__tag, __r| {
+        #ferro::__derive::fields_sharing_tags(__r, |__tag, __r| {
             match __tag {
-                #rows_tag => ::ferro::codec::decode_into(&mut __rows, __r)?,
+                #rows_tag => #ferro::__derive::decode_into(&mut __rows, __r)?,
                 #decode_arm
                 _ => {}
             }
@@ -2380,9 +2429,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
     let visit_fields = quote! {
         #fingerprints_of
-        __r.fields_sharing_tags(|__tag, __r| {
+        #ferro::__derive::fields_sharing_tags(__r, |__tag, __r| {
             match __tag {
-                #rows_tag => ::ferro::codec::visit_field::<#rows_ty>(__r)?,
+                #rows_tag => #ferro::__derive::visit_field::<#rows_ty>(__r)?,
                 #visit_arm
                 _ => {}
             }
@@ -2391,18 +2440,18 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
     let index_names: Vec<&str> = indexes.iter().map(|ix| ix.name.as_str()).collect();
     let visit_fn = quote! {
-        fn visit(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<()> {
-            ::ferro::table::noted::<#name, _>(__r, |__r| {
+        fn visit(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<()> {
+            #ferro::__derive::noted::<#name, _>(__r, |__r| {
                 #visit_fields
             })
         }
     };
     let stored_fn = quote! {
-        fn __stored(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<(Self, [bool; #count], bool)> {
+        fn __stored(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<(Self, [bool; #count], bool)> {
             #read_fields
             let __stale = [#(#vars.is_none()),*];
             let __table = #table {
-                rows: ::ferro::codec::required(__rows, "rows")?,
+                rows: #ferro::codec::required(__rows, "rows")?,
                 #(#index_fields: ::std::option::Option::unwrap_or_default(#vars)),*
             };
             ::std::result::Result::Ok((__table, __stale, __unknown))
@@ -2410,10 +2459,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
     let decode_stored_fn = quote! {
         fn decode_stored(
-            __r: &mut ::ferro::codec::Decoder<'_>,
-        ) -> ::ferro::Result<::ferro::table::Stored<Self>> {
+            __r: &mut #ferro::codec::Decoder<'_>,
+        ) -> #ferro::Result<#ferro::__derive::Stored<Self>> {
             let (__table, __stale, __unknown) = Self::__stored(__r)?;
-            ::std::result::Result::Ok(::ferro::table::Stored {
+            ::std::result::Result::Ok(#ferro::__derive::Stored {
                 table: __table,
                 held: __stale.iter().map(|__stale| !*__stale).collect(),
                 unknown: __unknown,
@@ -2423,8 +2472,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     let (decode_fn, slot_fns) = if count == 0 {
         (
             quote! {
-                fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                    let (__table, _, _) = ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
+                fn decode(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<Self> {
+                    let (__table, _, _) = #ferro::__derive::noted::<#name, _>(__r, Self::__stored)?;
                     ::std::result::Result::Ok(__table)
                 }
             },
@@ -2433,8 +2482,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
     } else {
         (
             quote! {
-                fn decode(__r: &mut ::ferro::codec::Decoder<'_>) -> ::ferro::Result<Self> {
-                    let (mut __table, __stale, _) = ::ferro::table::noted::<#name, _>(__r, Self::__stored)?;
+                fn decode(__r: &mut #ferro::codec::Decoder<'_>) -> #ferro::Result<Self> {
+                    let (mut __table, __stale, _) = #ferro::__derive::noted::<#name, _>(__r, Self::__stored)?;
                     #rebuild
                     ::std::result::Result::Ok(__table)
                 }
@@ -2443,16 +2492,16 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 #decode_stored_fn
 
                 fn indexing_reads() -> bool {
-                    false #(|| <#each_tys as ::ferro::table::IndexEach>::READS)*
+                    false #(|| <#each_tys as #ferro::table::IndexEach>::READS)*
                 }
 
                 fn diff_slots(
                     &self,
                     __later: &Self,
                     __slots: &[bool],
-                    __differ: &::ferro::table::Differ<'_, '_>,
-                    __rows: &mut dyn ::std::ops::FnMut() -> ::ferro::Result<::std::vec::Vec<::ferro::table::RowChange<#name>>>,
-                ) -> ::ferro::Result<::std::option::Option<(&'static str, ::ferro::table::Fault)>> {
+                    __differ: &#ferro::__derive::Differ<'_, '_>,
+                    __rows: &mut dyn ::std::ops::FnMut() -> #ferro::Result<::std::vec::Vec<#ferro::__derive::RowChange<#name>>>,
+                ) -> #ferro::Result<::std::option::Option<(&'static str, #ferro::__derive::Fault)>> {
                     #(
                         let #started = (__slots.get(#slots) == ::std::option::Option::Some(&true))
                             .then(|| __differ.start(&self.#index_fields, &__later.#index_fields));
@@ -2482,9 +2531,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 fn built_slots(
                     &self,
                     __slots: &[bool],
-                    __differ: &::ferro::table::Differ<'_, '_>,
-                    __rows: &mut ::ferro::table::EveryRow<'_, #name>,
-                ) -> ::ferro::Result<::std::option::Option<(&'static str, ::ferro::table::Fault)>> {
+                    __differ: &#ferro::__derive::Differ<'_, '_>,
+                    __rows: &mut #ferro::__derive::EveryRow<'_, #name>,
+                ) -> #ferro::Result<::std::option::Option<(&'static str, #ferro::__derive::Fault)>> {
                     #(
                         let mut #vars: ::std::option::Option<::std::vec::Vec<#entry_tys>> =
                             (__slots.get(#slots) == ::std::option::Option::Some(&true)).then(::std::vec::Vec::new);
@@ -2513,7 +2562,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
         )
     };
     let table_doc = format!(
-        "The rows of [`{name}`] and the indexes its `Record` derive declares. [`ferro::Table<{name}>`](ferro::Table) derefs to it, so its lookups are called on the table."
+        "The rows of [`{name}`] and the indexes its `Record` derive declares. [`{linked}::Table<{name}>`]({linked}::Table) derefs to it, so its lookups are called on the table."
     );
 
     Ok(quote! {
@@ -2541,8 +2590,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
 
-        impl ::ferro::Data for #table {
-            fn encode(&self, __w: &mut ::ferro::codec::Encoder<'_>) -> ::ferro::Result<()> {
+        impl #ferro::Data for #table {
+            fn encode(&self, __w: &mut #ferro::codec::Encoder<'_>) -> #ferro::Result<()> {
                 __w.varint(#total);
                 #encode_first
                 #encode_last
@@ -2554,19 +2603,19 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             #visit_fn
 
             fn same_encoding(&self, __other: &Self) -> bool {
-                ::ferro::Data::same_encoding(&self.rows, &__other.rows)
-                    #(&& ::ferro::Data::same_encoding(&self.#index_fields, &__other.#index_fields))*
+                #ferro::Data::same_encoding(&self.rows, &__other.rows)
+                    #(&& #ferro::Data::same_encoding(&self.#index_fields, &__other.#index_fields))*
             }
 
-            fn tables(__t: &mut ::ferro::codec::Tabled) {
+            fn tables(__t: &mut #ferro::__derive::Tabled) {
                 __t.table();
             }
 
             fn pair(
-                __old: &mut ::ferro::codec::Decoder<'_>,
-                __new: &mut ::ferro::codec::Decoder<'_>,
-                __p: &mut ::ferro::codec::Pairing<'_>,
-            ) -> ::ferro::Result<()> {
+                __old: &mut #ferro::codec::Decoder<'_>,
+                __new: &mut #ferro::codec::Decoder<'_>,
+                __p: &mut #ferro::__derive::Pairing<'_>,
+            ) -> #ferro::Result<()> {
                 __p.fields(__old, __new, |__p, __tag, __old, __new| match __tag {
                     #rows_tag => __p.field::<#rows_ty>(__old, __new),
                     _ => ::std::result::Result::Ok(()),
@@ -2574,7 +2623,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
 
-        impl ::ferro::Record for #name {
+        impl #ferro::Record for #name {
             type Key = #key_ty;
             type Table = #table;
 
@@ -2583,12 +2632,12 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
 
-        impl ::ferro::TableData<#name> for #table {
-            fn rows(&self) -> &::ferro::Map<#key_ty, #name> {
+        impl #ferro::TableData<#name> for #table {
+            fn rows(&self) -> &#ferro::Map<#key_ty, #name> {
                 &self.rows
             }
 
-            fn rows_mut(&mut self) -> &mut ::ferro::Map<#key_ty, #name> {
+            fn rows_mut(&mut self) -> &mut #ferro::Map<#key_ty, #name> {
                 &mut self.rows
             }
 
@@ -2598,10 +2647,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 
             fn write(
                 &mut self,
-                __changes: &mut dyn ::std::ops::FnMut(&mut ::ferro::table::Stage<'_, #name>),
-                __rows: &mut dyn ::std::ops::FnMut(&mut ::ferro::table::Rows<#name>),
+                __changes: &mut dyn ::std::ops::FnMut(&mut #ferro::__derive::Stage<'_, #name>),
+                __rows: &mut dyn ::std::ops::FnMut(&mut #ferro::__derive::Rows<#name>),
             ) {
-                #(let mut #edits_vars = ::ferro::table::Edits::<#index_key_tys, #index_value_tys>::new();)*
+                #(let mut #edits_vars = #ferro::__derive::Edits::<#index_key_tys, #index_value_tys>::new();)*
                 __changes(&mut |__old: ::std::option::Option<&#name>, __new: ::std::option::Option<&#name>| {
                     #(Self::#reindex_fns(&mut #edits_vars, __old, __new);)*
                 });
@@ -2623,7 +2672,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 &self,
                 __row: &#name,
                 __moving: ::std::option::Option<&#key_ty>,
-            ) -> ::std::option::Option<::ferro::table::Taken<#key_ty>> {
+            ) -> ::std::option::Option<#ferro::table::Taken<#key_ty>> {
                 #(
                     if let ::std::option::Option::Some(__taken) = self.#clash_fns(__row, __moving) {
                         return ::std::option::Option::Some(__taken);
@@ -2643,7 +2692,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             #(
                 #[inline]
                 fn #reindex_fns(
-                    __sink: &mut impl ::ferro::table::IndexSink<#index_key_tys, #index_value_tys>,
+                    __sink: &mut impl #ferro::__derive::IndexSink<#index_key_tys, #index_value_tys>,
                     __old: ::std::option::Option<&#name>,
                     __new: ::std::option::Option<&#name>,
                 ) {
@@ -2654,9 +2703,9 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
             #(
                 fn #entries_fns(
                     __r: &#name,
-                    __differ: ::std::option::Option<&::ferro::table::Differ<'_, '_>>,
+                    __differ: ::std::option::Option<&#ferro::__derive::Differ<'_, '_>>,
                     __out: &mut ::std::vec::Vec<#entry_tys>,
-                ) -> ::ferro::Result<()> {
+                ) -> #ferro::Result<()> {
                     #try_entries
                     ::std::result::Result::Ok(())
                 }
@@ -2664,10 +2713,10 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                 fn #delta_fns(
                     __old: ::std::option::Option<&#name>,
                     __new: ::std::option::Option<&#name>,
-                    __differ: &::ferro::table::Differ<'_, '_>,
+                    __differ: &#ferro::__derive::Differ<'_, '_>,
                     __gone: &mut ::std::vec::Vec<#entry_tys>,
                     __come: &mut ::std::vec::Vec<#entry_tys>,
-                ) -> ::ferro::Result<()> {
+                ) -> #ferro::Result<()> {
                     #deltas
                 }
             )*
@@ -2678,7 +2727,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
                     &self,
                     __row: &#name,
                     __moving: ::std::option::Option<&#key_ty>,
-                ) -> ::std::option::Option<::ferro::table::Taken<#key_ty>> {
+                ) -> ::std::option::Option<#ferro::table::Taken<#key_ty>> {
                     #clash_blocks
                     ::std::option::Option::None
                 }
@@ -2728,7 +2777,8 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// | `#[unique(a, b)]` | A unique composite index: at most one row holds each `(a, b)`. Takes a cover list too. |
 ///
 /// `#[ferro(rename = "...")]`, `#[ferro(default)]`, `#[ferro(default = "...")]`,
-/// `#[ferro(skip)]` and, on the struct, `#[ferro(removed(...))]` mean what they do for `Data`.
+/// `#[ferro(skip)]` and, on the struct, `#[ferro(removed(...))]` and `#[ferro(crate = "...")]`
+/// mean what they do for `Data`.
 /// Each index is stored with a fingerprint of its kind, the key's type, and the stored names, types
 /// and defaults of the fields it is keyed on and stores, where a type's description holds the
 /// defaults of the derived structs and enums it reaches. When a table is read, an index whose
@@ -3197,6 +3247,87 @@ mod tests {
             if let Err(error) = expand_data(input) {
                 panic!("{error}");
             }
+        }
+    }
+
+    fn idents(tokens: TokenStream2, out: &mut Vec<String>) {
+        for tree in tokens {
+            match tree {
+                proc_macro2::TokenTree::Ident(ident) => out.push(ident.to_string()),
+                proc_macro2::TokenTree::Group(group) => idents(group.stream(), out),
+                _ => {}
+            }
+        }
+    }
+
+    fn names(tokens: TokenStream2) -> Vec<String> {
+        let mut out = Vec::new();
+        idents(tokens, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_crate_path_stands_for_ferro_in_everything_the_derives_generate() {
+        let data: [DeriveInput; 3] = [
+            syn::parse_quote! {
+                #[ferro(crate = "crate::storage::engine")]
+                struct Point<T> { x: T, #[ferro(default)] y: u32 }
+            },
+            syn::parse_quote! {
+                #[ferro(crate = "crate::storage::engine")]
+                enum Tier { Free, Paid { seats: u32 } }
+            },
+            syn::parse_quote! {
+                #[ferro(transparent, crate = "crate::storage::engine")]
+                struct Team(u32);
+            },
+        ];
+        let record: DeriveInput = syn::parse_quote! {
+            #[ferro(crate = "crate::storage::engine")]
+            #[index(team, name)]
+            #[unique(name, room, cover(note))]
+            struct Member {
+                #[key] id: u64,
+                #[index(cover(note))] team: u32,
+                #[unique] email: Option<String>,
+                #[index(each)] tags: Vec<String>,
+                #[index] lead: Option<u64>,
+                name: String,
+                room: u16,
+                note: String,
+            }
+        };
+        let mut generated: Vec<TokenStream2> = data
+            .into_iter()
+            .map(|input| expand_data(input).unwrap())
+            .collect();
+        generated.push(expand_record(record).unwrap());
+        for tokens in generated {
+            let names = names(tokens);
+            assert!(!names.iter().any(|name| name == "ferro"), "{names:?}");
+            assert!(names.iter().any(|name| name == "engine"), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_crate_path_the_derives_name_ferro() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct Row { #[key] id: u64, #[index] room: u32 }
+        };
+        let names = names(expand_record(input).unwrap());
+        assert!(names.iter().any(|name| name == "ferro"), "{names:?}");
+    }
+
+    #[test]
+    fn a_second_crate_path_is_refused() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[ferro(crate = "crate::one")]
+            #[ferro(crate = "crate::two")]
+            struct Point { x: u32 }
+        };
+        match expand_data(input) {
+            Ok(_) => panic!("the derive accepted two crate paths"),
+            Err(error) => assert_eq!(error.to_string(), "a type takes one crate path"),
         }
     }
 }

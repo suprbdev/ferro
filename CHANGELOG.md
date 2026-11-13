@@ -11,6 +11,12 @@ says so under **Format**, and a build refuses a file of another format with `Err
 
 ## [Unreleased]
 
+### Added
+
+- `#[ferro(crate = "path")]` on a type that derives `Data` or `Record` gives the path its generated
+  code reaches ferro by, `::ferro` without it, for a crate that depends on ferro under another name
+  or through a re-export.
+
 ### Changed
 
 - **Breaking:** `Set`, `List` and `Table` return iterator types of their own rather than the `Map`
@@ -27,6 +33,13 @@ says so under **Format**, and a build refuses a file of another format with `Err
   `store_id` and `store`, `Decoder::store`, `Encoder::reusing`, `into_buf`, `is_unsettled` and
   `store_id`, and `Staged` are gone from the API. `Encoder::sink` and `mark_unsettled` need the
   `testing` feature, which also adds `Decoder::in_store` to decode with a store behind it.
+- **Breaking:** what the `Data` and `Record` derives generate calls into one hidden module,
+  `ferro::__derive`, which semantic versioning does not cover. The hidden items they called are
+  gone from `codec`, `map` and `table`: `decode_into`, `visit_field`, `Tabled`, `Pairing`,
+  `Edits`, `noted`, `Differ`, `Stored`, `Fault`, `Fresh`, `IndexSink`, `Fingerprints`, `present`,
+  `each_values`, the lookup helpers such as `index_eq` and `unique_some`, and the rest, and so are
+  `Decoder::rebuilds` and `Decoder::fields_sharing_tags`. A hand-written `Data` impl that overrides
+  `tables` or `pair` imports `Tabled` and `Pairing` from `ferro::__derive`.
 
 ## [0.1.0] - 2026-11-13
 

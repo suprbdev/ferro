@@ -7,7 +7,8 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 
 use common::{cases, fast, panic_text, quiet_ferro_panics, text};
-use ferro::codec::{Decoder, Encoder, Object, Pairing, Tabled};
+use ferro::__derive::{Pairing, Tabled};
+use ferro::codec::{Decoder, Encoder, Object};
 use ferro::{
     Bundle, Bytes, Data, Db, Error, Hash, Keep, List, Map, Outcome, Ptr, Record, Set, Snapshot,
     Summary, Table,

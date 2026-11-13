@@ -1051,7 +1051,7 @@ fn changing_what_default_returns_for_an_indexed_type_rebuilds_its_index() {
 #[test]
 fn a_default_is_described_by_the_value_it_returns() {
     let fingerprint = |value: u8| {
-        ferro::table::index_fingerprint(|d| {
+        ferro::__derive::index_fingerprint(|d| {
             d.word("value");
             d.value(&value);
         })

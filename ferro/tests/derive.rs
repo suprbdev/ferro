@@ -1317,3 +1317,96 @@ fn a_table_whose_indexes_change_verifies_compacts_and_syncs() {
         root.items.len() == 300 && root.items.by_extra(&3).count() == 1
     });
 }
+
+mod storage {
+    pub use ferro as engine;
+}
+
+mod through_a_path {
+    use crate::storage::engine::{Data, Record, Table};
+
+    #[derive(Data, Clone, Debug, PartialEq)]
+    #[ferro(crate = "crate::storage::engine")]
+    pub enum Tier {
+        Free,
+        Paid { seats: u32 },
+    }
+
+    #[derive(Data, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    #[ferro(crate = "crate::storage::engine", transparent)]
+    pub struct Team(pub u32);
+
+    #[derive(Data, Record, Clone, Debug, PartialEq)]
+    #[ferro(crate = "crate::storage::engine")]
+    #[index(team, name)]
+    pub struct Member {
+        #[key]
+        pub id: u64,
+        #[index]
+        pub team: Team,
+        #[unique]
+        pub email: Option<String>,
+        #[index(each, cover(name))]
+        pub tags: Vec<String>,
+        pub name: String,
+        pub tier: Tier,
+    }
+
+    #[derive(Data, Clone, Default)]
+    #[ferro(crate = "crate::storage::engine")]
+    pub struct Root {
+        pub members: Table<Member>,
+    }
+}
+
+#[test]
+fn the_derives_reach_ferro_through_the_crate_path_they_are_given() {
+    use through_a_path::{Member, Root, Team, Tier};
+
+    roundtrip(Tier::Paid { seats: 3 });
+    roundtrip(Tier::Free);
+    assert_eq!(bytes(&Team(7)), bytes(&7u32));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("path.ferro");
+    {
+        let db: Db<Root> = buffered().open(&path).unwrap();
+        db.commit("fill", |root| {
+            for id in 0..40u64 {
+                root.members.insert(Member {
+                    id,
+                    team: Team((id % 4) as u32),
+                    email: (id % 3 == 0).then(|| format!("{id}@x")),
+                    tags: vec![format!("t{}", id % 5), "all".into()],
+                    name: format!("m{id:02}"),
+                    tier: if id % 2 == 0 {
+                        Tier::Free
+                    } else {
+                        Tier::Paid { seats: id as u32 }
+                    },
+                });
+            }
+        })
+        .unwrap();
+        db.verify_typed().unwrap();
+    }
+    opened_as::<Root>(&path, |root| {
+        let members = &root.members;
+        let team: Vec<u64> = members.by_team(&Team(1)).keys().take(3).collect();
+        let tagged: Vec<(u64, String)> = members.by_tags("t2").covered().collect();
+        let prefixed: Vec<u64> = members.by_team_name_prefix(&Team(2)).keys().collect();
+        let found: Vec<u64> = members
+            .find()
+            .by_team(&Team(3))
+            .and(members.find().by_tags("t3"))
+            .keys()
+            .collect();
+        members.len() == 40
+            && team == [1, 5, 9]
+            && tagged[..2] == [(2, "m02".to_string()), (7, "m07".to_string())]
+            && prefixed.len() == 10
+            && members.by_email("9@x").map(|member| member.id) == Some(9)
+            && members.key_by_email("10@x").is_none()
+            && found == [3, 23]
+    });
+}
