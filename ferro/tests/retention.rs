@@ -327,7 +327,7 @@ fn retention_model(seed: u64) {
                 }
                 let version = retained[rng.below(retained.len() as u64) as usize];
                 let snapshot = model.db.at(version).unwrap();
-                model.db.restore(&snapshot).unwrap();
+                model.db.restore(&snapshot, "restore").unwrap();
                 model.record();
             }
             73..81 => {

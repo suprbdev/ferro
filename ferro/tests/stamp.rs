@@ -56,7 +56,7 @@ fn plain(db: &Db<Root>, id: u64) -> Committed<()> {
 }
 
 fn time_of(db: &Db<Root>, version: u64) -> u64 {
-    db.log().get(&version).unwrap().time_ms
+    db.log().get(version).unwrap().time_ms
 }
 
 fn assert_lands(db: &Db<Root>, id: u64, (version, time_ms): (u64, u64)) {
@@ -133,7 +133,7 @@ fn committed_carries_the_time_of_every_kind_of_write() {
     assert_eq!((merged.version, merged.time_ms), (4, time_of(&db, 4)));
     assert!(merged.time_ms >= branch.read().commit().time_ms);
 
-    let restored = db.restore(&db.at(1).unwrap()).unwrap();
+    let restored = db.restore(&db.at(1).unwrap(), "restore").unwrap();
     assert_eq!((restored.version, restored.time_ms), (5, time_of(&db, 5)));
 }
 

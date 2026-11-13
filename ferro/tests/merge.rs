@@ -55,7 +55,7 @@ fn commit_with_takes_the_message_from_the_closure_and_reports_outcome() {
     assert_eq!(done.value, 1);
     assert_eq!(done.version, 1);
     assert!(done.changed);
-    assert_eq!(db.log().get(&1).unwrap().message, "add #1");
+    assert_eq!(db.log().get(1).unwrap().message, "add #1");
     let same = db.commit_with(|_| ("nothing", ())).unwrap();
     assert!(!same.changed);
     assert_eq!(same.version, 1);
@@ -78,13 +78,13 @@ fn a_multi_line_message_is_one_message() {
     }
     let db = Db::<Board>::open(&path).unwrap();
     let log = db.log();
-    let first = log.get(&1).unwrap();
+    let first = log.get(1).unwrap();
     assert_eq!(first.message, "title\n\nbody line\n");
     assert_eq!(
         first.messages().collect::<Vec<_>>(),
         vec!["title\n\nbody line\n"]
     );
-    assert_eq!(log.get(&2).unwrap().messages().count(), 0);
+    assert_eq!(log.get(2).unwrap().messages().count(), 0);
 }
 
 #[test]
@@ -95,13 +95,13 @@ fn restore_records_its_source_and_reports_a_no_op() {
         .unwrap();
     db.update(|board| board.tasks.insert(task(2, None, "open", &[])))
         .unwrap();
-    let done = db.restore(&db.at(1).unwrap()).unwrap();
+    let done = db.restore(&db.at(1).unwrap(), "restore").unwrap();
     assert!(done.changed);
     assert_eq!(done.version, 3);
     let log = db.log();
-    let commit: std::sync::Arc<Commit> = log.get(&3).unwrap();
+    let commit: std::sync::Arc<Commit> = log.get(3).unwrap();
     assert_eq!(commit.restored, Some(1));
-    assert!(!db.restore(&db.at(1).unwrap()).unwrap().changed);
+    assert!(!db.restore(&db.at(1).unwrap(), "restore").unwrap().changed);
 }
 
 #[test]

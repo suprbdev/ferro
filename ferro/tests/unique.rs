@@ -62,7 +62,7 @@ enum Op {
     GetMut(u32, Fields),
     Rekey(u32, u32, Fields),
     Remove(u32),
-    Drain(Bound<u32>, Bound<u32>),
+    TakeRange(Bound<u32>, Bound<u32>),
     Retain(u8),
     Commit,
     Reopen,
@@ -85,7 +85,7 @@ fn op() -> impl Strategy<Value = Op> {
         4 => (0..IDS, fields()).prop_map(|(id, f)| Op::GetMut(id, f)),
         4 => (0..IDS, 0..IDS, fields()).prop_map(|(id, to, f)| Op::Rekey(id, to, f)),
         3 => (0..IDS).prop_map(Op::Remove),
-        1 => (id_bound(), id_bound()).prop_map(|(a, b)| Op::Drain(a, b)),
+        1 => (id_bound(), id_bound()).prop_map(|(a, b)| Op::TakeRange(a, b)),
         1 => (2..4u8).prop_map(Op::Retain),
         2 => Just(Op::Commit),
         1 => Just(Op::Reopen),
@@ -259,14 +259,19 @@ fn run(ops: Vec<Op>) {
                 let old = table.remove(&id);
                 assert_eq!(old.map(|row| (*row).clone()), model.remove(&id));
             }
-            Op::Drain(low, high) => {
-                let drained = table.drain_range::<u32, _>((low, high));
-                let wanted: Vec<u32> = model
-                    .keys()
-                    .copied()
-                    .filter(|id| within(*id, &low, &high))
+            Op::TakeRange(low, high) => {
+                let wanted: BTreeMap<u32, Item> = model
+                    .iter()
+                    .filter(|(id, _)| within(**id, &low, &high))
+                    .map(|(id, row)| (*id, row.clone()))
                     .collect();
-                assert_eq!(drained.iter().map(|row| row.id).collect::<Vec<_>>(), wanted);
+                let mut taken = table.take_range::<u32, _>((low, high));
+                check(&taken, &wanted);
+                for row in wanted.values() {
+                    let mut copy = row.clone();
+                    copy.id = row.id + IDS;
+                    assert!(taken.try_insert(copy).is_err(), "{row:?}");
+                }
                 model.retain(|id, _| !within(*id, &low, &high));
             }
             Op::Retain(modulus) => {

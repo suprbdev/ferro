@@ -75,8 +75,10 @@ have nothing left to load. An insert writes its row first,
 since it learns the row it replaces from that, and takes it back the same way. A row under a new
 key, in a table without an `each` index, gives each index at most one entry and removes none, so
 the insert puts each entry in as it goes and takes back those before one that fails, working their
-keys out again from the row. `retain` and
-`drain_range` remove their rows as one batch and each index's entries as another.
+keys out again from the row. `retain`,
+`take_range` and `remove_range` remove their rows as one batch and each index's entries as another.
+`take_range` builds the indexes of the table it returns first, in one write of that table, and only
+then cuts the rows out of its own, so a load that fails in either leaves the table as it was.
 `Table::try_merge`, which writes as it goes, puts back the copy of the table it keeps for an `Err`
 from `resolve` on a panic too. [Edits that fail halfway](tree.md#edits-that-fail-halfway) describes
 what a map loads ahead.

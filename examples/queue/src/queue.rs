@@ -180,8 +180,8 @@ impl Queue {
         Ok(self.db.refresh()?)
     }
 
-    pub fn size_on_disk(&self) -> u64 {
-        self.db.size_on_disk()
+    pub fn log_bytes(&self) -> u64 {
+        self.db.log_bytes()
     }
 
     pub fn space(&self) -> Result<Space> {

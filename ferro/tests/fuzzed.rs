@@ -1612,7 +1612,7 @@ fn refresh_refuses_a_superblock_whose_log_ends_past_the_file() {
     });
     fs::write(&path, &bytes).unwrap();
     corrupt(follower.refresh());
-    assert!(follower.size_on_disk() <= bytes.len() as u64);
+    assert!(follower.log_bytes() <= bytes.len() as u64);
     let space = follower.space().unwrap();
     assert!(space.live_bytes <= space.file_bytes, "{space:?}");
     assert!(follower.read().contains_key(&1));

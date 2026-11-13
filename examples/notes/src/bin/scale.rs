@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "laptop: {} notes in {:.2} s, {} bytes on disk",
         args.notes,
         started.elapsed().as_secs_f64(),
-        laptop.db().size_on_disk()
+        laptop.db().log_bytes()
     );
     let started = Instant::now();
     let cloned = phone.sync(&laptop)?;
@@ -149,8 +149,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("converged: {converged}, {shared} is now {winner:?}");
     println!(
         "files: laptop {} bytes, phone {} bytes",
-        laptop.db().size_on_disk(),
-        phone.db().size_on_disk()
+        laptop.db().log_bytes(),
+        phone.db().log_bytes()
     );
     drop((laptop, phone));
     if owned {

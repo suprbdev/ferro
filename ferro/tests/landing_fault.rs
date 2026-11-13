@@ -710,7 +710,7 @@ fn a_write_held_inside_pwrite_holds_back_every_sync_and_superblock() {
         let (db, branches) = seeded(options().hook(hook(&stalls)), &path, &["b0", "b1", "b2"]);
         let held = writer(&branches[0], "held", 1, 1);
         wait_until("the held write", || WRITE_ENTERED.load(Ordering::SeqCst));
-        let size = db.size_on_disk();
+        let size = db.log_bytes();
         let later: Vec<_> = branches[1..]
             .iter()
             .map(|branch| {
@@ -726,7 +726,7 @@ fn a_write_held_inside_pwrite_holds_back_every_sync_and_superblock() {
         assert!(later.iter().all(|handle| !handle.is_finished()), "{kind}");
         assert!(!forker.is_finished(), "{kind}");
         assert_eq!(
-            db.size_on_disk(),
+            db.log_bytes(),
             size,
             "{kind}: a superblock moved past a held frame"
         );

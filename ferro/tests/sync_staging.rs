@@ -202,7 +202,7 @@ fn killing_the_process_at_every_step_of_a_large_receive_keeps_the_file_or_the_la
         let len = fs::metadata(&path).unwrap().len();
         assert_eq!(
             len,
-            db.size_on_disk(),
+            db.log_bytes(),
             "{step}: the file keeps a partial frame"
         );
         match landed {
@@ -301,7 +301,7 @@ fn killed_beside_a_live_shared_writer(durability: Durability, name: &str) {
         );
         assert_eq!(
             fs::metadata(&path).unwrap().len(),
-            exclusive.size_on_disk(),
+            exclusive.log_bytes(),
             "{label}"
         );
     }
@@ -422,9 +422,9 @@ fn objects_a_landing_refused_after_learning_them_serve_later_commits_through_reo
         Err(Error::StaleHave(_)) => {}
         other => panic!("landed on a base pruned before the landing: {other:?}"),
     }
-    let from = b.size_on_disk();
+    let from = b.log_bytes();
     fill(&b, 10, KEYS);
-    let grown = b.size_on_disk() - from;
+    let grown = b.log_bytes() - from;
     assert!(
         grown < case.bundle.len() as u64 / 8,
         "a commit of the refused bundle's values grew the log by {grown} bytes, not linking them"
@@ -508,7 +508,7 @@ fn two_receives_staging_at_once_beside_commits_both_land() {
         drop(b);
         let b: Db<Root> = fast().open(&path).unwrap();
         b.verify_typed().unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().len(), b.size_on_disk());
+        assert_eq!(fs::metadata(&path).unwrap().len(), b.log_bytes());
     }
 }
 
@@ -527,7 +527,7 @@ fn two_shared_handles_receive_at_once_beside_a_third_committing() {
         drop(handles);
         let b: Db<Root> = fast().open(&path).unwrap();
         b.verify_typed().unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().len(), b.size_on_disk());
+        assert_eq!(fs::metadata(&path).unwrap().len(), b.log_bytes());
     }
 }
 
@@ -690,7 +690,7 @@ fn cycle_at(step: &'static str, nth: usize) {
     let b = case.open(fast());
     assert_eq!(b.branch("a").unwrap().head_hash(), case.a.head_hash());
     b.verify_typed().unwrap();
-    let size = b.size_on_disk();
+    let size = b.log_bytes();
     let again = b.compact(Keep::All).unwrap();
     assert!(again.after_bytes <= size, "{again:?}");
 }

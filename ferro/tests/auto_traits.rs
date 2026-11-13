@@ -3,8 +3,8 @@ use std::fmt::Debug;
 use ferro::table::{Explain, IndexIter, Matches};
 use ferro::{
     Bundle, Bytes, Change, Closer, Commit, Committed, Compacted, Conflict, Data, Db, Durability,
-    Error, Following, Have, Keep, List, Log, Map, Options, Outcome, Pulled, Reclaim, Record, Set,
-    Snapshot, Space, Table, Taken, Val, Verified, Watcher,
+    Error, Following, Have, Keep, List, Log, Map, Options, Outcome, Reclaim, Record, Set, Snapshot,
+    Space, Synced, Table, Taken, Val, Verified, Watcher,
 };
 
 #[derive(Data, Record, Clone, Debug, PartialEq)]
@@ -52,7 +52,7 @@ fn handles_and_values_are_send_sync_and_debug() {
 #[test]
 fn reports_and_settings_are_send_sync_and_debug() {
     shared::<Committed<u32>>();
-    shared::<Pulled<u32>>();
+    shared::<Synced<u32>>();
     shared::<Outcome>();
     shared::<Space>();
     shared::<Compacted>();

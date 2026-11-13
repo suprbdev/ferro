@@ -30,11 +30,7 @@ fn compressible_values_round_trip_and_shrink_the_file() {
             }
         })
         .unwrap();
-        assert!(
-            db.size_on_disk() < raw / 2,
-            "{} vs {raw}",
-            db.size_on_disk()
-        );
+        assert!(db.log_bytes() < raw / 2, "{} vs {raw}", db.log_bytes());
     }
     let check = |db: &Db<Root>| {
         let snapshot = db.read();
@@ -86,13 +82,13 @@ fn a_value_pulled_uncompressed_is_stored_compressed_and_a_power_cut_over_it_is_t
         root.insert(1, value.clone());
     })
     .unwrap();
-    let sent = a.size_on_disk();
+    let sent = a.log_bytes();
     let before = fs::read(&path).unwrap();
     b.pull(&a, "a", refuse).unwrap();
     assert!(
-        b.size_on_disk() < 2 * sent,
+        b.log_bytes() < 2 * sent,
         "{} bytes pulled from a file of {sent}",
-        b.size_on_disk()
+        b.log_bytes()
     );
     drop(b);
     let whole = fs::read(&path).unwrap();

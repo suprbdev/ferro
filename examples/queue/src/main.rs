@@ -513,7 +513,7 @@ fn run(cli: Cli) -> Result<(), QueueError> {
         }
         Cmd::Info => {
             let q = open_ro()?;
-            println!("version={} file_bytes={}", q.version(), q.size_on_disk());
+            println!("version={} file_bytes={}", q.version(), q.log_bytes());
         }
     }
     Ok(())

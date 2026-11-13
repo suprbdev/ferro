@@ -258,14 +258,14 @@ fn running_out_of_space_during_the_copy_fails_the_cycle_and_commits_continue() {
     };
     let db: Db<Root> = options().hook(Hook(Arc::new(hook))).open(&path).unwrap();
     fill(&db, 0, 1500);
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     let outcome = db.compact(Keep::Last(1));
     WRITES_FAIL.with(|fail| fail.set(false));
     COPY_FAILS.store(false, Ordering::SeqCst);
     assert!(matches!(outcome, Err(Error::Io(_))), "{outcome:?}");
     assert!(no_temp(&path));
     assert!(db.space().unwrap().last_error.is_some());
-    assert!(db.size_on_disk() >= size);
+    assert!(db.log_bytes() >= size);
     fill(&db, 4000, 20);
     let want = dump(&db.read());
     db.verify().unwrap();
@@ -472,13 +472,13 @@ fn a_failed_rename_fails_the_cycle_and_commits_continue() {
     let path = dir.path().join("db.ferro");
     let db: Db<Root> = options().open(&path).unwrap();
     fill(&db, 0, 800);
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     RENAME_ERROR.store(EIO, Ordering::SeqCst);
     let outcome = db.compact(Keep::Last(1));
     RENAME_ERROR.store(0, Ordering::SeqCst);
     assert!(matches!(outcome, Err(Error::Io(_))), "{outcome:?}");
     assert!(no_temp(&path));
-    assert!(db.size_on_disk() >= size);
+    assert!(db.log_bytes() >= size);
     fill(&db, 5000, 20);
     let want = dump(&db.read());
     db.verify().unwrap();
@@ -679,7 +679,7 @@ fn the_pause_reads_no_chain_ahead_when_an_earlier_pass_walked_it() {
             move |name: &'static str| match name {
                 "synced" => {
                     let db = slot.lock().unwrap().clone().unwrap();
-                    OLD_END.store(db.size_on_disk() as i64, Ordering::SeqCst);
+                    OLD_END.store(db.log_bytes() as i64, Ordering::SeqCst);
                     fill_one(&db, 9000, added);
                 }
                 "paused" => PAUSED.store(true, Ordering::SeqCst),

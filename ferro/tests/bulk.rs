@@ -40,10 +40,10 @@ fn remove_range_writes_a_path_not_the_range() {
     let dir = tempfile::tempdir().unwrap();
     let n = 200_000;
     let db = filled(&dir.path().join("w.ferro"), n);
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     let removed = db.update(|root| root.remove_range(1_000..199_000)).unwrap();
     assert_eq!(removed, 198_000);
-    let written = db.size_on_disk() - before;
+    let written = db.log_bytes() - before;
     assert!(written < before / 100, "wrote {written} of {before} bytes");
     let snapshot = db.read();
     assert_eq!(snapshot.len(), 2_000);
@@ -57,7 +57,7 @@ fn remove_range_never_reads_the_removed_subtrees() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("r.ferro");
     let n = 200_000;
-    let size = filled(&path, n).size_on_disk();
+    let size = filled(&path, n).log_bytes();
     let mut file = OpenOptions::new().write(true).open(&path).unwrap();
     let garbage = vec![0xa5u8; (size / 5) as usize];
     file.seek(SeekFrom::Start(size * 2 / 5)).unwrap();
@@ -103,7 +103,7 @@ fn empty_range_leaves_the_tree_clean() {
     let dir = tempfile::tempdir().unwrap();
     let db = filled(&dir.path().join("e.ferro"), 10_000);
     let version = db.version();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     db.update(|root| {
         assert_eq!(root.remove_range(20_000..), 0);
         assert_eq!(root.remove_range(..0), 0);
@@ -114,7 +114,7 @@ fn empty_range_leaves_the_tree_clean() {
     })
     .unwrap();
     assert_eq!(db.version(), version);
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
 }
 
 #[test]
@@ -122,13 +122,13 @@ fn split_off_at_any_edge_writes_nothing_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = filled(&dir.path().join("s.ferro"), 10_000);
     let version = db.version();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     db.update(|root| {
         assert!(root.split_off(&10_000).is_empty());
     })
     .unwrap();
     assert_eq!(db.version(), version);
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
     db.update(|root| {
         let mut tail = root.split_off(&5_000);
         root.append(&mut tail);
@@ -148,19 +148,19 @@ fn a_cut_that_moves_nothing_adds_no_bytes_beside_a_real_change() {
         .unwrap();
     let plain = {
         let db = open();
-        let before = db.size_on_disk();
+        let before = db.log_bytes();
         db.update(|root| root.1 += 1).unwrap();
-        db.size_on_disk() - before
+        db.log_bytes() - before
     };
     let cut = {
         let db = open();
-        let before = db.size_on_disk();
+        let before = db.log_bytes();
         db.update(|root| {
             root.1 += 1;
             assert!(root.0.split_off(&50_000).is_empty());
         })
         .unwrap();
-        db.size_on_disk() - before
+        db.log_bytes() - before
     };
     assert_eq!(cut, plain);
 }
@@ -289,11 +289,11 @@ fn a_batch_of_absent_deletes_changes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let db = filled(&dir.path().join("a.ferro"), 10_000);
     let version = db.version();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     db.update(|root| root.apply((20_000..20_100).map(|key| (key, None))))
         .unwrap();
     assert_eq!(db.version(), version);
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
     let hash = db.read().root_hash();
     let mut map = (*db.read()).clone();
     map.apply(std::iter::empty());

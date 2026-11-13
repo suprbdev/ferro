@@ -136,7 +136,7 @@ fn panic_inside_update_discards_the_transaction() {
         root.insert(1, "keep".into());
     })
     .unwrap();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     for round in 0..50 {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             db.update(|root| {
@@ -153,7 +153,7 @@ fn panic_inside_update_discards_the_transaction() {
         assert_eq!(db.version(), 1);
         assert_eq!(*db.read().get(&1).unwrap(), "keep");
         assert!(db.read().get(&2).is_none());
-        assert_eq!(db.size_on_disk(), size);
+        assert_eq!(db.log_bytes(), size);
     }
     db.update(|root| {
         root.insert(3, "next".into());
@@ -212,7 +212,7 @@ fn panic_or_error_from_encode_leaves_the_database_usable() {
         root.insert(1, touchy(1));
     })
     .unwrap();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
         let _ = db.update(|root| {
             let mut bad = touchy(2);
@@ -229,7 +229,7 @@ fn panic_or_error_from_encode_leaves_the_database_usable() {
     });
     assert!(matches!(refused, Err(Error::Decode(_))));
     assert_eq!(db.version(), 1);
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
     db.update(|root| {
         root.insert(4, touchy(4));
     })
@@ -248,7 +248,7 @@ fn value_that_cannot_decode_is_refused_before_it_becomes_durable() {
         root.insert(1, touchy(1));
     })
     .unwrap();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     let refused = db.update(|root| {
         let mut bad = touchy(2);
         bad.fail_on_decode = true;
@@ -256,7 +256,7 @@ fn value_that_cannot_decode_is_refused_before_it_becomes_durable() {
     });
     assert!(matches!(refused, Err(Error::Decode(_))));
     assert_eq!(db.version(), 1);
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
     db.update(|root| {
         root.insert(3, touchy(3));
     })
@@ -380,7 +380,7 @@ fn restore_reports_its_own_version_under_contention() {
         handles.push(thread::spawn(move || {
             barrier.wait();
             for _ in 0..300 {
-                let version = db.restore(&origin).unwrap().version;
+                let version = db.restore(&origin, "restore").unwrap().version;
                 let restored = db.at(version).unwrap();
                 assert_eq!(
                     restored.root_hash(),

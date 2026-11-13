@@ -279,7 +279,7 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
     let t = Instant::now();
     db.commit("bulk", |r| r.build(edges)).unwrap();
     let bulk = t.elapsed().as_secs_f64();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     out += &format!(
         "bulk insert   {:.2}s  {:.2} M edges/s   file {:.1} MiB  {:.2} bytes/edge\n",
         bulk,
@@ -385,7 +385,7 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
         50.0 / inc
     );
 
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     let mut next = users;
     let mut lat = Vec::new();
     for _ in 0..300 {
@@ -394,13 +394,13 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
         db.commit("celeb", |r| r.add(celebrity, next)).unwrap();
         lat.push(t.elapsed().as_secs_f64() * 1e6);
     }
-    let bytes = (db.size_on_disk() - before) as f64 / 300.0;
+    let bytes = (db.log_bytes() - before) as f64 / 300.0;
     out += &format!(
         "celebrity row update (buffered)  median {:.0} us  {:.0} bytes/commit\n",
         median(&mut lat),
         bytes
     );
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     let mut lat = Vec::new();
     for _ in 0..300 {
         let a = rng.below(users as u64) as u32;
@@ -409,7 +409,7 @@ pub fn run<R: Rep>(dir: &Path, edges: &[(u32, u32)], celebrity: u32, users: u32)
         db.commit("ordinary", |r| r.add(a, b)).unwrap();
         lat.push(t.elapsed().as_secs_f64() * 1e6);
     }
-    let bytes_ordinary = (db.size_on_disk() - before) as f64 / 300.0;
+    let bytes_ordinary = (db.log_bytes() - before) as f64 / 300.0;
     out += &format!(
         "ordinary random add (buffered)  median {:.0} us  {:.0} bytes/commit\n",
         median(&mut lat),

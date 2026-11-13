@@ -1156,10 +1156,10 @@ fn left_by_a_dead_writer(left: Left) {
         .unwrap();
     let mut slots = vec![0u8; 8192];
     file.read_exact_at(&mut slots, 0).unwrap();
-    let start = live.size_on_disk();
+    let start = live.log_bytes();
     let dead: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
     commit(&dead).unwrap();
-    let end = dead.size_on_disk();
+    let end = dead.log_bytes();
     drop(dead);
     assert!(end - start > 4 * 4096, "a frame of {} bytes", end - start);
     let mut frame = vec![0u8; (end - start) as usize];
@@ -1282,10 +1282,10 @@ fn below_the_superblock(durability: Durability, rot: Rot) {
     };
     let a = open();
     let b = open();
-    let mut ends = vec![a.size_on_disk()];
+    let mut ends = vec![a.log_bytes()];
     for pad in &pads[..4] {
         commit(&a, pad).unwrap();
-        ends.push(a.size_on_disk());
+        ends.push(a.log_bytes());
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -1340,10 +1340,10 @@ fn a_writer_that_opens_beside_a_live_one_reports_a_frame_below_the_superblock_th
         })
     };
     let a: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
-    let mut ends = vec![a.size_on_disk()];
+    let mut ends = vec![a.log_bytes()];
     for _ in 0..4 {
         commit(&a, &mut rng).unwrap();
-        ends.push(a.size_on_disk());
+        ends.push(a.log_bytes());
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -1418,10 +1418,10 @@ fn near_copy_left_by_a_dead_writer(marker: bool) {
         .unwrap();
     let mut slots = vec![0u8; 8192];
     file.read_exact_at(&mut slots, 0).unwrap();
-    let start = live.size_on_disk();
+    let start = live.log_bytes();
     let dead: Db<Padded> = shared().reclaim(manual).open(&path).unwrap();
     commit(&dead, &pads[3]);
-    let end = dead.size_on_disk();
+    let end = dead.log_bytes();
     drop(dead);
     let mut left = vec![0u8; (end - start) as usize];
     file.read_exact_at(&mut left, start).unwrap();
@@ -1546,7 +1546,7 @@ fn a_following_shared_writer_sees_another_handles_commits_and_cycles_without_ref
     );
     assert_eq!(following.last_error, None);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while b.size_on_disk() != a.size_on_disk() {
+    while b.log_bytes() != a.log_bytes() {
         assert!(Instant::now() < deadline, "b never moved to the new file");
         thread::sleep(Duration::from_millis(5));
     }
@@ -1620,10 +1620,10 @@ fn a_following_shared_writer_reports_a_named_frame_that_does_not_check() {
     let watcher = b.watch();
     bump(&a, 0, 1);
     reached.recv().unwrap();
-    let mut ends = vec![a.size_on_disk()];
+    let mut ends = vec![a.log_bytes()];
     for i in 2..=5 {
         bump(&a, 0, i);
-        ends.push(a.size_on_disk());
+        ends.push(a.log_bytes());
     }
     let middle = (ends[1] + ends[2]) / 2;
     let file = std::fs::OpenOptions::new()
@@ -2878,7 +2878,7 @@ fn churn(path: &Path, who: u64, ops: u64, seed: u64) -> Vec<String> {
                 let back = db.version().saturating_sub(1 + rng.below(3));
                 let result = db
                     .at(back)
-                    .and_then(|snapshot| db.restore(&snapshot).map(drop));
+                    .and_then(|snapshot| db.restore(&snapshot, "restore").map(drop));
                 note("restore", result);
             }
             8 => {

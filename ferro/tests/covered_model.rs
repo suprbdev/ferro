@@ -568,7 +568,8 @@ enum Op {
     Update(u8, Vec<Change>),
     Edit(u8, Vec<Change>),
     Retain(u8),
-    Drain(u8, u8),
+    TakeRange(u8, u8),
+    RemoveRange(u8, u8),
     Commit,
     Reopen,
     Compact,
@@ -582,7 +583,8 @@ fn op() -> impl Strategy<Value = Op> {
         6 => (0..IDS, changes()).prop_map(|(id, c)| Op::Update(id, c)),
         6 => (0..IDS, changes()).prop_map(|(id, c)| Op::Edit(id, c)),
         1 => any::<u8>().prop_map(Op::Retain),
-        1 => (0..IDS, 0..IDS + 1).prop_map(|(lo, hi)| Op::Drain(lo, hi)),
+        1 => (0..IDS, 0..IDS + 1).prop_map(|(lo, hi)| Op::TakeRange(lo, hi)),
+        1 => (0..IDS, 0..IDS + 1).prop_map(|(lo, hi)| Op::RemoveRange(lo, hi)),
         2 => Just(Op::Commit),
         1 => Just(Op::Reopen),
         1 => Just(Op::Compact),
@@ -658,10 +660,19 @@ fn run(ops: Vec<Op>) {
                 table.retain(|row| mask & (1 << row.id) != 0);
                 model.retain(|id, _| mask & (1 << id) != 0);
             }
-            Op::Drain(lo, hi) => {
-                let drained: Vec<u8> = table.drain_range(lo..hi).iter().map(|row| row.id).collect();
-                let wanted: Vec<u8> = model.range(lo..hi.max(lo)).map(|(id, _)| *id).collect();
-                assert_eq!(drained, wanted);
+            Op::TakeRange(lo, hi) => {
+                let wanted: BTreeMap<u8, Item> = model
+                    .range(lo..hi.max(lo))
+                    .map(|(id, row)| (*id, row.clone()))
+                    .collect();
+                let taken = table.take_range(lo..hi);
+                check(&taken, &wanted);
+                same_form(&taken, &wanted, step as u64);
+                model.retain(|id, _| !(lo..hi).contains(id));
+            }
+            Op::RemoveRange(lo, hi) => {
+                let wanted = model.range(lo..hi.max(lo)).count();
+                assert_eq!(table.remove_range(lo..hi), wanted);
                 model.retain(|id, _| !(lo..hi).contains(id));
             }
             Op::Commit => {

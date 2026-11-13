@@ -141,7 +141,7 @@ fn generated(corpus: &mut Corpus, dir: &Path) {
             root.insert(9, "with".into());
             ("with a message", ())
         })?;
-        db.restore(&db.at(1)?)?;
+        db.restore(&db.at(1)?, "restore v1")?;
         Ok(())
     });
     scenario::<Root>(corpus, dir, "branches", ROOT, |db| {

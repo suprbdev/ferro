@@ -363,9 +363,9 @@ fn settle(devices: &[Db<Field>]) {
         for to in 0..devices.len() {
             for from in 0..devices.len() {
                 if from != to {
-                    let before = devices[to].size_on_disk();
+                    let before = devices[to].log_bytes();
                     let outcome = exchange(devices, from, to);
-                    moved |= outcome != Outcome::UpToDate || devices[to].size_on_disk() != before;
+                    moved |= outcome != Outcome::UpToDate || devices[to].log_bytes() != before;
                 }
             }
         }

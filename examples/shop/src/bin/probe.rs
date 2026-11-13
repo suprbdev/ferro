@@ -196,7 +196,7 @@ fn snapshot_experiment() {
             std::hint::black_box(sum);
         }
         let held_count = held.len();
-        let file_before = db.size_on_disk();
+        let file_before = db.log_bytes();
         drop(held);
         drop(probe);
         println!(

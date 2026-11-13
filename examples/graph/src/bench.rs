@@ -471,7 +471,7 @@ fn counts_bench(out: &mut dyn Write, db: &Db<Graph>, commits: usize) -> Res<()> 
         ("with cached counts", true),
     ] {
         for (who, celeb) in [("celebrity followed", true), ("ordinary followed", false)] {
-            let before = db.size_on_disk();
+            let before = db.log_bytes();
             let mut lat = Vec::new();
             for _ in 0..commits {
                 let a = rng.below(n) as UserId;
@@ -489,7 +489,7 @@ fn counts_bench(out: &mut dyn Write, db: &Db<Graph>, commits: usize) -> Res<()> 
                 })?;
                 lat.push(t.elapsed().as_secs_f64() * 1e6);
             }
-            let bytes = (db.size_on_disk() - before) as f64 / lat.len() as f64;
+            let bytes = (db.log_bytes() - before) as f64 / lat.len() as f64;
             writeln!(
                 out,
                 "follow {who}, {label}: median {:.0} us, {:.0} bytes/commit",
@@ -557,7 +557,7 @@ fn fanout_bench(out: &mut dyn Write, db: &Db<Graph>, commits: usize) -> Res<()> 
         };
         for fanout in [false, true] {
             let mut lat = Vec::new();
-            let before = db.size_on_disk();
+            let before = db.log_bytes();
             let reps = if followers > 50_000 {
                 commits.min(3)
             } else {
@@ -574,7 +574,7 @@ fn fanout_bench(out: &mut dyn Write, db: &Db<Graph>, commits: usize) -> Res<()> 
                 out,
                 "post by user with {followers} followers, fanout-on-write={fanout}: median {:.2} ms, {:.0} KiB/commit",
                 median(&mut lat),
-                (db.size_on_disk() - before) as f64 / reps as f64 / 1024.0
+                (db.log_bytes() - before) as f64 / reps as f64 / 1024.0
             )?;
         }
     }

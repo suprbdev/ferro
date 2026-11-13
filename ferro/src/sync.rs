@@ -6,7 +6,7 @@
 //! same pull is three calls on bytes: the pulling side sends its [`Have`], the other answers with a
 //! [`Bundle`], and the pulling side lands it with [`Db::receive`](crate::Db::receive). Either way
 //! the other side's branch lands in this file as a remote branch, and this branch is brought up to
-//! it by a fast-forward or a merge, as the [`Outcome`] in the returned [`Pulled`] says. Every
+//! it by a fast-forward or a merge, as the [`Outcome`] in the returned [`Synced`] says. Every
 //! object received is checked by hash, and as the type that will read it, before any of it can be
 //! reached from the file. See
 //! [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
@@ -188,10 +188,10 @@ pub enum Outcome {
     Merged,
 }
 
-/// What a pull or receive did.
+/// What a pull, push or receive did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Pulled<R> {
+pub struct Synced<R> {
     /// How this branch was brought up to the remote one.
     pub outcome: Outcome,
     /// What the merge closure returned, if the outcome is [`Outcome::Merged`].
@@ -200,7 +200,8 @@ pub struct Pulled<R> {
     pub version: u64,
     /// The number of objects the bundle carried.
     pub objects: u64,
-    /// The bytes of the [`Have`] sent to the other side, which only a pull sends.
+    /// The bytes of the [`Have`] sent to the other side, which a pull or push sends and a receive
+    /// does not.
     pub sent_bytes: u64,
     /// The bytes of the bundle read.
     pub received_bytes: u64,
@@ -4720,9 +4721,9 @@ impl<T: Data> Db<T> {
     ///
     /// let have: Vec<u8> = phone.have()?.into();
     /// let bundle: Vec<u8> = laptop.bundle(&Have::from(have))?.into();
-    /// let pulled = phone.receive("laptop", &Bundle::from(bundle), merge)?;
+    /// let synced = phone.receive("laptop", &Bundle::from(bundle), merge)?;
     ///
-    /// assert_eq!(pulled.outcome, Outcome::FastForward);
+    /// assert_eq!(synced.outcome, Outcome::FastForward);
     /// assert_eq!(phone.read().get("anvil").as_deref(), Some(&5));
     /// # Ok(())
     /// # }
@@ -4814,7 +4815,7 @@ impl<T: Data> Db<T> {
     /// If this file prunes or drops what the bundle builds on while it is sent, nothing lands, and
     /// the pull sends a fresh have and tries again, up to three attempts in all. That is found
     /// before `merge` can run, so `merge` never runs for an attempt that is tried again, only for
-    /// the one that landed, as often as [`Db::merge_with`] runs it, and the [`Pulled`] describes
+    /// the one that landed, as often as [`Db::merge_with`] runs it, and the [`Synced`] describes
     /// that attempt.
     ///
     /// # Errors
@@ -4896,7 +4897,7 @@ impl<T: Data> Db<T> {
         from: &Db<T>,
         remote: &str,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<Pulled<R>> {
+    ) -> Result<Synced<R>> {
         self.try_pull::<R, S, Error>(from, remote, infallible(merge))
     }
 
@@ -4919,7 +4920,7 @@ impl<T: Data> Db<T> {
         from: &Db<T>,
         remote: &str,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
-    ) -> std::result::Result<Pulled<R>, E> {
+    ) -> std::result::Result<Synced<R>, E> {
         check_remote(remote, self.branch_name())?;
         let mut attempts = 1;
         let (arrival, sent_bytes) = loop {
@@ -4952,7 +4953,7 @@ impl<T: Data> Db<T> {
         to: &Db<T>,
         remote: &str,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<Pulled<R>> {
+    ) -> Result<Synced<R>> {
         to.pull(self, remote, merge)
     }
 
@@ -4971,7 +4972,7 @@ impl<T: Data> Db<T> {
         to: &Db<T>,
         remote: &str,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
-    ) -> std::result::Result<Pulled<R>, E> {
+    ) -> std::result::Result<Synced<R>, E> {
         to.try_pull(self, remote, merge)
     }
 
@@ -5021,7 +5022,7 @@ impl<T: Data> Db<T> {
         remote: &str,
         bundle: &Bundle,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<Pulled<R>> {
+    ) -> Result<Synced<R>> {
         self.try_receive::<R, S, Error>(remote, bundle, infallible(merge))
     }
 
@@ -5040,7 +5041,7 @@ impl<T: Data> Db<T> {
         remote: &str,
         bundle: &Bundle,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
-    ) -> std::result::Result<Pulled<R>, E> {
+    ) -> std::result::Result<Synced<R>, E> {
         self.try_receive_from(remote, bundle.as_bytes(), merge)
     }
 
@@ -5072,12 +5073,12 @@ impl<T: Data> Db<T> {
     ///
     /// let mut wire = Vec::new();
     /// let sent = laptop.bundle_to(&phone.have()?, &mut wire)?;
-    /// let pulled = phone.receive_from("laptop", wire.as_slice(), |readings, base, theirs| {
+    /// let synced = phone.receive_from("laptop", wire.as_slice(), |readings, base, theirs| {
     ///     ("sync", readings.merge(base, theirs, |conflict| conflict.keep_theirs()))
     /// })?;
     ///
-    /// assert_eq!(pulled.received_bytes, sent);
-    /// assert_eq!(pulled.outcome, Outcome::FastForward);
+    /// assert_eq!(synced.received_bytes, sent);
+    /// assert_eq!(synced.outcome, Outcome::FastForward);
     /// # Ok(())
     /// # }
     /// ```
@@ -5086,7 +5087,7 @@ impl<T: Data> Db<T> {
         remote: &str,
         input: impl Read,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> (S, R),
-    ) -> Result<Pulled<R>> {
+    ) -> Result<Synced<R>> {
         self.try_receive_from::<R, S, Error>(remote, input, infallible(merge))
     }
 
@@ -5104,7 +5105,7 @@ impl<T: Data> Db<T> {
         remote: &str,
         input: impl Read,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
-    ) -> std::result::Result<Pulled<R>, E> {
+    ) -> std::result::Result<Synced<R>, E> {
         self.caught_up()?;
         let arrival = self.land_from(remote, input)?;
         self.bring_up(remote, arrival, merge)
@@ -5179,12 +5180,12 @@ impl<T: Data> Db<T> {
         remote: &str,
         arrival: Arrival,
         merge: impl FnMut(&mut T, &Snapshot<T>, &Snapshot<T>) -> std::result::Result<(S, R), E>,
-    ) -> std::result::Result<Pulled<R>, E> {
+    ) -> std::result::Result<Synced<R>, E> {
         let (outcome, value) = match arrival.landed {
             Some(_ours) => self.integrate(remote, merge, arrival.together)?,
             None => (Outcome::UpToDate, None),
         };
-        Ok(Pulled {
+        Ok(Synced {
             outcome,
             value,
             version: self.version(),

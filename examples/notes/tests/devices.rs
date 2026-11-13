@@ -146,7 +146,7 @@ fn a_repeated_sync_sends_no_objects_and_writes_nothing() {
     laptop.add("one", &[]).unwrap();
     phone.add("two", &[]).unwrap();
     laptop.sync(phone).unwrap();
-    let sizes = (laptop.db().size_on_disk(), phone.db().size_on_disk());
+    let sizes = (laptop.db().log_bytes(), phone.db().log_bytes());
     for _ in 0..3 {
         let again = phone.sync(laptop).unwrap();
         assert_eq!(again.objects(), 0, "{:?}", again.steps);
@@ -156,10 +156,7 @@ fn a_repeated_sync_sends_no_objects_and_writes_nothing() {
                 .iter()
                 .all(|step| step.pulled.outcome == Outcome::UpToDate)
         );
-        assert_eq!(
-            (laptop.db().size_on_disk(), phone.db().size_on_disk()),
-            sizes
-        );
+        assert_eq!((laptop.db().log_bytes(), phone.db().log_bytes()), sizes);
     }
 }
 
@@ -243,15 +240,9 @@ fn three_devices_converge_whichever_order_they_sync_in() {
         }
         gossip(&all);
         assert_converged(&all);
-        let sizes: Vec<u64> = all
-            .iter()
-            .map(|device| device.db().size_on_disk())
-            .collect();
+        let sizes: Vec<u64> = all.iter().map(|device| device.db().log_bytes()).collect();
         gossip(&all);
-        let after: Vec<u64> = all
-            .iter()
-            .map(|device| device.db().size_on_disk())
-            .collect();
+        let after: Vec<u64> = all.iter().map(|device| device.db().log_bytes()).collect();
         assert_eq!(sizes, after, "order {round}");
     }
 }
@@ -306,7 +297,7 @@ fn a_sync_after_small_edits_on_a_large_notebook_moves_little() {
     }
     phone.tag(&ids[0], "phone").unwrap();
     let synced = phone.sync(laptop).unwrap();
-    let file = laptop.db().size_on_disk();
+    let file = laptop.db().log_bytes();
     println!(
         "file {file} bytes, clone {} bytes, sync after {} edits {} bytes in {} objects",
         cloned.bytes(),

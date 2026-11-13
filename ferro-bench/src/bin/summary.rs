@@ -128,7 +128,7 @@ fn run<S: Summary<u64, i64>>(
     db.update(|root| root.extend((0..n).map(|i| (mix(i), amount(i)))))
         .unwrap();
     let bulk_ns = started.elapsed().as_nanos() as f64 / n as f64;
-    let bulk = db.size_on_disk() as f64 / n as f64;
+    let bulk = db.log_bytes() as f64 / n as f64;
     let db = match cache {
         Some(bytes) => {
             drop(db);
@@ -140,7 +140,7 @@ fn run<S: Summary<u64, i64>>(
         }
         None => db,
     };
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     let started = Instant::now();
     for i in 0..COMMITS {
         db.update(|root| {
@@ -149,15 +149,15 @@ fn run<S: Summary<u64, i64>>(
         .unwrap();
     }
     let insert_ns = started.elapsed().as_nanos() as f64 / COMMITS as f64;
-    let inserted = (db.size_on_disk() - before) as f64 / COMMITS as f64;
-    let before = db.size_on_disk();
+    let inserted = (db.log_bytes() - before) as f64 / COMMITS as f64;
+    let before = db.log_bytes();
     for i in 0..COMMITS {
         db.update(|root| {
             root.insert(mix(i), amount(i) + 1);
         })
         .unwrap();
     }
-    let updated = (db.size_on_disk() - before) as f64 / COMMITS as f64;
+    let updated = (db.log_bytes() - before) as f64 / COMMITS as f64;
     let snapshot = db.read();
     let started = Instant::now();
     let mut found = 0u64;

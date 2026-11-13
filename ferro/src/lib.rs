@@ -119,6 +119,6 @@ pub use map::{Change, Conflict, Cursor, Map, Summary, Val};
 pub use prefix::Prefix;
 pub use set::Set;
 pub use store::{Durability, FILE_FORMAT};
-pub use sync::{Bundle, Have, Outcome, Pulled, SYNC_FORMAT};
+pub use sync::{Bundle, Have, Outcome, SYNC_FORMAT, Synced};
 pub use table::{Record, RowMut, Table, TableData, Taken};
 pub use watch::{Changed, Closer, Watcher};

@@ -92,7 +92,7 @@ fn main() -> ferro::Result<()> {
         println!("v{} {}", commit.version, commit.message);
     }
 
-    db.restore(&db.at(1)?)?;
+    db.restore(&db.at(1)?, "restore v1")?;
     println!("after restore: {} orders", db.read().orders.len());
     Ok(())
 }

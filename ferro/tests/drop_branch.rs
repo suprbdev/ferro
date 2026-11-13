@@ -97,7 +97,7 @@ fn another_handle_keeps_reading_but_cannot_write_or_resurrect_the_branch() {
     ));
     assert!(matches!(side.fork("child"), Err(Error::NoBranch(_))));
     assert!(matches!(
-        side.restore(&side.at(1).unwrap()),
+        side.restore(&side.at(1).unwrap(), "restore"),
         Err(Error::NoBranch(_))
     ));
     assert_eq!(db.branches(), vec!["main".to_string()]);

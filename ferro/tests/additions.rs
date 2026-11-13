@@ -66,10 +66,10 @@ fn head_hash_covers_the_whole_chain_and_stands_for_it_later() {
     .unwrap();
     let second = db.head_hash().unwrap();
     assert_ne!(first, second);
-    assert_eq!(db.log().hash_at(&1), Some(first));
-    assert_eq!(db.log().hash_at(&2), Some(second));
-    assert_eq!(db.log().hash_at(&3), None);
-    assert_eq!(db.log().hash_at(&0), None);
+    assert_eq!(db.log().hash_at(1), Some(first));
+    assert_eq!(db.log().hash_at(2), Some(second));
+    assert_eq!(db.log().hash_at(3), None);
+    assert_eq!(db.log().hash_at(0), None);
 
     let fork = db.fork("side").unwrap();
     assert_eq!(fork.head_hash(), Some(second));
@@ -78,19 +78,19 @@ fn head_hash_covers_the_whole_chain_and_stands_for_it_later() {
     })
     .unwrap();
     assert_ne!(fork.head_hash(), Some(second));
-    assert_eq!(fork.log().hash_at(&2), Some(second));
+    assert_eq!(fork.log().hash_at(2), Some(second));
     drop(fork);
     drop(db);
 
     admin::compact(&path, Keep::All).unwrap();
     let db = fast().open::<Map<u64, u64>>(&path).unwrap();
     assert_eq!(db.head_hash(), Some(second));
-    assert_eq!(db.log().hash_at(&1), Some(first));
+    assert_eq!(db.log().hash_at(1), Some(first));
     drop(db);
 
     admin::compact(&path, Keep::Last(1)).unwrap();
     let db = fast().open::<Map<u64, u64>>(&path).unwrap();
-    assert_eq!(db.log().hash_at(&1), None);
+    assert_eq!(db.log().hash_at(1), None);
     assert_eq!(db.head_hash(), Some(second));
 }
 

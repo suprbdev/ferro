@@ -194,7 +194,7 @@ fn queued_commits_stay_invisible_until_their_sync_returns() {
     settle_queue();
     assert_eq!(db.version(), 1);
     assert_eq!(counter(&db.read()), 1);
-    assert!(db.log().get(&2).is_none());
+    assert!(db.log().get(2).is_none());
     assert!(db.at(2).is_err());
     assert!(events.try_recv().is_err());
     assert!(!outside.refresh().unwrap());
@@ -529,7 +529,7 @@ fn reservation_is_invisible_to_readers_and_released_on_close() {
         root.insert(0, 2);
     })
     .unwrap();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     assert!(
         fs::metadata(&path).unwrap().len() > size,
         "no space was reserved"

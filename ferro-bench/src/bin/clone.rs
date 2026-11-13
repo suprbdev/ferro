@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ferro::{Db, Durability, Have, Map, Options, Pulled, Snapshot};
+use ferro::{Db, Durability, Have, Map, Options, Snapshot, Synced};
 
 type Root = Map<u64, String>;
 
@@ -325,7 +325,7 @@ fn build(dir: &Path, args: &[String]) {
     );
 }
 
-fn report(what: &str, pulled: &Pulled<()>, seconds: f64) {
+fn report(what: &str, pulled: &Synced<()>, seconds: f64) {
     println!(
         "{what}: {:?}, {} bytes in {} objects, {:.3} s, peak RSS {:.1} MiB, peak heap {:.1} MiB",
         pulled.outcome,
@@ -475,7 +475,7 @@ fn write_bundle(source: &Db<Root>, have: &Have, path: &Path) -> u64 {
     source.bundle_to(have, out).unwrap()
 }
 
-fn read_bundle(clone: &Db<Root>, path: &Path) -> Pulled<()> {
+fn read_bundle(clone: &Db<Root>, path: &Path) -> Synced<()> {
     receive_bundle(clone, bundle_file(path))
 }
 
@@ -483,7 +483,7 @@ fn bundle_file(path: &Path) -> BufReader<File> {
     BufReader::new(File::open(path).unwrap())
 }
 
-fn receive_bundle(clone: &Db<Root>, input: BufReader<File>) -> Pulled<()> {
+fn receive_bundle(clone: &Db<Root>, input: BufReader<File>) -> Synced<()> {
     clone.receive_from("source", input, refuse).unwrap()
 }
 

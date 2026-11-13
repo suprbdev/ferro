@@ -128,9 +128,9 @@ fn merge_records_ride_in_the_steps_of_their_branch() {
     ours.pull(&theirs, "theirs", merge).unwrap();
     let grown: Vec<u64> = (0..20)
         .map(|round| {
-            let before = ours.size_on_disk();
+            let before = ours.log_bytes();
             put(&ours, 10 + round, round);
-            ours.size_on_disk() - before
+            ours.log_bytes() - before
         })
         .collect();
     let plain: Db<Root> = options().open(dir.path().join("plain.ferro")).unwrap();
@@ -138,9 +138,9 @@ fn merge_records_ride_in_the_steps_of_their_branch() {
     put(&plain, 2, 2);
     let alone: Vec<u64> = (0..20)
         .map(|round| {
-            let before = plain.size_on_disk();
+            let before = plain.log_bytes();
             put(&plain, 10 + round, round);
-            plain.size_on_disk() - before
+            plain.log_bytes() - before
         })
         .collect();
     let recorded: u64 = grown.iter().sum();
@@ -246,10 +246,10 @@ fn an_open_that_fails_on_the_table_under_its_steps_releases_the_file() {
         let db: Db<Root> = options().open(&path).unwrap();
         put(&db, 0, 0);
         let branches: Vec<Db<Root>> = (0..24).map(|b| db.fork(&name(b)).unwrap()).collect();
-        let start = db.size_on_disk();
+        let start = db.log_bytes();
         db.fork("table").unwrap();
         db.drop_branch("table").unwrap();
-        let end = db.size_on_disk();
+        let end = db.log_bytes();
         for branch in &branches {
             put(branch, 1, 1);
         }

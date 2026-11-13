@@ -190,10 +190,7 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
             })
             .unwrap();
         });
-        report.set(
-            "map_bulk_bytes_per_key",
-            db.size_on_disk() as f64 / n as f64,
-        );
+        report.set("map_bulk_bytes_per_key", db.log_bytes() as f64 / n as f64);
         let snapshot = db.read();
         for _ in 0..2 {
             report.timed("map_get_warm", READ_SAMPLES, || {
@@ -210,7 +207,7 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
                 assert!(snapshot.range(mix(i)..).take(1000).count() > 0);
             }
         });
-        let before = db.size_on_disk();
+        let before = db.log_bytes();
         report.timed("map_commit_fsync", FSYNC_COMMITS, || {
             for i in 0..FSYNC_COMMITS {
                 db.update(|root| {
@@ -219,7 +216,7 @@ fn map_workload(report: &mut Report, dir: &Path, n: u64) {
                 .unwrap();
             }
         });
-        let after = db.size_on_disk();
+        let after = db.log_bytes();
         report.set(
             "map_bytes_per_commit",
             (after - before) as f64 / FSYNC_COMMITS as f64,
@@ -290,7 +287,7 @@ fn table_workload(report: &mut Report, dir: &Path, n: u64) {
             .unwrap();
         }
     });
-    report.set("table_bytes_per_row", db.size_on_disk() as f64 / n as f64);
+    report.set("table_bytes_per_row", db.log_bytes() as f64 / n as f64);
     let snapshot = db.read();
     report.timed("table_get", READ_SAMPLES, || {
         for i in 0..READ_SAMPLES {
@@ -319,7 +316,7 @@ fn table_workload(report: &mut Report, dir: &Path, n: u64) {
             assert_eq!(snapshot.accounts.by_country_counts().len(), 8);
         }
     });
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     report.timed("table_update_fsync", FSYNC_COMMITS, || {
         for i in 0..FSYNC_COMMITS {
             let id = mix(i) % n;
@@ -329,7 +326,7 @@ fn table_workload(report: &mut Report, dir: &Path, n: u64) {
             .unwrap();
         }
     });
-    let after = db.size_on_disk();
+    let after = db.log_bytes();
     report.set(
         "table_bytes_per_update",
         (after - before) as f64 / FSYNC_COMMITS as f64,

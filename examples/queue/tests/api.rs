@@ -534,7 +534,7 @@ fn retention_keeps_a_busy_queue_small_without_stopping_it() {
         assert_eq!(leased.job.id, job);
         q.ack(leased.lease()).unwrap();
         done += 1;
-        peak = peak.max(q.size_on_disk());
+        peak = peak.max(q.log_bytes());
         assert!(done < 200_000, "no cycle ran: {:?}", q.space().unwrap());
     }
     assert!(q.space().unwrap().last_error.is_none());

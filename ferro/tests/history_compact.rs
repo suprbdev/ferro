@@ -128,7 +128,7 @@ fn build(path: &std::path::Path, steps: &[Step]) -> Vec<BranchState> {
                 if let Some(db) = &dbs[*b]
                     && let Ok(snapshot) = db.at(*v % (db.version() + 1))
                 {
-                    db.restore(&snapshot).unwrap();
+                    db.restore(&snapshot, "restore").unwrap();
                 }
             }
             Step::Pause => std::thread::sleep(Duration::from_millis(3)),
@@ -177,7 +177,7 @@ fn check_after(path: &std::path::Path, before: &[BranchState], keep: Keep) {
                 let snapshot = db.at(version.version).unwrap();
                 assert_eq!(dump(&snapshot), version.content);
                 assert_eq!(snapshot.root_hash(), version.hash);
-                let commit: Arc<Commit> = log.get(&version.version).unwrap();
+                let commit: Arc<Commit> = log.get(version.version).unwrap();
                 assert_eq!(commit.time_ms, version.time_ms);
                 assert_eq!(commit.message, version.message);
                 assert_eq!(commit.restored, version.restored);

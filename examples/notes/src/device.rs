@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ferro::{Db, Options, Outcome, Pulled};
+use ferro::{Db, Options, Outcome};
 
 use crate::model::{Note, Notes, Stamp, merge};
 
@@ -54,7 +54,7 @@ pub type Result<T> = std::result::Result<T, NotesError>;
 pub struct Step {
     pub from: String,
     pub into: String,
-    pub pulled: Pulled<usize>,
+    pub pulled: ferro::Synced<usize>,
 }
 
 /// The pulls a [`Device::sync`] made, in order.

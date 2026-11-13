@@ -202,7 +202,7 @@ fn run(ops: Vec<Op>) {
                 sides[s].remove(&id);
             }
             Op::Drain(s, a, b) => {
-                sides[s].drain_range(a.min(b)..a.max(b));
+                sides[s].remove_range(a.min(b)..a.max(b));
             }
             Op::Merge(s, answers, sync) => {
                 let theirs = sides[1 - s].clone();

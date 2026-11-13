@@ -505,21 +505,21 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
     {
         let db = open_map(&path, Durability::Buffered);
         let file = File::open(&path).unwrap();
-        let start = db.size_on_disk();
+        let start = db.log_bytes();
         db.update(|root| {
             root.insert(mix(next), "x".to_string());
         })
         .unwrap();
         next += 1;
-        before_root = root_ptr(&path, start, db.size_on_disk());
+        before_root = root_ptr(&path, start, db.log_bytes());
         for _ in 0..commits {
-            let start = db.size_on_disk();
+            let start = db.log_bytes();
             db.update(|root| {
                 root.insert(mix(next), "x".to_string());
             })
             .unwrap();
             next += 1;
-            framed.push((0, frame_of(&file, start, db.size_on_disk())));
+            framed.push((0, frame_of(&file, start, db.log_bytes())));
         }
     }
     deltas(&path, &mut framed, before_root);
@@ -565,7 +565,7 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
         println!("  outside the closure, commit        {}", summary(&rest));
         println!("  hash_of the dirty root, no write   {}", summary(&hashed));
         for k in [1u64, 16, 256, 4096, 65536] {
-            let start = db.size_on_disk();
+            let start = db.log_bytes();
             db.update(|root| {
                 for _ in 0..k {
                     root.insert(mix(next), "x".to_string());
@@ -573,7 +573,7 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
                 }
             })
             .unwrap();
-            let frame = frame_of(&file, start, db.size_on_disk());
+            let frame = frame_of(&file, start, db.log_bytes());
             println!(
                 "  checkpoint of {k:>5} commits: tree {:>9} bytes, {:>6.0} per commit",
                 frame.parts.tree + frame.parts.root,
@@ -610,12 +610,12 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
             fixed.push(Sample::now(counter, began).since(start).minus(inside));
         }
     }
-    let start = small.size_on_disk();
+    let start = small.log_bytes();
     small.update(|root| root.insert(3, 3)).unwrap();
     println!(
         "  a 16-key map, outside the closure  {}  bytes {}",
         summary(&fixed),
-        small.size_on_disk() - start
+        small.log_bytes() - start
     );
     drop(small);
     let fsync_rounds = number("--fsync", 300);
@@ -623,7 +623,7 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
         let large = open_map(&path, Durability::Fsync);
         let small = Options::new().open::<Map<u64, u64>>(&tiny).unwrap();
         let (mut big, mut little) = (Vec::new(), Vec::new());
-        let (big_start, little_start) = (large.size_on_disk(), small.size_on_disk());
+        let (big_start, little_start) = (large.log_bytes(), small.log_bytes());
         for i in 0..fsync_rounds {
             let began = Instant::now();
             large
@@ -638,9 +638,9 @@ fn map_workload(dir: &Path, n: u64, commits: u64, counter: &Counter) {
         println!(
             "  fsync commit p50: 1M-key map {:.1} us at {} bytes, 16-key map {:.1} us at {} bytes",
             median(big),
-            (large.size_on_disk() - big_start) / fsync_rounds,
+            (large.log_bytes() - big_start) / fsync_rounds,
             median(little),
-            (small.size_on_disk() - little_start) / fsync_rounds
+            (small.log_bytes() - little_start) / fsync_rounds
         );
     }
 }
@@ -766,13 +766,10 @@ fn booking_workload(dir: &Path, pairs: u64, warm: u64, counter: &Counter) {
     let before = db.read().commit().root.unwrap();
     let mut framed: Vec<(usize, Framed)> = Vec::new();
     script.drive(pairs, |step| {
-        let start = db.size_on_disk();
+        let start = db.log_bytes();
         let done = commit(&db, step, |_| {});
         if done.is_some() {
-            framed.push((
-                step.kind() as usize,
-                frame_of(&file, start, db.size_on_disk()),
-            ));
+            framed.push((step.kind() as usize, frame_of(&file, start, db.log_bytes())));
         }
         done
     });
@@ -849,16 +846,16 @@ fn booking_workload(dir: &Path, pairs: u64, warm: u64, counter: &Counter) {
             bumps.push(Sample::now(counter, began).since(start).minus(inside));
         }
     }
-    let start = db.size_on_disk();
+    let start = db.log_bytes();
     db.update(|hotels| hotels.next_payment += 1).unwrap();
     println!(
         "  a root field alone, outside the closure  {}  bytes {}",
         summary(&bumps),
-        db.size_on_disk() - start
+        db.log_bytes() - start
     );
     for k in [1u64, 4, 16, 64, 256, 1024, 4096] {
         let mut ops = 0;
-        let start = db.size_on_disk();
+        let start = db.log_bytes();
         let mut group = script.clone();
         group.rng = fastrand::Rng::with_seed(k);
         db.update(|hotels| {
@@ -874,7 +871,7 @@ fn booking_workload(dir: &Path, pairs: u64, warm: u64, counter: &Counter) {
             }
         })
         .unwrap();
-        let frame = frame_of(&file, start, db.size_on_disk());
+        let frame = frame_of(&file, start, db.log_bytes());
         println!(
             "  checkpoint of {ops:>5} writes: tree {:>9} bytes, {:>6.0} per write",
             frame.parts.tree + frame.parts.root,

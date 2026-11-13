@@ -289,7 +289,7 @@ fn a_hostile_stream_of_large_objects_costs_one_object_at_a_time() {
         root.insert(1, "one".to_string());
     })
     .unwrap();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     let bundle = carries_large_objects(48);
     let len = bundle.as_bytes().len();
     let peak = peak_of(&db, &bundle);
@@ -298,7 +298,7 @@ fn a_hostile_stream_of_large_objects_costs_one_object_at_a_time() {
         peak < 8 * MIB,
         "a stream of {len} bytes took {peak} bytes of heap"
     );
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
     assert_eq!(db.version(), 1);
 }

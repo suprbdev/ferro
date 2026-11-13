@@ -416,7 +416,7 @@ fn common_ancestor_survives_a_restore_that_makes_the_logs_differ() {
         bump(&main, 0, i);
     }
     let side = main.fork("side").unwrap();
-    main.restore(&main.at(1).unwrap()).unwrap();
+    main.restore(&main.at(1).unwrap(), "restore").unwrap();
     bump(&side, 1, 5);
     assert_eq!(main.version(), 4);
     assert_eq!(side.version(), 4);

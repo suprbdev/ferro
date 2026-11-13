@@ -4313,7 +4313,7 @@ impl<T: Data> Db<T> {
     /// The file itself can be up to 4 MiB longer, by zeroes a writer preallocated past the log,
     /// and longer still by the staging frames of a large receive past the newest commit, as
     /// [`Space::file_bytes`] from [`Db::space`], its length, describes.
-    pub fn size_on_disk(&self) -> u64 {
+    pub fn log_bytes(&self) -> u64 {
         self.shared.store().size()
     }
 
@@ -4447,7 +4447,7 @@ impl<T: Data> Db<T> {
     /// let (version, anchor) = (db.version(), db.head_hash());
     ///
     /// db.update(|balance| *balance = 80)?;
-    /// assert_eq!(db.log().hash_at(&version), anchor);
+    /// assert_eq!(db.log().hash_at(version), anchor);
     /// db.verify()?;
     /// # Ok(())
     /// # }
@@ -5169,7 +5169,7 @@ impl<T: Data> Db<T> {
     /// assert_eq!(*db.at(1)?, 10);
     /// assert!(matches!(db.at(3), Err(Error::NoVersion(3))));
     ///
-    /// db.restore(&db.at(1)?)?;
+    /// db.restore(&db.at(1)?, "back to 10")?;
     /// assert_eq!(*db.read(), 10);
     /// assert_eq!(db.read().commit().restored, Some(1));
     /// # Ok(())
@@ -5221,8 +5221,7 @@ impl<T: Data> Db<T> {
         }
     }
 
-    /// Commits the value of `snapshot` as a new version, with the message `restore v` and its
-    /// version.
+    /// Commits the value of `snapshot` as a new version, with `message`.
     ///
     /// History is not rewritten: the new commit records the version it restored in
     /// [`Commit::restored`], and every version between stays readable. The snapshot can come from
@@ -5234,17 +5233,7 @@ impl<T: Data> Db<T> {
     /// # Errors
     ///
     /// As for [`Db::commit`].
-    pub fn restore(&self, snapshot: &Snapshot<T>) -> Result<Committed<()>> {
-        let message = format!("restore v{}", snapshot.commit.version);
-        self.restore_with(snapshot, message)
-    }
-
-    /// Commits the value of `snapshot` as a new version, like [`Db::restore`], with `message`.
-    ///
-    /// # Errors
-    ///
-    /// As for [`Db::commit`].
-    pub fn restore_with(
+    pub fn restore(
         &self,
         snapshot: &Snapshot<T>,
         message: impl Into<String>,

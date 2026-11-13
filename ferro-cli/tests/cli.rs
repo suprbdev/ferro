@@ -147,7 +147,7 @@ fn info_and_space_report_the_length_of_a_file_a_writer_has_open() {
     let space = admin::space(&path).unwrap();
     assert_eq!(admin::info(&path).unwrap().file_bytes, on_disk);
     assert_eq!(space.file_bytes, on_disk);
-    assert_eq!(space.log_bytes, db.size_on_disk());
+    assert_eq!(space.log_bytes, db.log_bytes());
     let own = db.space().unwrap();
     assert!(own.live_bytes <= own.log_bytes, "{own:?}");
     assert!(own.log_bytes <= own.file_bytes, "{own:?}");

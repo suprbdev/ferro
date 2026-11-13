@@ -199,7 +199,7 @@ pub fn exercise<T: Probe>(db: &Db<T>, read_only: bool) {
     guarded(|| log.last());
     guarded(|| log.first());
     let version = db.version();
-    guarded(|| log.hash_at(&version));
+    guarded(|| log.hash_at(version));
     let probes = [
         0,
         1,
@@ -211,7 +211,7 @@ pub fn exercise<T: Probe>(db: &Db<T>, read_only: bool) {
         u64::MAX,
     ];
     for at in probes {
-        let _ = log.try_get(&at);
+        let _ = log.try_get(at);
         if let Ok(old) = db.at(at) {
             let mut small = 200;
             guarded(|| old.probe(&mut small));

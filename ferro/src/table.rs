@@ -1282,37 +1282,85 @@ impl<T: Record> Table<T> {
         );
     }
 
-    /// Removes the rows whose key lies in `range` and returns them in key order.
+    /// Removes the rows whose key lies in `range` and returns them as a table of their own, with
+    /// every index built.
     ///
-    /// Cutting the rows out takes O(log n) nodes, but every removed row is read and its index
-    /// entries removed, as one batch for each index, so the whole costs O(rows removed).
-    pub fn drain_range<Q, R>(&mut self, range: R) -> Vec<Val<T>>
+    /// The rows' tree is cut along the two ends of the range, which touches O(log n) nodes, but
+    /// every row that moves is read to move its index entries, as one batch for each index of
+    /// either table, so the whole costs O(rows moved). A range that holds no key leaves the table
+    /// as it was.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Event {
+    ///     #[key]
+    ///     at: u64,
+    ///     #[index]
+    ///     kind: String,
+    /// }
+    ///
+    /// let mut events: Table<Event> = Table::new();
+    /// for at in 0..6 {
+    ///     let kind = if at % 2 == 0 { "click" } else { "view" };
+    ///     events.insert(Event { at, kind: kind.into() });
+    /// }
+    ///
+    /// let old = events.take_range(..3);
+    /// assert_eq!(old.keys().collect::<Vec<_>>(), [0, 1, 2]);
+    /// assert_eq!(old.by_kind("click").len(), 2);
+    /// assert_eq!(events.by_kind("click").len(), 1);
+    /// assert_eq!(events.remove_range(4..), 2);
+    /// assert_eq!(events.keys().collect::<Vec<_>>(), [3]);
+    /// ```
+    pub fn take_range<Q, R>(&mut self, range: R) -> Table<T>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
-        let span = (range.start_bound(), range.end_bound());
-        let drained: Vec<Val<T>> = self
-            .0
-            .rows()
-            .range::<Q, _>(span)
-            .map(|(_, row)| row)
-            .collect();
-        if drained.is_empty() {
-            return drained;
+        let mut kept = self.0.rows().clone();
+        let moved = kept.take_range::<Q, R>(range);
+        let mut taken = Table::new();
+        if moved.is_empty() {
+            return taken;
         }
-        self.0.write(
-            &mut |stage| {
-                for row in &drained {
-                    stage(Some(row), None);
-                }
-            },
-            &mut |rows| {
-                rows.remove_range::<Q, _>(span);
-            },
+        taken.0.write(
+            &mut |stage| moved.for_each(|_, row| stage(None, Some(row))),
+            &mut |rows| *rows = moved.clone(),
         );
-        drained
+        self.cut(kept, &moved);
+        taken
+    }
+
+    /// Removes the rows whose key lies in `range` and returns how many there were.
+    ///
+    /// The rows' tree is cut along the two ends of the range, which touches O(log n) nodes, but
+    /// every removed row is read to remove its index entries, as one batch for each index, so the
+    /// whole costs O(rows removed).
+    pub fn remove_range<Q, R>(&mut self, range: R) -> usize
+    where
+        T::Key: Borrow<Q>,
+        Q: Ord + ?Sized,
+        R: RangeBounds<Q>,
+    {
+        let mut kept = self.0.rows().clone();
+        let moved = kept.take_range::<Q, R>(range);
+        if moved.is_empty() {
+            return 0;
+        }
+        self.cut(kept, &moved);
+        moved.len()
+    }
+
+    fn cut(&mut self, kept: Rows<T>, moved: &Rows<T>) {
+        self.0.write(
+            &mut |stage| moved.for_each(|_, row| stage(Some(row), None)),
+            &mut |rows| *rows = kept.clone(),
+        );
     }
 
     /// The rows added, removed and changed between this table and `newer`, in key order.

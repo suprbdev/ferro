@@ -89,7 +89,7 @@ fn prefill(queue: &Queue, depth: u64) {
     println!(
         "prefill depth={depth} took={:.1}s file_mib={:.1}",
         start.elapsed().as_secs_f64(),
-        queue.size_on_disk() as f64 / 1048576.0
+        queue.log_bytes() as f64 / 1048576.0
     );
 }
 
@@ -107,7 +107,7 @@ fn throughput(args: &HashMap<String, String>) {
     }
     for workers in list {
         let stop = Arc::new(AtomicBool::new(false));
-        let size_before = queue.size_on_disk();
+        let size_before = queue.log_bytes();
         let version_before = queue.version();
         let start = Instant::now();
         let mut handles = Vec::new();
@@ -147,7 +147,7 @@ fn throughput(args: &HashMap<String, String>) {
             ack.extend(a);
         }
         let elapsed = start.elapsed().as_secs_f64();
-        let grown = queue.size_on_disk() - size_before;
+        let grown = queue.log_bytes() - size_before;
         let commits = queue.version() - version_before;
         println!(
             "throughput depth={depth} workers={workers} jobs={jobs} jobs_per_s={:.0} commits_per_s={:.0} bytes_per_job={:.0} bytes_per_commit={:.0}",
@@ -162,7 +162,7 @@ fn throughput(args: &HashMap<String, String>) {
     }
     println!(
         "final file_mib={:.1} live_jobs={}",
-        queue.size_on_disk() as f64 / 1048576.0,
+        queue.log_bytes() as f64 / 1048576.0,
         queue.db().read().jobs.len()
     );
 }
@@ -177,49 +177,49 @@ fn growth(args: &HashMap<String, String>) {
     let floor_path = fresh("floor.ferro");
     {
         let db = Db::<Counter>::open(&floor_path).unwrap();
-        let before = db.size_on_disk();
+        let before = db.log_bytes();
         let start = Instant::now();
         for _ in 0..2000 {
             db.commit("bump", |c| c.n += 1).unwrap();
         }
         println!(
             "floor trivial_commit bytes_per_commit={:.0} commits_per_s={:.0}",
-            (db.size_on_disk() - before) as f64 / 2000.0,
+            (db.log_bytes() - before) as f64 / 2000.0,
             2000.0 / start.elapsed().as_secs_f64()
         );
     }
     for batch in [1u64, 10, 100] {
         let path = fresh(&format!("growth-{batch}.ferro"));
         let queue = open(&path);
-        let base = queue.size_on_disk();
+        let base = queue.log_bytes();
         let (mut enq_b, mut lease_b, mut ack_b) = (0u64, 0u64, 0u64);
         let (mut enq_t, mut lease_t, mut ack_t) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let mut done = 0;
         let start = Instant::now();
         while done < total {
-            let s0 = queue.size_on_disk();
+            let s0 = queue.log_bytes();
             let t = Instant::now();
             let specs = (0..batch)
                 .map(|i| NewJob::new("q", format!("job-{}", done + i)))
                 .collect();
             queue.enqueue_batch(specs).unwrap();
             enq_t += t.elapsed();
-            let s1 = queue.size_on_disk();
+            let s1 = queue.log_bytes();
             let t = Instant::now();
             let got = queue.lease_n("q", "w", 60_000, batch as usize).unwrap();
             lease_t += t.elapsed();
-            let s2 = queue.size_on_disk();
+            let s2 = queue.log_bytes();
             let leases: Vec<_> = got.iter().map(|l| l.lease()).collect();
             let t = Instant::now();
             queue.ack_many(&leases).unwrap();
             ack_t += t.elapsed();
-            let s3 = queue.size_on_disk();
+            let s3 = queue.log_bytes();
             enq_b += s1 - s0;
             lease_b += s2 - s1;
             ack_b += s3 - s2;
             done += batch;
         }
-        let grown = queue.size_on_disk() - base;
+        let grown = queue.log_bytes() - base;
         let commits = (done / batch) as f64;
         println!(
             "growth batch={batch} jobs={done} bytes_per_job={:.0} (enqueue {:.0} + lease {:.0} + ack {:.0}) bytes_per_commit enq={:.0} lease={:.0} ack={:.0} jobs_per_s={:.0}",
@@ -347,7 +347,7 @@ fn batching(args: &HashMap<String, String>) {
             queue.enqueue_batch(specs).unwrap();
             made += take;
         }
-        let size_before = queue.size_on_disk();
+        let size_before = queue.log_bytes();
         let version_before = queue.version();
         let acked = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
@@ -377,7 +377,7 @@ fn batching(args: &HashMap<String, String>) {
             "batching lease_batch={batch} workers=8 jobs={jobs} jobs_per_s={:.0} commits={} bytes_per_job={:.0}",
             jobs as f64 / elapsed,
             queue.version() - version_before,
-            (queue.size_on_disk() - size_before) as f64 / jobs as f64
+            (queue.log_bytes() - size_before) as f64 / jobs as f64
         );
     }
 }
@@ -399,7 +399,7 @@ fn day(args: &HashMap<String, String>) {
     let mut sent = 0u64;
     let mut next_report = 10u64;
     let mut late = 0u64;
-    let base = queue.size_on_disk();
+    let base = queue.log_bytes();
     while start.elapsed().as_secs() < secs {
         let due = (start.elapsed().as_secs_f64() * rate as f64) as u64;
         if sent < due {
@@ -422,7 +422,7 @@ fn day(args: &HashMap<String, String>) {
                 runner.done(),
                 state.ready.len(),
                 state.leases.len(),
-                queue.size_on_disk() as f64 / 1048576.0,
+                queue.log_bytes() as f64 / 1048576.0,
                 queue.version()
             );
             next_report += 10;
@@ -432,7 +432,7 @@ fn day(args: &HashMap<String, String>) {
         thread::sleep(Duration::from_millis(50));
     }
     let elapsed = start.elapsed().as_secs_f64();
-    let size = queue.size_on_disk();
+    let size = queue.log_bytes();
     let version = queue.version();
     println!(
         "day rate_target={rate} sent={sent} achieved_per_s={:.0} late_ticks={late} commits={version} commits_per_job={:.2} file_bytes={size} bytes_per_job={:.0} bytes_per_commit={:.0}",
@@ -500,7 +500,7 @@ fn cycle(args: &HashMap<String, String>) {
             queue.enqueue_batch(specs).unwrap();
             sent += take;
         }
-        peak = peak.max(queue.size_on_disk());
+        peak = peak.max(queue.log_bytes());
         thread::sleep(Duration::from_millis(pace));
     }
     while runner.done() < sent {
@@ -573,14 +573,14 @@ fn split(args: &HashMap<String, String>) {
     prefill(&queue, depth);
     let db = queue.db().clone();
     let measure = |label: &str, f: &dyn Fn(&mut queue::State, u64)| {
-        let before = db.size_on_disk();
+        let before = db.log_bytes();
         let t = Instant::now();
         for i in 0..rounds {
             db.commit("x", |state| f(state, i)).unwrap();
         }
         println!(
             "split depth={depth} {label}: bytes_per_commit={:.0} commit_us={:.0}",
-            (db.size_on_disk() - before) as f64 / rounds as f64,
+            (db.log_bytes() - before) as f64 / rounds as f64,
             t.elapsed().as_micros() as f64 / rounds as f64
         );
     };

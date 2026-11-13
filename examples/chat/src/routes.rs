@@ -512,7 +512,7 @@ async fn health(State(app): State<Shared>) -> Json<Value> {
         "feeds": app.feeds.live(),
         "frames": app.feeds.frames.load(Ordering::Relaxed),
         "posts": app.counters.posts.load(Ordering::Relaxed),
-        "file_bytes": app.db.size_on_disk(),
+        "file_bytes": app.db.log_bytes(),
     }))
 }
 

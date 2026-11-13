@@ -31,8 +31,9 @@ Insert and remove use treap-style `split` and `merge`, and so do the range opera
 key ranges do not overlap, so each touches O(log n) nodes. `remove_range` returns the count stored
 on the cut-out subtree links and never reads those subtrees. At 1M keys it took 0.8 to 2.5 ms where
 collecting the keys and removing them one by one took 5 to 260 ms, for the same bytes written. A cut
-that moves nothing keeps each node's `origin`, so it writes nothing back. `Table::drain_range` has
-to update every index for every row, so it is O(rows) and returns them. `append` across two stores,
+that moves nothing keeps each node's `origin`, so it writes nothing back. `Table::take_range` and
+`Table::remove_range` cut the rows' tree the same way, but have to update every index for every row
+that moves, so they are O(rows). `append` across two stores,
 or with overlapping keys, copies `other` entry by entry, since links only mean something inside
 their own store.
 

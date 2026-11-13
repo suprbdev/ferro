@@ -46,7 +46,7 @@ struct Cost {
 }
 
 fn measure<T: Data>(db: &Db<T>, f: impl FnOnce(&mut T)) -> Cost {
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     let started = Instant::now();
     let mut closure_ms = 0.0;
     db.update(|root| {
@@ -58,7 +58,7 @@ fn measure<T: Data>(db: &Db<T>, f: impl FnOnce(&mut T)) -> Cost {
     Cost {
         closure_ms,
         commit_ms: started.elapsed().as_secs_f64() * 1e3,
-        bytes: db.size_on_disk() - before,
+        bytes: db.log_bytes() - before,
     }
 }
 
@@ -330,7 +330,7 @@ fn seq_bench<S: Seq>(dir: &Path, label: &str, n: u64, make: impl Fn(u64) -> S::I
     let db = open::<S>(dir, "seq.ferro");
     let items: Vec<S::Item> = (0..n).map(&make).collect();
     db.update(|root| root.fill(items)).unwrap();
-    let base = db.size_on_disk();
+    let base = db.log_bytes();
     let pushes = 20_000u64;
     let start = Instant::now();
     for i in 0..pushes {
@@ -338,7 +338,7 @@ fn seq_bench<S: Seq>(dir: &Path, label: &str, n: u64, make: impl Fn(u64) -> S::I
         db.update(|root| root.push(item)).unwrap();
     }
     let push_ns = start.elapsed().as_secs_f64() * 1e9 / pushes as f64;
-    let per_push = (db.size_on_disk() - base) as f64 / pushes as f64;
+    let per_push = (db.log_bytes() - base) as f64 / pushes as f64;
     let snapshot = db.read();
     let start = Instant::now();
     for i in 0..500_000u64 {
@@ -349,7 +349,7 @@ fn seq_bench<S: Seq>(dir: &Path, label: &str, n: u64, make: impl Fn(u64) -> S::I
     let total = snapshot.scan();
     let scan = start.elapsed().as_secs_f64() * 1e9 / total as f64;
     drop(snapshot);
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     drop(db);
     let cold_db = Options::new()
         .durability(Durability::Buffered)

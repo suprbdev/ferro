@@ -880,7 +880,7 @@ would, and failed that way while the marker was kept.
 
 A shared writer does not truncate the Fsync reservation when it closes, since other writers may be
 placing frames into it. The next writer to open truncates it, so the file can stay up to 4 MiB
-longer than `size_on_disk` while no shared writer has it open.
+longer than `log_bytes` while no shared writer has it open.
 
 A read-only open that can take the writer lock shared takes the placement lock shared too, and
 trusts the superblock if another holds it, then tests the lock that writers hold once they have

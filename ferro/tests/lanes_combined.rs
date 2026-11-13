@@ -182,7 +182,7 @@ fn draft_straddling_pieces(stale: bool) {
             .unwrap()
     };
     drafted_rx.recv_timeout(PATIENCE).unwrap();
-    let size_before = b.size_on_disk();
+    let size_before = b.log_bytes();
     let received = b.receive("a", &bundle, merge_in);
     drafting.join().unwrap().unwrap();
     match (stale, &received) {
@@ -191,7 +191,7 @@ fn draft_straddling_pieces(stale: bool) {
         _ => panic!("stale {stale}: {received:?}"),
     }
     assert!(straddle.lock().is_none() && placed_tx.lock().is_none());
-    let grew = b.size_on_disk() - size_before;
+    let grew = b.log_bytes() - size_before;
     assert!(
         grew < bundle.as_bytes().len() as u64 + (256 << 10),
         "stale {stale}: the moved draft kept its own copies, {grew} bytes"

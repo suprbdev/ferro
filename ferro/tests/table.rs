@@ -75,7 +75,8 @@ enum Op {
     Untouched(u32),
     Rewrite(u32),
     Retain(u8),
-    DrainRange(Bound<u32>, Bound<u32>),
+    TakeRange(Bound<u32>, Bound<u32>),
+    RemoveRange(Bound<u32>, Bound<u32>),
     PanicUpdate(u32, Fields),
     Forget(u32, Fields),
     Commit,
@@ -100,7 +101,8 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (0..IDS).prop_map(Op::Untouched),
         2 => (0..IDS).prop_map(Op::Rewrite),
         1 => (2..4u8).prop_map(Op::Retain),
-        2 => (id_bound(), id_bound()).prop_map(|(a, b)| Op::DrainRange(a, b)),
+        2 => (id_bound(), id_bound()).prop_map(|(a, b)| Op::TakeRange(a, b)),
+        1 => (id_bound(), id_bound()).prop_map(|(a, b)| Op::RemoveRange(a, b)),
         2 => (0..IDS, fields()).prop_map(|(k, f)| Op::PanicUpdate(k, f)),
         2 => (0..IDS, fields()).prop_map(|(k, f)| Op::Forget(k, f)),
         3 => Just(Op::Commit),
@@ -367,19 +369,22 @@ fn run(ops: Vec<Op>) {
                 table.retain(|row| row.n % modulus == 0);
                 model.retain(|_, row| row.n % modulus == 0);
             }
-            Op::DrainRange(low, high) => {
-                let wanted: Vec<Row> = model
-                    .values()
-                    .filter(|row| within(&row.id, &low, &high))
-                    .cloned()
-                    .collect();
-                let drained: Vec<Row> = table
-                    .drain_range::<u32, _>((low, high))
+            Op::TakeRange(low, high) => {
+                let wanted: BTreeMap<u32, Row> = model
                     .iter()
-                    .map(|row| (**row).clone())
+                    .filter(|(id, _)| within(*id, &low, &high))
+                    .map(|(id, row)| (*id, row.clone()))
                     .collect();
-                assert_eq!(drained, wanted);
+                let taken = table.take_range::<u32, _>((low, high));
+                check(&taken, &wanted);
+                same_form(&taken, &rebuilt(&wanted, step as u64));
                 model.retain(|_, row| !within(&row.id, &low, &high));
+            }
+            Op::RemoveRange(low, high) => {
+                let before = model.len();
+                model.retain(|_, row| !within(&row.id, &low, &high));
+                let removed = table.remove_range::<u32, _>((low, high));
+                assert_eq!(removed, before - model.len());
             }
             Op::PanicUpdate(id, f) => {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -446,6 +451,54 @@ fn quiet() {
             }
         }));
     });
+}
+
+#[derive(Data, Clone, Debug, Default, PartialEq)]
+struct Halves {
+    kept: Table<Row>,
+    taken: Table<Row>,
+}
+
+#[test]
+fn take_range_moves_stored_rows_with_their_index_entries_into_a_table_of_their_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("halves.ferro");
+    let db: Db<Halves> = fast().open(&path).unwrap();
+    let mut kept = BTreeMap::new();
+    db.update(|halves| {
+        for id in 0..IDS {
+            let row = Row {
+                id,
+                n: (id % 4) as u8,
+                opt: (id % 3 == 0).then(|| "a".to_string()),
+                tags: vec!["x".to_string(); (id % 3) as usize],
+            };
+            halves.kept.insert(row.clone());
+            kept.insert(id, row);
+        }
+    })
+    .unwrap();
+    drop(db);
+    let mut taken = kept.split_off(&3);
+    kept.append(&mut taken.split_off(&7));
+    let db: Db<Halves> = fast().open(&path).unwrap();
+    db.update(|halves| {
+        halves.taken = halves.kept.take_range(3..7);
+        assert!(halves.kept.take_range(3..7).is_empty());
+        assert_eq!(halves.kept.remove_range(IDS..), 0);
+        check(&halves.kept, &kept);
+        check(&halves.taken, &taken);
+    })
+    .unwrap();
+    drop(db);
+    let db: Db<Halves> = fast().open(&path).unwrap();
+    let read = db.read();
+    check(&read.kept, &kept);
+    check(&read.taken, &taken);
+    same_form(&read.kept, &rebuilt(&kept, 3));
+    same_form(&read.taken, &rebuilt(&taken, 4));
+    drop(read);
+    db.verify_typed().unwrap();
 }
 
 #[test]
@@ -898,15 +951,27 @@ mod failed_loads {
             9 => {
                 let low = rng.below(IDS);
                 let high = low + rng.below(40);
-                let drained = interrupted(rng, || table.drain_range(low..high));
-                let done = drained.is_some();
-                if let Some(drained) = drained {
-                    let wanted: Vec<u64> = model.range(low..high).map(|(id, _)| *id).collect();
-                    let got: Vec<u64> = drained.iter().map(|row| row.id).collect();
-                    assert_eq!(got, wanted, "drain_range");
-                    model.retain(|id, _| !(low..high).contains(id));
+                let wanted: Model = model
+                    .range(low..high)
+                    .map(|(id, plain)| (*id, plain.clone()))
+                    .collect();
+                if rng.chance(50) {
+                    let taken = interrupted(rng, || table.take_range(low..high));
+                    let done = taken.is_some();
+                    if let Some(taken) = taken {
+                        same(&taken, &wanted, "the table take_range returned");
+                        model.retain(|id, _| !(low..high).contains(id));
+                    }
+                    ("take_range", done)
+                } else {
+                    let removed = interrupted(rng, || table.remove_range(low..high));
+                    let done = removed.is_some();
+                    if let Some(removed) = removed {
+                        assert_eq!(removed, wanted.len(), "remove_range");
+                        model.retain(|id, _| !(low..high).contains(id));
+                    }
+                    ("remove_range", done)
                 }
-                ("drain_range", done)
             }
             10 | 11 => {
                 let mut theirs = base.clone();
@@ -1143,8 +1208,11 @@ mod failed_loads {
                 let low = 200 + round * 50;
                 let mut after = model.clone();
                 after.retain(|id, _| !(low..low + 30).contains(id));
-                sweep(table, &model, &after, "drain_range", |table| {
-                    table.drain_range(low..low + 30);
+                sweep(table, &model, &after, "take_range", |table| {
+                    table.take_range(low..low + 30);
+                });
+                sweep(table, &model, &after, "remove_range", |table| {
+                    table.remove_range(low..low + 30);
                 });
             }
         })
@@ -1418,8 +1486,11 @@ mod failed_loads {
             *table = swept(table, "retain", |table| {
                 table.retain(|shelf| shelf.kind.0 != 2)
             });
-            *table = swept(table, "drain_range", |table| {
-                table.drain_range(Brittle(40)..Brittle(50));
+            *table = swept(table, "take_range", |table| {
+                table.take_range(Brittle(40)..Brittle(46));
+            });
+            *table = swept(table, "remove_range", |table| {
+                table.remove_range(Brittle(46)..Brittle(50));
             });
             *table = swept(table, "rewrite", |table| table.rewrite());
         })

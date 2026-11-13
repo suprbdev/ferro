@@ -19,7 +19,7 @@ fn meta(db: &Db<Tracker>, version: u64) -> Meta {
     Meta {
         branch: db.branch_name().to_string(),
         version,
-        file_bytes: db.size_on_disk(),
+        file_bytes: db.log_bytes(),
     }
 }
 
@@ -208,7 +208,7 @@ pub fn run_write(w: &mut dyn Write, db: &Db<Tracker>, command: Command) -> Res<(
         Command::Undo => undo(w, db),
         Command::Restore { version } => {
             let snapshot = db.at(version)?;
-            let done = db.restore(&snapshot)?;
+            let done = db.restore(&snapshot, format!("restore v{version}"))?;
             report(w, &done, &format!("restored v{version}"))
         }
         Command::Seed { n, batch } => {
@@ -302,7 +302,7 @@ fn merge(w: &mut dyn Write, db: &Db<Tracker>, branch: &str, take_theirs: bool) -
 fn undo_target(db: &Db<Tracker>) -> u64 {
     let log = db.log();
     let mut version = db.version();
-    while let Some(restored) = log.get(&version).and_then(|commit| commit.restored) {
+    while let Some(restored) = log.get(version).and_then(|commit| commit.restored) {
         version = restored;
     }
     version
@@ -316,7 +316,7 @@ fn undo(w: &mut dyn Write, db: &Db<Tracker>) -> Res<()> {
         return Ok(());
     }
     let target = current - 1;
-    let done = db.restore_with(&db.at(target)?, format!("undo v{head}: restore v{target}"))?;
+    let done = db.restore(&db.at(target)?, format!("undo v{head}: restore v{target}"))?;
     if done.changed {
         writeln!(
             w,

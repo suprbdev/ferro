@@ -51,11 +51,11 @@ fn pruning_reclaims_while_retained_versions_stay_exact() {
     let db: Db<Root> = options().open(path_in(&dir)).unwrap();
     fill(&db, 3000, 40);
     let keep: Vec<_> = (2991..=3000).map(|v| dump(&db.at(v).unwrap())).collect();
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     let report = db.compact(Keep::Last(10)).unwrap();
     assert_eq!(report.commits_dropped, 2990);
     assert!(report.before_bytes <= before);
-    assert_eq!(report.after_bytes, db.size_on_disk());
+    assert_eq!(report.after_bytes, db.log_bytes());
     assert!(report.after_bytes * 10 < report.before_bytes, "{report:?}");
     assert_eq!(
         std::fs::metadata(db.path()).unwrap().len(),
@@ -90,17 +90,17 @@ fn head_hash_and_anchors_survive_pruning_and_reclaim() {
     let db: Db<Root> = options().open(path_in(&dir)).unwrap();
     fill(&db, 200, 20);
     let head = db.head_hash();
-    let anchor = db.log().hash_at(&195);
+    let anchor = db.log().hash_at(195);
     db.compact(Keep::Last(10)).unwrap();
     assert_eq!(db.head_hash(), head);
-    assert_eq!(db.log().hash_at(&195), anchor);
-    assert_eq!(db.log().hash_at(&150), None);
+    assert_eq!(db.log().hash_at(195), anchor);
+    assert_eq!(db.log().hash_at(150), None);
     let path = db.path();
     drop(db);
     admin::compact(&path, Keep::All).unwrap();
     let db: Db<Root> = options().open(&path).unwrap();
     assert_eq!(db.head_hash(), head);
-    assert_eq!(db.log().hash_at(&195), anchor);
+    assert_eq!(db.log().hash_at(195), anchor);
     db.verify().unwrap();
 }
 
@@ -128,7 +128,7 @@ fn repeated_cycles_stay_bounded_and_exact() {
     let mut smallest = u64::MAX;
     for round in 0..30 {
         fill(&db, 200, 50);
-        peak = peak.max(db.size_on_disk());
+        peak = peak.max(db.log_bytes());
         let want = dump(&db.read());
         let report = db.compact(Keep::Last(5)).unwrap();
         assert_eq!(dump(&db.read()), want, "round {round}");
@@ -153,11 +153,11 @@ fn the_live_estimate_tracks_growth_between_cycles_and_survives_reopening() {
     let path = path_in(&dir);
     let db: Db<Root> = options().open(&path).unwrap();
     fill(&db, 500, 20);
-    assert_eq!(db.space().unwrap().live_bytes, db.size_on_disk());
+    assert_eq!(db.space().unwrap().live_bytes, db.log_bytes());
     let report = db.compact(Keep::Last(1)).unwrap();
     fill(&db, 500, 20);
     db.compact(Keep::Last(1)).unwrap();
-    let base = db.size_on_disk();
+    let base = db.log_bytes();
     assert!(base * 2 > report.after_bytes && base < report.after_bytes * 2);
     fill(&db, 500, 20);
     let space = db.space().unwrap();
@@ -271,7 +271,7 @@ fn restoring_a_held_pruned_snapshot_commits_and_survives_later_cycles() {
     let want = dump(&held);
     fill(&db, 300, 200);
     db.compact(Keep::Last(1)).unwrap();
-    let restored = db.restore(&held).unwrap().version;
+    let restored = db.restore(&held, "restore").unwrap().version;
     assert_eq!(dump(&db.read()), want);
     drop(held);
     for _ in 0..3 {
@@ -793,7 +793,8 @@ fn merges_restores_stamped_commits_drops_and_receives_during_every_stage_of_a_cy
                 let side = db.branch("side").unwrap();
                 fill_from(&side, 3000, 5, 7);
                 db.merge_with(&side, keep_ours).unwrap();
-                db.restore(&old.lock().unwrap().take().unwrap()).unwrap();
+                db.restore(&old.lock().unwrap().take().unwrap(), "restore")
+                    .unwrap();
                 db.commit_stamped(|root, stamp| {
                     root.insert(900, format!("{}-{}", stamp.version(), stamp.time_ms()));
                     ("stamped", ())
@@ -901,7 +902,7 @@ fn the_history_option_prunes_on_commit_and_reclaims_in_the_background() {
     let mut peak = 0;
     while db.space().unwrap().cycles < 3 && started.elapsed() < Duration::from_secs(30) {
         fill(&db, 200, 40);
-        peak = peak.max(db.size_on_disk());
+        peak = peak.max(db.log_bytes());
     }
     let space = db.space().unwrap();
     assert!(space.cycles >= 3, "{space:?}");
@@ -1258,7 +1259,7 @@ fn as_of_stops_at_the_oldest_retained_commit_across_a_pruned_skip_link() {
     }
     assert_eq!(db.version(), 100);
     let times: Vec<u64> = (98..=100)
-        .map(|v| db.log().get(&v).unwrap().time_ms)
+        .map(|v| db.log().get(v).unwrap().time_ms)
         .collect();
     db.compact(Keep::Last(3)).unwrap();
     assert_eq!(db.log().first().unwrap().0, 98);
@@ -1533,7 +1534,7 @@ proptest! {
                         if !log.is_empty() {
                             let chosen = log[*version as usize % log.len()];
                             let snapshot = db.at(chosen).unwrap();
-                            let done = db.restore(&snapshot).unwrap();
+                            let done = db.restore(&snapshot, "restore").unwrap();
                             if done.changed {
                                 let model = models[*b].as_mut().unwrap();
                                 model.head = done.version;

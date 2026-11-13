@@ -966,7 +966,7 @@ staging frame would be placed over them and its records would write the bytes a 
 shared writer's staging frame makes the file 4 MiB longer than itself, which other processes take
 as reserved. Commits beside a receive then extend the file, as the receive's records do anyway.
 The reservation is only an optimization. A failed reservation stops further attempts without failing the commit, open discards
-it, and a clean close truncates it, so the file can be up to 4 MiB longer than `size_on_disk` while
+it, and a clean close truncates it, so the file can be up to 4 MiB longer than `log_bytes` while
 open, and longer still by staging frames that end the log, which hold a receive's records while it
 streams and stay, once it is refused, until the writer closes. Truncating those at the refusal would
 take the log's end and sequence numbers back while other threads place frames, and a shared writer

@@ -260,7 +260,7 @@ impl World {
                 Some(branch.version()),
                 "{context}: admin log of {name}"
             );
-            assert_eq!(branch.log().hash_at(&branch.version()), Some(*hash));
+            assert_eq!(branch.log().hash_at(branch.version()), Some(*hash));
         }
         self.count("deep check");
     }

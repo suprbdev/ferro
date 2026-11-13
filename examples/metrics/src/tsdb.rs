@@ -850,7 +850,7 @@ pub fn stats(db: &Db<Metrics>) -> Stats {
         raw_floor: m.raw_floor,
         versions: db.log().len(),
         version: db.version(),
-        file_bytes: db.size_on_disk(),
+        file_bytes: db.log_bytes(),
     }
 }
 

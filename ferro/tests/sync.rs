@@ -18,8 +18,8 @@ use ferro::codec::{Encoder, HashSink, Object};
 use ferro::db::{Clock, Hook};
 use ferro::store::{Op, Store, StoreOptions, Trace};
 use ferro::{
-    Bundle, Data, Db, Error, Hash, Have, Keep, Map, Options, Outcome, Ptr, Pulled, Reclaim, Record,
-    Snapshot, Summary, Table,
+    Bundle, Data, Db, Error, Hash, Have, Keep, Map, Options, Outcome, Ptr, Reclaim, Record,
+    Snapshot, Summary, Synced, Table,
 };
 use parking_lot::Mutex;
 use tempfile::TempDir;
@@ -81,10 +81,10 @@ fn an_empty_database_fast_forwards_to_the_remote_and_shares_its_hashes() {
     assert_eq!(b.head_hash(), a.head_hash());
     assert_eq!(dump(&b.read()), dump(&a.read()));
     for version in 1..=20 {
-        assert_eq!(b.log().hash_at(&version), a.log().hash_at(&version));
+        assert_eq!(b.log().hash_at(version), a.log().hash_at(version));
         assert_eq!(
-            *b.log().get(&version).unwrap(),
-            *a.log().get(&version).unwrap()
+            *b.log().get(version).unwrap(),
+            *a.log().get(version).unwrap()
         );
         assert_eq!(dump(&b.at(version).unwrap()), dump(&a.at(version).unwrap()));
     }
@@ -266,7 +266,7 @@ fn pull_exactly<T: Data + Clone + Default + Send + Sync + 'static>(
     receiver: &Db<T>,
     sender: &Db<T>,
     remote: &str,
-) -> Pulled<()> {
+) -> Synced<()> {
     let lacked = lacked(dir, sender, receiver);
     let pulled = receiver.pull(sender, remote, no_merge).unwrap();
     assert_eq!(pulled.outcome, Outcome::FastForward);
@@ -580,7 +580,7 @@ fn repeated_sync_writes_nothing_and_sends_no_objects() {
     settle(&a, "a", &b, "b");
     assert_eq!(dump(&a.read()), dump(&b.read()));
     let (pa, pb) = (dir.path().join("a.ferro"), dir.path().join("b.ferro"));
-    let (sa, sb) = (a.size_on_disk(), b.size_on_disk());
+    let (sa, sb) = (a.log_bytes(), b.log_bytes());
     let heads = (a.head_hash(), b.head_hash());
     for _ in 0..3 {
         let one = a.pull(&b, "b", refuse).unwrap();
@@ -590,7 +590,7 @@ fn repeated_sync_writes_nothing_and_sends_no_objects() {
             assert_ne!(pulled.outcome, Outcome::FastForward);
             assert_eq!(pulled.objects, 0, "{pulled:?}");
         }
-        assert_eq!((a.size_on_disk(), b.size_on_disk()), (sa, sb));
+        assert_eq!((a.log_bytes(), b.log_bytes()), (sa, sb));
         assert_eq!((a.head_hash(), b.head_hash()), heads);
     }
     drop((a, b));
@@ -628,7 +628,7 @@ fn boards(dir: &TempDir, count: usize) -> Vec<Db<Board>> {
         .collect()
 }
 
-fn exchange(devices: &[Db<Board>], from: usize, to: usize) -> Pulled<usize> {
+fn exchange(devices: &[Db<Board>], from: usize, to: usize) -> Synced<usize> {
     devices[to]
         .pull(&devices[from], &format!("d{from}"), join)
         .unwrap()
@@ -660,10 +660,10 @@ fn converge(devices: &[Db<Board>]) {
     for to in 0..devices.len() {
         for from in 0..devices.len() {
             if from != to {
-                let before = devices[to].size_on_disk();
+                let before = devices[to].log_bytes();
                 let pulled = exchange(devices, from, to);
                 assert_eq!(pulled.objects, 0, "d{from} into d{to}: {pulled:?}");
-                assert_eq!(devices[to].size_on_disk(), before);
+                assert_eq!(devices[to].log_bytes(), before);
             }
         }
     }
@@ -765,15 +765,15 @@ fn pulled_commits_keep_their_versions_times_and_messages() {
     b.pull(&a, "a", theirs_win).unwrap();
     let remote = b.branch("a").unwrap();
     for version in 1..=3 {
-        let theirs = a.log().get(&version).unwrap();
-        assert_eq!(*remote.log().get(&version).unwrap(), *theirs);
-        assert_eq!(remote.log().hash_at(&version), a.log().hash_at(&version));
+        let theirs = a.log().get(version).unwrap();
+        assert_eq!(*remote.log().get(version).unwrap(), *theirs);
+        assert_eq!(remote.log().hash_at(version), a.log().hash_at(version));
     }
-    assert_eq!(b.log().get(&1).unwrap().message, "put 1");
-    assert_eq!(b.log().get(&2).unwrap().message, "put 9");
-    let merge = b.log().get(&3).unwrap();
+    assert_eq!(b.log().get(1).unwrap().message, "put 1");
+    assert_eq!(b.log().get(2).unwrap().message, "put 9");
+    let merge = b.log().get(3).unwrap();
     assert_eq!(merge.message, "merge");
-    assert!(merge.time_ms >= b.log().get(&2).unwrap().time_ms);
+    assert!(merge.time_ms >= b.log().get(2).unwrap().time_ms);
     assert_eq!(remote.version(), 3);
     assert_eq!(dump(&remote.read()), dump(&a.read()));
 }
@@ -796,7 +796,7 @@ fn a_small_change_on_a_large_database_sends_a_small_bundle() {
     put(&a, 100_001, "added");
     let small = b.pull(&a, "a", refuse).unwrap();
     assert_eq!(small.outcome, Outcome::FastForward);
-    let file = a.size_on_disk();
+    let file = a.log_bytes();
     println!(
         "file {file} bytes, clone {} bytes in {} objects, three commits {} bytes in {} objects, have {} bytes",
         clone.received_bytes, clone.objects, small.received_bytes, small.objects, small.sent_bytes
@@ -830,7 +830,7 @@ fn corrupt_case(dir: &TempDir) -> (Db<Root>, PathBuf, Bundle) {
 fn every_corrupted_byte_of_a_bundle_is_rejected_and_leaves_the_target_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let (mut b, path, bundle) = corrupt_case(&dir);
-    let before = (b.head_hash(), b.size_on_disk(), file_bytes(&path));
+    let before = (b.head_hash(), b.log_bytes(), file_bytes(&path));
     let clean = {
         let copy = dir.path().join("clean.ferro");
         fs::write(&copy, &before.2).unwrap();
@@ -872,7 +872,7 @@ fn every_corrupted_byte_of_a_bundle_is_rejected_and_leaves_the_target_untouched(
         same * 200 < rejected,
         "{same} flips decoded to the same objects, {rejected} rejected"
     );
-    assert_eq!(b.size_on_disk(), before.1);
+    assert_eq!(b.log_bytes(), before.1);
     drop(b);
     assert_eq!(file_bytes(&path), before.2);
     let b = open(&dir, "b.ferro");
@@ -938,12 +938,12 @@ fn a_bundle_built_for_another_database_is_rejected() {
     put(&a, 2, "two");
     let for_b = a.bundle(&b.have().unwrap()).unwrap();
     put(&c, 7, "seven");
-    let size = c.size_on_disk();
+    let size = c.log_bytes();
     match c.receive("a", &for_b, theirs_win) {
         Err(Error::StaleHave(message)) => assert!(message.contains("does not have"), "{message}"),
         other => panic!("accepted a foreign bundle: {other:?}"),
     }
-    assert_eq!(c.size_on_disk(), size);
+    assert_eq!(c.log_bytes(), size);
     assert_eq!(c.branches(), vec!["main".to_string()]);
 }
 
@@ -962,7 +962,7 @@ fn a_bundle_damaged_where_it_names_its_base_reads_as_stale_and_a_fresh_one_lands
         .expect("the bundle names the commit it builds on");
     let state = |b: &Db<Root>| {
         let landed = b.branch("a").unwrap().head_hash();
-        (b.head_hash(), landed, b.size_on_disk())
+        (b.head_hash(), landed, b.log_bytes())
     };
     let before = state(&b);
     for offset in [0, base.len() / 2, base.len() - 1] {
@@ -2073,7 +2073,7 @@ fn a_bundle_whose_commit_skips_to_another_commit_is_rejected() {
     for into_a_value in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let b: Db<u64> = fast().open(dir.path().join("b.ferro")).unwrap();
-        let size = b.size_on_disk();
+        let size = b.log_bytes();
         let roots: Vec<Object> = (0..=10u64).map(|value| object_of(&value)).collect();
         let other_root = object_of(&40u64);
         let mut entries: Vec<Object> = Vec::new();
@@ -2105,7 +2105,7 @@ fn a_bundle_whose_commit_skips_to_another_commit_is_rejected() {
         }
         assert_eq!(b.version(), 0);
         assert_eq!(b.branches(), vec!["main".to_string()]);
-        assert_eq!(b.size_on_disk(), size);
+        assert_eq!(b.log_bytes(), size);
     }
 }
 
@@ -2210,7 +2210,7 @@ fn a_bundle_with_a_forged_merge_link_or_generation_is_rejected() {
     for (name, claim) in cases {
         let dir = tempfile::tempdir().unwrap();
         let b: Db<u64> = fast().open(dir.path().join("b.ferro")).unwrap();
-        let size = b.size_on_disk();
+        let size = b.log_bytes();
         let merge = forged_entry(&roots[3], Forged { time: 60, ..claim });
         let objects: Vec<&Object> = vec![
             &roots[1], &first, &roots[2], &second, &side_root, &side, &roots[3], &merge,
@@ -2229,7 +2229,7 @@ fn a_bundle_with_a_forged_merge_link_or_generation_is_rejected() {
             other => panic!("accepted a forged {name} merge: {other:?}"),
         }
         assert_eq!(b.version(), 0);
-        assert_eq!(b.size_on_disk(), size);
+        assert_eq!(b.log_bytes(), size);
     }
 }
 
@@ -2428,12 +2428,12 @@ fn a_stale_bundle_does_not_move_the_remote_back() {
         b.pull(&a, "a", theirs_win).unwrap().outcome,
         Outcome::Merged
     );
-    let before = (b.head_hash(), b.size_on_disk());
+    let before = (b.head_hash(), b.log_bytes());
     let replayed = b.receive("a", &stale, theirs_win).unwrap();
     assert_ne!(replayed.outcome, Outcome::Merged);
     assert_eq!(*b.read().get(&1).unwrap(), "three");
     assert_eq!(b.branch("a").unwrap().head_hash(), a.head_hash());
-    assert_eq!((b.head_hash(), b.size_on_disk()), before);
+    assert_eq!((b.head_hash(), b.log_bytes()), before);
 }
 
 fn forged_with(
@@ -2528,7 +2528,7 @@ fn inline_string(text: &str) -> Vec<u8> {
     slot
 }
 
-type Received<T> = (Db<T>, ferro::Result<Pulled<()>>, TempDir);
+type Received<T> = (Db<T>, ferro::Result<Synced<()>>, TempDir);
 
 fn receive_tree<T: Data + Default>(objects: &[&Object]) -> Received<T> {
     let dir = tempfile::tempdir().unwrap();
@@ -2545,7 +2545,7 @@ fn receive_tree<T: Data + Default>(objects: &[&Object]) -> Received<T> {
     (db, result, dir)
 }
 
-fn assert_refused<T: Data>(db: &Db<T>, result: ferro::Result<Pulled<()>>) {
+fn assert_refused<T: Data>(db: &Db<T>, result: ferro::Result<Synced<()>>) {
     match result {
         Err(Error::Bundle(_)) => {}
         other => panic!("accepted a tree that does not read: {other:?}"),
@@ -2643,8 +2643,8 @@ fn a_bundle_that_reuses_held_data_as_another_type_is_rejected() {
     let spill = object_of(&long);
     let node = node_of(key, &[1], vec![link_to(&spill)]);
     assert_eq!(b.read().root_hash(), Some(node.hash()));
-    let v1 = b.log().hash_at(&1).unwrap();
-    let size = b.size_on_disk();
+    let v1 = b.log().hash_at(1).unwrap();
+    let size = b.log_bytes();
     let before = b.head_hash();
     for (count, held_as) in [(1u8, 3u64), (4, 2), (1, 2)] {
         let target = if held_as == 3 { &spill } else { &node };
@@ -2684,7 +2684,7 @@ fn a_bundle_that_reuses_held_data_as_another_type_is_rejected() {
             other => panic!("accepted a link to held data of another type: {other:?}"),
         }
         assert_eq!(b.head_hash(), before);
-        assert_eq!(b.size_on_disk(), size);
+        assert_eq!(b.log_bytes(), size);
     }
     b.verify_typed().unwrap();
 }
@@ -2885,7 +2885,7 @@ fn a_peer_that_reads_held_bytes_as_text_lands_them_only_if_they_are_text() {
         let bundle = peer.bundle(&b.have().unwrap()).unwrap();
         b.receive("peer", &bundle, no_merge).unwrap();
         peer.update(|raw| raw.notes = raw.blobs.clone()).unwrap();
-        let before = (b.head_hash(), b.size_on_disk());
+        let before = (b.head_hash(), b.log_bytes());
         let bundle = peer.bundle(&b.have().unwrap()).unwrap();
         let result = b.receive("peer", &bundle, no_merge);
         if lands {
@@ -2896,7 +2896,7 @@ fn a_peer_that_reads_held_bytes_as_text_lands_them_only_if_they_are_text() {
                 Err(Error::Bundle(message)) => assert!(message.contains("another type")),
                 other => panic!("landed bytes that are not text as a String: {other:?}"),
             }
-            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+            assert_eq!((b.head_hash(), b.log_bytes()), before);
         }
         b.verify_typed().unwrap();
     }
@@ -2908,8 +2908,8 @@ fn retyped<T: Data>(
     db: &Db<T>,
     hints: &[(u64, u64)],
     sent: &[(&Object, &[u64])],
-) -> ferro::Result<Pulled<()>> {
-    let v1 = db.log().hash_at(&1).unwrap();
+) -> ferro::Result<Synced<()>> {
+    let v1 = db.log().hash_at(1).unwrap();
     let root = sent.last().unwrap().0;
     let tip = forged_entry(
         root,
@@ -2961,7 +2961,7 @@ fn a_held_map_linked_as_another_value_type_lands_only_if_every_node_below_checks
             body,
             links: vec![held, held],
         };
-        let before = (b.head_hash(), b.size_on_disk());
+        let before = (b.head_hash(), b.log_bytes());
         let result = retyped(&b, &[(0, 0)], &[(&root, &[2, 2])]);
         if fits {
             assert_eq!(result.unwrap().outcome, Outcome::FastForward);
@@ -2975,7 +2975,7 @@ fn a_held_map_linked_as_another_value_type_lands_only_if_every_node_below_checks
                 Err(Error::Bundle(message)) => assert!(message.contains("another type")),
                 other => panic!("landed a u64 past u32::MAX as a u32: {other:?}"),
             }
-            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+            assert_eq!((b.head_hash(), b.log_bytes()), before);
         }
         b.verify_typed().unwrap();
     }
@@ -3028,7 +3028,7 @@ fn a_held_subtree_linked_as_another_type_must_keep_within_its_new_range() {
             body,
             links: vec![link_to(&node)],
         };
-        let before = (b.head_hash(), b.size_on_disk());
+        let before = (b.head_hash(), b.log_bytes());
         let result = retyped(&b, &[(0, 0)], &[(&node, &[2]), (&root, &[0])]);
         if separator > last {
             assert_eq!(result.unwrap().outcome, Outcome::FastForward);
@@ -3044,7 +3044,7 @@ fn a_held_subtree_linked_as_another_type_must_keep_within_its_new_range() {
                 Err(Error::Bundle(message)) => assert!(message.contains("another type")),
                 other => panic!("landed keys outside the range their new parent gives: {other:?}"),
             }
-            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+            assert_eq!((b.head_hash(), b.log_bytes()), before);
         }
         b.verify_typed().unwrap();
     }
@@ -3288,14 +3288,14 @@ fn shared_values_copied(keys: u64, distinct: u64) {
         root.notes = Map::new();
     })
     .unwrap();
-    let held = (b.head_hash(), b.size_on_disk());
+    let held = (b.head_hash(), b.log_bytes());
     let bundle = a.bundle(&b.have().unwrap()).unwrap();
     assert!(bundle.as_bytes().len() < 1024);
     let pulled = b.receive("a", &bundle, no_merge);
     assert!(
         matches!(
             pulled,
-            Ok(Pulled {
+            Ok(Synced {
                 outcome: Outcome::FastForward,
                 ..
             })
@@ -3303,7 +3303,7 @@ fn shared_values_copied(keys: u64, distinct: u64) {
         "refused a copy of {distinct} values shared by {keys} keys: {:?}",
         pulled.map(|pulled| pulled.outcome)
     );
-    assert_ne!((b.head_hash(), b.size_on_disk()), held);
+    assert_ne!((b.head_hash(), b.log_bytes()), held);
     let root = b.read();
     assert!(root.notes.is_empty());
     for key in (0..keys).step_by(4_999) {
@@ -3393,7 +3393,7 @@ fn held_data_linked_as_another_type_counts_its_zero_width_items_from_its_first_r
         peer.update(|spans| spans.units = spans.counts.clone())
             .unwrap();
         let bundle = peer.bundle(&ours.have().unwrap()).unwrap();
-        let before = (ours.head_hash(), ours.size_on_disk());
+        let before = (ours.head_hash(), ours.log_bytes());
         let started = Instant::now();
         let result = ours.receive("peer", &bundle, no_merge);
         if lands {
@@ -3403,7 +3403,7 @@ fn held_data_linked_as_another_type_counts_its_zero_width_items_from_its_first_r
             assert_eq!(widths.units.get(&9).unwrap().len(), width as usize);
         } else {
             refused_for_zero_width(&result, started);
-            assert_eq!((ours.head_hash(), ours.size_on_disk()), before);
+            assert_eq!((ours.head_hash(), ours.log_bytes()), before);
         }
         ours.verify_typed().unwrap();
     }
@@ -3463,7 +3463,7 @@ fn held_data_linked_as_another_type_under_many_ranges_is_refused_for_its_reads()
         let mut sent: Vec<(&Object, &[u64])> =
             parents.iter().map(|node| (node, &[2][..])).collect();
         sent.push((&root, &references));
-        let before = (b.head_hash(), b.size_on_disk());
+        let before = (b.head_hash(), b.log_bytes());
         let result = retyped(&b, &[(0, 0)], &sent);
         if lands {
             assert_eq!(result.unwrap().outcome, Outcome::FastForward);
@@ -3482,7 +3482,7 @@ fn held_data_linked_as_another_type_under_many_ranges_is_refused_for_its_reads()
                 ),
                 other => panic!("read a held node again under every range it was sent: {other:?}"),
             }
-            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+            assert_eq!((b.head_hash(), b.log_bytes()), before);
         }
         b.verify_typed().unwrap();
     }
@@ -3889,7 +3889,7 @@ fn held_data_linked_as_another_type_counts_its_zero_width_items_from_its_second_
         let mut sent: Vec<(&Object, &[u64])> =
             parents.iter().map(|node| (node, &[2][..])).collect();
         sent.push((&root, &references));
-        let before = (b.head_hash(), b.size_on_disk());
+        let before = (b.head_hash(), b.log_bytes());
         let started = Instant::now();
         let result = retyped(&b, &[(0, 0)], &sent);
         if lands {
@@ -3902,7 +3902,7 @@ fn held_data_linked_as_another_type_counts_its_zero_width_items_from_its_second_
             }
         } else {
             refused_for_zero_width(&result, started);
-            assert_eq!((b.head_hash(), b.size_on_disk()), before);
+            assert_eq!((b.head_hash(), b.log_bytes()), before);
         }
         b.verify_typed().unwrap();
     }
@@ -4016,7 +4016,7 @@ fn level_zero_keys(count: usize) -> Vec<u64> {
         .collect()
 }
 
-fn assert_forged<T: Data>(db: &Db<T>, result: ferro::Result<Pulled<()>>) {
+fn assert_forged<T: Data>(db: &Db<T>, result: ferro::Result<Synced<()>>) {
     match &result {
         Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
         other => panic!("accepted a forged summary: {other:?}"),
@@ -4138,7 +4138,7 @@ fn a_bundle_that_reuses_held_data_under_a_forged_summary_is_rejected() {
     let spill = object_of(&long);
     let held = summed_node(&[(keys[0], Slot::Spill(&spill, of(keys[0])))], &[]);
     assert_eq!(b.read().root_hash(), Some(held.hash()));
-    let v1 = b.log().hash_at(&1).unwrap();
+    let v1 = b.log().hash_at(1).unwrap();
     let base = Ptr {
         hash: v1,
         offset: 0,
@@ -4155,7 +4155,7 @@ fn a_bundle_that_reuses_held_data_under_a_forged_summary_is_rejected() {
             },
         )
     };
-    let before = (b.head_hash(), b.size_on_disk());
+    let before = (b.head_hash(), b.log_bytes());
     for forged in [of(keys[0]) + 1, of(keys[1])] {
         let root = summed_root(1, forged, &held);
         let tip = tip_of(&root);
@@ -4171,7 +4171,7 @@ fn a_bundle_that_reuses_held_data_under_a_forged_summary_is_rejected() {
             Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
             other => panic!("accepted a held node under a forged summary: {other:?}"),
         }
-        assert_eq!((b.head_hash(), b.size_on_disk()), before);
+        assert_eq!((b.head_hash(), b.log_bytes()), before);
     }
     for (claimed, lands) in [(of(keys[0]), false), (of(keys[1]), true)] {
         let leaf = summed_node(&[(keys[1], Slot::Spill(&spill, claimed))], &[]);
@@ -4197,7 +4197,7 @@ fn a_bundle_that_reuses_held_data_under_a_forged_summary_is_rejected() {
             Err(Error::Bundle(message)) => assert!(message.contains("summary"), "{message}"),
             other => panic!("accepted a held value under another entry's summary: {other:?}"),
         }
-        assert_eq!((b.head_hash(), b.size_on_disk()), before);
+        assert_eq!((b.head_hash(), b.log_bytes()), before);
     }
     b.verify_typed().unwrap();
 }
@@ -5361,7 +5361,7 @@ fn a_head_the_receiver_cannot_read_leaves_an_attached_remote_where_the_refs_have
         })
         .unwrap();
     assert_eq!(remote.version(), 2);
-    assert_eq!(remote.log().hash_at(&1), landed);
+    assert_eq!(remote.log().hash_at(1), landed);
     let bundle = a.bundle(&b.have().unwrap()).unwrap();
     let refused = b.receive("a", &bundle, keep_theirs);
     assert!(matches!(refused, Err(Error::Decode(_))), "{refused:?}");
@@ -5456,12 +5456,12 @@ fn a_head_the_receiver_cannot_read_stops_no_handle_that_follows_the_remote_in_a_
     b.verify_typed().unwrap();
 }
 
-fn from_peer<T: Data, U: Data>(mine: &Db<T>, peer: &Db<U>) -> ferro::Result<Pulled<()>> {
+fn from_peer<T: Data, U: Data>(mine: &Db<T>, peer: &Db<U>) -> ferro::Result<Synced<()>> {
     let bundle = peer.bundle(&mine.have()?)?;
     mine.receive("peer", &bundle, unmerged)
 }
 
-fn assert_disagrees<T: Data>(received: ferro::Result<Pulled<()>>, mine: &Db<T>, case: &str) {
+fn assert_disagrees<T: Data>(received: ferro::Result<Synced<()>>, mine: &Db<T>, case: &str) {
     match received {
         Err(Error::Bundle(message)) => assert!(
             message.contains("do not agree with its rows"),
@@ -5740,7 +5740,7 @@ struct TeamsAfter {
     counter: u64,
 }
 
-fn refused_for_its_fingerprint(received: ferro::Result<Pulled<()>>, case: &str) {
+fn refused_for_its_fingerprint(received: ferro::Result<Synced<()>>, case: &str) {
     match received {
         Err(Error::Bundle(message)) => assert!(
             message.contains("fingerprint this type does not know"),
@@ -6387,7 +6387,7 @@ fn a_bundle_dated_far_past_this_clock_is_rejected() {
         }
         assert_eq!(b.branches(), vec!["main".to_string()]);
         b.update(|value| *value += 1).unwrap();
-        assert!(b.log().get(&1).unwrap().time_ms <= now_ms());
+        assert!(b.log().get(1).unwrap().time_ms <= now_ms());
     }
 }
 
@@ -6405,12 +6405,12 @@ fn a_bundle_whose_base_was_pruned_since_its_have_is_retryable() {
     put(&b, 2, "two");
     put(&a, 3, "three");
     let bundle = a.bundle(&have).unwrap();
-    let before = (b.head_hash(), b.size_on_disk());
+    let before = (b.head_hash(), b.log_bytes());
     match b.receive("a", &bundle, theirs_win) {
         Err(Error::StaleHave(message)) => assert!(message.contains("does not have"), "{message}"),
         other => panic!("a bundle whose base was pruned was not retryable: {other:?}"),
     }
-    assert_eq!((b.head_hash(), b.size_on_disk()), before);
+    assert_eq!((b.head_hash(), b.log_bytes()), before);
     let fresh = a.bundle(&b.have().unwrap()).unwrap();
     match b.receive("a", &fresh, theirs_win) {
         Ok(received) => assert_eq!(received.outcome, Outcome::Merged),
@@ -7139,7 +7139,7 @@ fn whole(db: &Db<Events>, name: &str, versions: u64, when: &str) {
     assert_eq!(log.len() as u64, versions, "{when}");
     assert_eq!(log.iter().count(), log.len(), "{when}");
     for version in 1..=versions {
-        assert!(log.get(&version).is_some(), "{when}: v{version}");
+        assert!(log.get(version).is_some(), "{when}: v{version}");
     }
 }
 
@@ -7224,7 +7224,7 @@ fn a_skip_link_copied_after_its_target_was_copied_again_names_the_copy_on_its_ch
         let log = c.branch("a").unwrap().log();
         assert_eq!(log.len(), 3, "{stage}");
         for version in 4..=6 {
-            assert!(log.get(&version).is_some(), "{stage}: v{version}");
+            assert!(log.get(version).is_some(), "{stage}: v{version}");
         }
         drop(c);
         ferro::admin::verify(dir.path().join("c.ferro")).unwrap();

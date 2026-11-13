@@ -418,7 +418,7 @@ async fn stats(State(app): State<Shared>, snap: Snap) -> Json<Value> {
         "events_sent": counters.events_sent.load(Ordering::Relaxed),
         "events_lagged": counters.events_lagged.load(Ordering::Relaxed),
         "feed_subscribers": app.feed.receiver_count(),
-        "db_bytes": app.db.size_on_disk(),
+        "db_bytes": app.db.log_bytes(),
         "db_live_bytes": space.live_bytes,
         "db_retired_bytes": space.retired_bytes,
         "reclaim_cycles": space.cycles,

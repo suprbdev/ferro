@@ -130,7 +130,7 @@ fn run(
         outside: 0,
         bytes: 0,
     };
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     for batch in batches {
         let began = Instant::now();
         let cpu = cpu_ns();
@@ -155,7 +155,7 @@ fn run(
         phase.inside += closure;
         phase.outside += whole - closure;
     }
-    phase.bytes = db.size_on_disk() - size;
+    phase.bytes = db.log_bytes() - size;
     phase
 }
 

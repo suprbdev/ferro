@@ -1271,10 +1271,10 @@ impl Log {
     /// # Errors
     ///
     /// A read error from the log, such as [`Error::Corrupt`].
-    pub fn try_get(&self, version: &u64) -> Result<Option<Arc<Commit>>> {
+    pub fn try_get(&self, version: u64) -> Result<Option<Arc<Commit>>> {
         Ok(self
             .chain
-            .get(&self.store, *version)?
+            .get(&self.store, version)?
             .map(|entry| entry.commit.clone()))
     }
 
@@ -1285,7 +1285,7 @@ impl Log {
     /// # Panics
     ///
     /// On a read error, as collection reads do. [`Log::try_get`] returns it instead.
-    pub fn get(&self, version: &u64) -> Option<Arc<Commit>> {
+    pub fn get(&self, version: u64) -> Option<Arc<Commit>> {
         crate::map::fatal(self.try_get(version))
     }
 
@@ -1295,7 +1295,7 @@ impl Log {
     ///
     /// On a read error, as collection reads do.
     pub fn first(&self) -> Option<(u64, Arc<Commit>)> {
-        self.get(&self.chain.first)
+        self.get(self.chain.first)
             .map(|commit| (self.chain.first, commit))
     }
 
@@ -1319,11 +1319,11 @@ impl Log {
     /// # Panics
     ///
     /// On a read error, as collection reads do.
-    pub fn hash_at(&self, version: &u64) -> Option<Hash> {
-        if self.is_empty() || *version < self.chain.first || *version > self.chain.last {
+    pub fn hash_at(&self, version: u64) -> Option<Hash> {
+        if self.is_empty() || version < self.chain.first || version > self.chain.last {
             return None;
         }
-        let ptr = crate::map::fatal(self.chain.pointer_to(&self.store, *version));
+        let ptr = crate::map::fatal(self.chain.pointer_to(&self.store, version));
         ptr.map(|ptr| ptr.hash)
     }
 

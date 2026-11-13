@@ -206,7 +206,7 @@ fn main() {
     } else {
         print("commit_and_drop", &rest, n as f64);
     }
-    println!("bytes_per_key={:.2}", db.size_on_disk() as f64 / n as f64);
+    println!("bytes_per_key={:.2}", db.log_bytes() as f64 / n as f64);
     let snapshot = db.read();
     let gets = 500_000;
     let began = Instant::now();

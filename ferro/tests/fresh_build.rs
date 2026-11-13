@@ -486,10 +486,10 @@ fn edit_rows(root: &mut Root, model: &mut Model, rng: &mut Rng) {
         }
         6 => {
             let high = id + rng.below(40) as u32;
-            let drained = root.rows.drain_range(id..high);
+            let taken = root.rows.take_range(id..high);
             let before = model.rows.len();
             model.rows.retain(|key, _| !(id..high).contains(key));
-            assert_eq!(drained.len(), before - model.rows.len());
+            assert_eq!(taken.len(), before - model.rows.len());
         }
         _ => {
             let group = rng.below(6) as u8;

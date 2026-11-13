@@ -115,7 +115,7 @@ fn a_stream_refused_after_it_spilled_leaves_the_file_as_it_was() {
     let path = case.path();
     let before = file_bytes(&path);
     let b = case.b();
-    let (head, size) = (b.head_hash(), b.size_on_disk());
+    let (head, size) = (b.head_hash(), b.log_bytes());
     #[cfg(target_os = "linux")]
     let taken = allocated(&path);
     let mut damaged = case.bundle.clone();
@@ -128,7 +128,7 @@ fn a_stream_refused_after_it_spilled_leaves_the_file_as_it_was() {
             other => panic!("accepted a damaged stream: {other:?}"),
         }
         assert_eq!(b.head_hash(), head);
-        assert_eq!(b.size_on_disk(), size);
+        assert_eq!(b.log_bytes(), size);
         #[cfg(target_os = "linux")]
         assert!(
             allocated(&path) < taken + (64 << 10),
@@ -301,7 +301,7 @@ fn a_power_cut_at_any_write_of_a_spilling_receive_keeps_a_database_that_opens() 
             let size = fs::metadata(&target).unwrap().len();
             assert_eq!(
                 size,
-                db.size_on_disk(),
+                db.log_bytes(),
                 "cut {cut} loss {loss} kept a partial bundle"
             );
         }

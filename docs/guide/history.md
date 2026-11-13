@@ -22,7 +22,7 @@ let life: Vec<_> = db
     .while_some()
     .collect();
 
-db.restore(&old)?;
+db.restore(&old, "restore v12")?;
 ```
 
 `diff` skips identical subtrees by hash, so it costs O(changes), not O(size). `restore` commits an
@@ -119,7 +119,7 @@ The bytes stay in the file until the next reclamation cycle.
 ## Tamper evidence
 
 `db.head_hash()` is a hash over the whole history of a branch, for publishing somewhere an attacker
-cannot edit. Check an old anchor with `db.log().hash_at(&version)` and `db.verify()`. A match shows
+cannot edit. Check an old anchor with `db.log().hash_at(version)` and `db.verify()`. A match shows
 that version and everything before it are unchanged. It is not a signature and says nothing about
 later commits, other branches or whether timestamps were true. See [`head_hash` and tamper
 evidence](../internals/history.md#head_hash-and-tamper-evidence).

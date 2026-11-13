@@ -19,10 +19,10 @@ fn messages_written_before_groups_were_recorded_still_split_on_newlines() {
     let db: Db<Counters> = Db::open(&path).unwrap();
     let log = db.log();
     assert_eq!(
-        log.get(&1).unwrap().messages().collect::<Vec<_>>(),
+        log.get(1).unwrap().messages().collect::<Vec<_>>(),
         vec!["first"]
     );
-    let joined = log.get(&2).unwrap();
+    let joined = log.get(2).unwrap();
     assert_eq!(joined.message, "one\ntwo");
     assert_eq!(joined.messages().collect::<Vec<_>>(), vec!["one", "two"]);
     db.commit("three\nfour", |root| {
@@ -30,10 +30,10 @@ fn messages_written_before_groups_were_recorded_still_split_on_newlines() {
     })
     .unwrap();
     assert_eq!(
-        db.log().get(&5).unwrap().messages().collect::<Vec<_>>(),
+        db.log().get(5).unwrap().messages().collect::<Vec<_>>(),
         vec!["three\nfour"]
     );
-    assert_eq!(log.get(&2).unwrap().messages().count(), 2);
+    assert_eq!(log.get(2).unwrap().messages().count(), 2);
     db.verify().unwrap();
 }
 

@@ -27,12 +27,12 @@ fn a_value_read_in_this_process_is_not_written_again() {
     let value = seeded(&path);
     let db = fast().open::<Root>(&path).unwrap();
     let copy = (*db.read().get(&1).unwrap()).clone();
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     db.update(|root| {
         root.insert(2, copy);
     })
     .unwrap();
-    let grown = db.size_on_disk() - before;
+    let grown = db.log_bytes() - before;
     assert!(grown < (LARGE / 8) as u64, "{grown}");
     drop(db);
     let db = fast().open::<Root>(&path).unwrap();
@@ -46,13 +46,13 @@ fn a_loaded_value_that_is_encoded_again_keeps_its_object() {
     let path = dir.path().join("d.ferro");
     let value = seeded(&path);
     let db = fast().open::<Root>(&path).unwrap();
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     db.update(|root| {
         root.get_mut(&1).unwrap();
         root.insert(3, "small".to_string());
     })
     .unwrap();
-    let grown = db.size_on_disk() - before;
+    let grown = db.log_bytes() - before;
     assert!(grown < (LARGE / 8) as u64, "{grown}");
     assert_eq!(*db.read().get(&1).unwrap(), value);
     db.verify().unwrap();
@@ -65,12 +65,12 @@ fn a_removed_value_read_back_by_a_later_commit_keeps_its_object() {
     let value = seeded(&path);
     let db = fast().open::<Root>(&path).unwrap();
     let removed = db.update(|root| root.remove(&1)).unwrap().unwrap();
-    let before = db.size_on_disk();
+    let before = db.log_bytes();
     db.update(|root| {
         root.insert(1, (*removed).clone());
     })
     .unwrap();
-    let grown = db.size_on_disk() - before;
+    let grown = db.log_bytes() - before;
     assert!(grown < (LARGE / 8) as u64, "{grown}");
     assert_eq!(*db.read().get(&1).unwrap(), value);
 }

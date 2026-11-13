@@ -317,14 +317,14 @@ fn forged(table: bool, dir: &std::path::Path) -> usize {
             .open::<Mine>(&path)
             .unwrap()
             .log()
-            .hash_at(&1)
+            .hash_at(1)
             .unwrap()
     } else {
         fast()
             .open::<MineMap>(&path)
             .unwrap()
             .log()
-            .hash_at(&1)
+            .hash_at(1)
             .unwrap()
     };
     let tip = entry(

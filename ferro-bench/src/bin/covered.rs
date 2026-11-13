@@ -196,7 +196,7 @@ impl<B: Bank> Opened<B> {
                 .unwrap();
         }
         db.compact(Keep::Last(1)).unwrap();
-        let size = db.size_on_disk();
+        let size = db.log_bytes();
         Opened {
             name,
             db,
@@ -208,7 +208,7 @@ impl<B: Bank> Opened<B> {
     }
 
     fn commits(&mut self, count: u64, mut edit: impl FnMut(&mut B, &mut u64, u64)) -> Cost {
-        let before = self.db.size_on_disk();
+        let before = self.db.log_bytes();
         let mut cpu = Vec::with_capacity(count as usize);
         for i in 0..count {
             let rng = &mut self.rng;
@@ -217,7 +217,7 @@ impl<B: Bank> Opened<B> {
             cpu.push((cpu_ns() - started) as f64 / 1000.0);
         }
         Cost {
-            bytes: (self.db.size_on_disk() - before) as f64 / count as f64,
+            bytes: (self.db.log_bytes() - before) as f64 / count as f64,
             cpu_us: median(cpu),
         }
     }

@@ -172,7 +172,7 @@ fn build_branched(path: &Path, seed: u64) -> u64 {
             }
             2 if db.version() > 3 => {
                 let back = db.at(db.version() - 1 - rng.below(3)).unwrap();
-                db.restore(&back).unwrap();
+                db.restore(&back, "restore").unwrap();
             }
             _ => {
                 let (outer, inner) = (rng.below(40), rng.below(200));

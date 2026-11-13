@@ -73,7 +73,7 @@ fn an_err_from_try_merge_with_discards_the_merge_and_returns_the_typed_error() {
     let db = open(&path);
     let (side, forked) = diverged(&db);
     let (version, head, before) = (db.version(), db.head_hash(), db.read());
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
 
     let mut ran = 0;
     let refused = db.try_merge_with(&side, |ours, base, theirs| {
@@ -87,7 +87,7 @@ fn an_err_from_try_merge_with_discards_the_merge_and_returns_the_typed_error() {
     assert_eq!(ran, 1);
     assert_eq!((db.version(), db.head_hash()), (version, head));
     assert_eq!(*db.read(), *before);
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
     assert_eq!(db.common_ancestor(&side).unwrap().version(), forked);
 
     let done = db
@@ -101,7 +101,7 @@ fn an_err_from_try_merge_with_discards_the_merge_and_returns_the_typed_error() {
         (done.value, done.version, done.changed),
         (2, version + 1, true)
     );
-    assert_eq!(done.time_ms, db.log().get(&done.version).unwrap().time_ms);
+    assert_eq!(done.time_ms, db.log().get(done.version).unwrap().time_ms);
     assert_eq!(db.common_ancestor(&side).unwrap().version(), side.version());
     let merged: Vec<(u64, i64)> = db.read().counts.iter().map(|(k, v)| (k, *v)).collect();
     assert_eq!(merged, vec![(1, 5), (2, 2), (3, 3)]);

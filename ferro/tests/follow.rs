@@ -125,8 +125,8 @@ fn follows_cycles(poll: Option<Duration>) {
         });
         assert_eq!(*reader.read().get(&(100 + round)).unwrap(), round);
         assert_eq!(
-            reader.size_on_disk(),
-            writer.size_on_disk(),
+            reader.log_bytes(),
+            writer.log_bytes(),
             "the reader reads the new file"
         );
     }
@@ -264,7 +264,7 @@ fn a_follower_whose_refresh_fails_keeps_trying_and_reporting_until_it_succeeds()
     put(&writer, 1, 1);
     let reader = follower(&path, QUICK);
     let watcher = reader.watch();
-    let start = writer.size_on_disk() + 100;
+    let start = writer.log_bytes() + 100;
     armed.store(true, Ordering::Release);
     let held = {
         let writer = writer.clone();

@@ -133,7 +133,7 @@ fn main() {
                 false => db.version(),
             }
         };
-        let (bytes_before, version_before) = (db.size_on_disk(), total(&lanes));
+        let (bytes_before, version_before) = (db.log_bytes(), total(&lanes));
         let stop = Arc::new(AtomicBool::new(false));
         let handles: Vec<_> = (0..count)
             .map(|writer| {
@@ -172,7 +172,7 @@ fn main() {
         let elapsed = started.elapsed().as_secs_f64();
         samples.sort_unstable();
         let closures = samples.len() as f64;
-        let grown = (db.size_on_disk() - bytes_before) as f64;
+        let grown = (db.log_bytes() - bytes_before) as f64;
         let versions = (total(&lanes) - version_before) as f64;
         println!(
             "{label} writers={count} closures_per_s={:.0} versions_per_s={:.0} per_version={:.2} bytes_per_closure={:.0} p50={:.0}us p99={:.0}us max={:.0}us",

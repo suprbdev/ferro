@@ -230,7 +230,7 @@ fn main() {
         let measured = round == 1;
         let (mut hold, mut confirm, mut cancel) =
             (Cost::default(), Cost::default(), Cost::default());
-        let before = db.size_on_disk();
+        let before = db.log_bytes();
         let mut wrote = 0;
         for i in 0..if measured { pairs } else { warm } {
             let now = start_ms + i;
@@ -268,7 +268,7 @@ fn main() {
         }
         if measured {
             costs = (hold, confirm, cancel);
-            bytes = db.size_on_disk() - before;
+            bytes = db.log_bytes() - before;
             writes = wrote;
         }
     }

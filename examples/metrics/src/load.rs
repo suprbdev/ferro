@@ -155,10 +155,10 @@ fn sample_sizes(tsdb: &Tsdb, total: Duration, start: Instant) -> Vec<(f64, u64)>
     let pause = (total / SIZE_SAMPLES).max(Duration::from_millis(50));
     let mut samples = Vec::new();
     while start.elapsed() < total {
-        samples.push((start.elapsed().as_secs_f64(), tsdb.db.size_on_disk()));
+        samples.push((start.elapsed().as_secs_f64(), tsdb.db.log_bytes()));
         thread::sleep(pause.min(total.saturating_sub(start.elapsed())));
     }
-    samples.push((start.elapsed().as_secs_f64(), tsdb.db.size_on_disk()));
+    samples.push((start.elapsed().as_secs_f64(), tsdb.db.log_bytes()));
     samples
 }
 
@@ -226,7 +226,7 @@ pub fn run(path: &Path, options: &LoadOptions) -> Result<LoadReport> {
     report.latencies_ms.sort_by(|a, b| a.total_cmp(b));
     report.size_samples = samples;
     let space = tsdb.db.space()?;
-    report.file_bytes = tsdb.db.size_on_disk();
+    report.file_bytes = tsdb.db.log_bytes();
     report.live_bytes = space.live_bytes;
     report.cycles = space.cycles;
     report.longest_pause = space.longest_pause;

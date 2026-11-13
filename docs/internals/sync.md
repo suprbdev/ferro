@@ -323,7 +323,7 @@ refused attempt sends its have and as much of its bundle as was read before the 
 bundle over 1 MiB that was placed before its landing refused it stays in the log until the next
 reclamation cycle. After three, the caller gets `StaleHave` and decides, as it would from
 `receive`. `receive` and `receive_from` do not retry, because the bundle came from the caller and
-only the caller can fetch another. The `Pulled` a pull returns describes the attempt that landed:
+only the caller can fetch another. The `Synced` a pull returns describes the attempt that landed:
 its have, its bundle and their bytes.
 
 A have names what the branch table as last published holds, and a shared writer publishes another

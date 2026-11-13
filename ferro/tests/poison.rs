@@ -286,7 +286,7 @@ fn failed_write_poisons_until_reopen() {
     assert_eq!(db.version(), version);
     assert_eq!(db.read().len(), length);
     db.verify().unwrap();
-    assert!(db.size_on_disk() <= dirty);
+    assert!(db.log_bytes() <= dirty);
     for key in 0..length as u64 {
         assert_eq!(*db.read().get(&key).unwrap(), text(key, 700));
     }

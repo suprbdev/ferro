@@ -463,13 +463,13 @@ fn a_base_pruned_between_placing_and_landing_fails_and_leaves_a_file_that_reclai
     let pair = Pair::new(2_000, 1_500, options);
     let Pair { a, b, bundle, .. } = &pair;
     *cell.lock() = Some(b.clone());
-    let size = b.size_on_disk();
+    let size = b.log_bytes();
     match b.receive_from("a", &bundle[..], merge_in) {
         Err(Error::StaleHave(_)) => {}
         other => panic!("landed on a pruned base: {other:?}"),
     }
     assert!(cell.lock().is_none());
-    assert!(b.size_on_disk() > size + bundle.len() as u64 / 2);
+    assert!(b.log_bytes() > size + bundle.len() as u64 / 2);
     b.verify_typed().unwrap();
     let reclaimed = b.compact(Keep::Last(1)).unwrap();
     assert!(
@@ -634,7 +634,7 @@ fn open_cut(target: &Path, image: &[u8], cut: usize, loss: usize) -> Db<Root> {
     let size = fs::metadata(target).unwrap().len();
     assert_eq!(
         size,
-        db.size_on_disk(),
+        db.log_bytes(),
         "cut {cut} loss {loss} kept a partial frame"
     );
     db

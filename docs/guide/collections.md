@@ -62,9 +62,10 @@ range within a group, such as one account's postings between two dates, still ta
 ## Cutting, joining and batching
 
 `Map` and `Set` also have `remove_range`, `take_range`, `split_off` and `append`, which cut and join
-trees in O(log n) nodes however many entries move. `Table::drain_range` removes a key range and
-returns the rows, which is O(rows) because every index has to be updated. `Map::apply` takes a batch
-of puts and deletes and merges it in one descent of the tree, as `extend` does for puts.
+trees in O(log n) nodes however many entries move. `Table` has `take_range`, which returns the rows
+of a key range as a table of their own with its indexes, and `remove_range`, which returns how many
+it removed. Both are O(rows) because every index has to be updated. `Map::apply` takes a batch of
+puts and deletes and merges it in one descent of the tree, as `extend` does for puts.
 
 ## Summaries
 

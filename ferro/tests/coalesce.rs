@@ -241,7 +241,7 @@ fn closures_queued_behind_a_sync_share_one_version() {
     assert_eq!(counter(&db.read()), 7);
     let log = db.log();
     assert_eq!(log.len(), 3);
-    let commit = log.get(&3).unwrap();
+    let commit = log.get(3).unwrap();
     let mut messages: Vec<&str> = commit.messages().collect();
     messages.sort_unstable();
     assert_eq!(messages, vec!["m0", "m1", "m2", "m3", "m4"]);
@@ -284,19 +284,9 @@ fn multi_line_messages_stay_whole_alone_and_in_a_group() {
     }
     let read = |db: &Db<Root>| {
         let log = db.log();
-        let mut group: Vec<String> = log
-            .get(&4)
-            .unwrap()
-            .messages()
-            .map(str::to_string)
-            .collect();
+        let mut group: Vec<String> = log.get(4).unwrap().messages().map(str::to_string).collect();
         group.sort_unstable();
-        let alone: Vec<String> = log
-            .get(&2)
-            .unwrap()
-            .messages()
-            .map(str::to_string)
-            .collect();
+        let alone: Vec<String> = log.get(2).unwrap().messages().map(str::to_string).collect();
         (alone, group)
     };
     let mut expected: Vec<String> = names.iter().map(|name| name.to_string()).collect();
@@ -305,7 +295,7 @@ fn multi_line_messages_stay_whole_alone_and_in_a_group() {
         read(&db),
         (vec!["alone\nsecond line".to_string()], expected.clone())
     );
-    let message = db.log().get(&4).unwrap().message.clone();
+    let message = db.log().get(4).unwrap().message.clone();
     assert_eq!(message.matches('\n').count(), 8);
     drop(db);
     let reopened = Options::new().open::<Root>(&path).unwrap();
@@ -445,7 +435,7 @@ fn a_panic_with_nobody_else_writes_nothing() {
     quiet_ferro_panics();
     let _turn = serial();
     let (_dir, _path, db) = database();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         db.update(|root| {
             root.insert(50, 50);
@@ -453,7 +443,7 @@ fn a_panic_with_nobody_else_writes_nothing() {
         })
     }));
     assert!(outcome.is_err());
-    assert_eq!(db.size_on_disk(), size);
+    assert_eq!(db.log_bytes(), size);
     assert_eq!(db.version(), 1);
     assert_eq!(db.update(increment).unwrap(), 2);
 }
@@ -657,10 +647,10 @@ fn a_no_op_beside_a_real_change_shares_the_groups_version() {
 fn a_closure_alone_keeps_the_plain_path() {
     let _turn = serial();
     let (_dir, _path, db) = database();
-    let size = db.size_on_disk();
+    let size = db.log_bytes();
     let done = db.commit_with(|root| ("one", increment(root))).unwrap();
     assert_eq!((done.version, done.value, done.changed), (2, 2, true));
-    assert!(db.size_on_disk() > size);
+    assert!(db.log_bytes() > size);
     let done = db.commit_with(|_| ("none", ())).unwrap();
     assert_eq!((done.version, done.changed), (2, false));
     assert_eq!(db.read().commit().message, "one");
@@ -727,9 +717,9 @@ fn a_closure_stops_waiting_for_followers_that_are_slow_to_reach_the_lock() {
     assert_eq!(closer_then_follower(&db, &arrivals), (3, 4));
     assert_eq!(counter(&db.read()), 5);
     let log = db.log();
-    assert_eq!(log.get(&2).unwrap().messages().count(), 2);
+    assert_eq!(log.get(2).unwrap().messages().count(), 2);
     assert_eq!(
-        log.get(&3).unwrap().messages().collect::<Vec<_>>(),
+        log.get(3).unwrap().messages().collect::<Vec<_>>(),
         vec!["closer"]
     );
 }
@@ -799,7 +789,7 @@ fn a_member_that_seals_a_newer_group_on_its_way_wakes_that_group() {
     assert_eq!(counter(&db.read()), 4);
     let log = db.log();
     assert_eq!(
-        log.get(&4).unwrap().messages().collect::<Vec<_>>(),
+        log.get(4).unwrap().messages().collect::<Vec<_>>(),
         vec!["late"]
     );
 }
@@ -999,7 +989,7 @@ fn restore_merge_fork_and_drop_flush_the_open_group_first() {
     settle_queue();
     let restorer = {
         let (db, old) = (db.clone(), old.clone());
-        thread::spawn(move || db.restore(&old))
+        thread::spawn(move || db.restore(&old, "restore"))
     };
     settle_queue();
     let merger = {
@@ -1032,7 +1022,7 @@ fn restore_merge_fork_and_drop_flush_the_open_group_first() {
     assert_eq!(db.branches(), vec!["late", "main", "side"]);
     let log = db.log();
     assert_eq!(
-        log.get(&restored.version).unwrap().restored,
+        log.get(restored.version).unwrap().restored,
         Some(old.version())
     );
     assert!(log.len() >= 5);
@@ -1447,7 +1437,7 @@ fn stamps_in_a_group_name_the_groups_version_and_time() {
         assert_eq!(done.value, (3, 8_000));
         assert_eq!((done.version, done.time_ms, done.changed), (3, 8_000, true));
     }
-    assert_eq!(db.log().get(&3).unwrap().time_ms, 8_000);
+    assert_eq!(db.log().get(3).unwrap().time_ms, 8_000);
     assert_eq!(db.as_of(8_000).unwrap().version(), 3);
     assert_eq!(counter(&db.as_of(8_000).unwrap()), 5);
     let after = db.commit_with(|root| ("after", increment(root))).unwrap();
@@ -1490,6 +1480,6 @@ fn a_closure_that_fails_after_reading_the_time_takes_back_only_its_own_claim() {
     let last = db.commit_with(|root| ("last", increment(root))).unwrap();
     assert_eq!((last.version, last.time_ms), (7, 9_001));
     assert_eq!(db.as_of(9_000).unwrap().version(), 6);
-    let group = db.log().get(&6).unwrap();
+    let group = db.log().get(6).unwrap();
     assert_eq!(group.messages().collect::<Vec<_>>(), vec!["kept"]);
 }

@@ -115,12 +115,12 @@ fn run_history(seed: u64, options: fn() -> Options, steps: usize) {
             }
             6 => {
                 let before = handle.version();
-                let size = handle.size_on_disk();
+                let size = handle.log_bytes();
                 handle.update(|_| {}).unwrap();
                 let current = branches[index].versions.last().unwrap().clone();
                 handle.update(|root| set_contents(root, &current)).unwrap();
                 assert_eq!(handle.version(), before);
-                assert_eq!(handle.size_on_disk(), size);
+                assert_eq!(handle.log_bytes(), size);
             }
             7 => {
                 forks += 1;
@@ -137,7 +137,10 @@ fn run_history(seed: u64, options: fn() -> Options, steps: usize) {
                 let snapshot = handle.at(target).unwrap();
                 let wanted = branches[index].versions[target as usize].clone();
                 let current = branches[index].versions.last().unwrap().clone();
-                let version = handle.restore(&snapshot).unwrap().version;
+                let version = handle
+                    .restore(&snapshot, format!("restore v{target}"))
+                    .unwrap()
+                    .version;
                 if wanted == current {
                     assert_eq!(version, branches[index].versions.len() as u64 - 1);
                 } else {
@@ -253,13 +256,19 @@ fn restore_of_head_is_a_no_op_and_restore_of_genesis_commits() {
     })
     .unwrap();
     let head = db.read();
-    assert_eq!(db.restore(&head).unwrap().version, 1);
+    assert_eq!(db.restore(&head, "restore").unwrap().version, 1);
     assert_eq!(db.version(), 1);
     let genesis = db.at(0).unwrap();
-    assert_eq!(db.restore(&genesis).unwrap().version, 2);
+    assert_eq!(db.restore(&genesis, "restore").unwrap().version, 2);
     assert!(db.read().is_empty());
-    assert_eq!(db.restore(&db.at(0).unwrap()).unwrap().version, 2);
-    assert_eq!(db.restore(&db.at(1).unwrap()).unwrap().version, 3);
+    assert_eq!(
+        db.restore(&db.at(0).unwrap(), "restore").unwrap().version,
+        2
+    );
+    assert_eq!(
+        db.restore(&db.at(1).unwrap(), "restore").unwrap().version,
+        3
+    );
     assert_eq!(*db.read().get(&1).unwrap(), "one");
     assert_eq!(db.read().root_hash(), db.at(1).unwrap().root_hash());
     assert_eq!(db.log().len(), 3);
@@ -278,7 +287,7 @@ fn restore_from_another_branch_copies_contents() {
         root.insert(2, "y".repeat(2000));
     })
     .unwrap();
-    db.restore(&fork.read()).unwrap();
+    db.restore(&fork.read(), "restore").unwrap();
     assert_eq!(db.version(), 2);
     assert_eq!(db.read().root_hash(), fork.read().root_hash());
 }
@@ -414,10 +423,10 @@ fn ptr_of_commit_points_at_the_recorded_root() {
     })
     .unwrap();
     let log = db.log();
-    assert_eq!(log.get(&1).unwrap().message, "one");
-    assert_eq!(log.get(&2).unwrap().message, "two");
-    assert_ne!(log.get(&1).unwrap().root, log.get(&2).unwrap().root);
-    assert!(log.get(&1).unwrap().root.is_some());
+    assert_eq!(log.get(1).unwrap().message, "one");
+    assert_eq!(log.get(2).unwrap().message, "two");
+    assert_ne!(log.get(1).unwrap().root, log.get(2).unwrap().root);
+    assert!(log.get(1).unwrap().root.is_some());
 }
 
 #[test]

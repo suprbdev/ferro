@@ -486,7 +486,7 @@ fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outco
     let world = Arc::new(world(&svc, args)?);
     let stop = Arc::new(AtomicBool::new(false));
     let version_before = svc.db().version();
-    let bytes_before = svc.db().size_on_disk();
+    let bytes_before = svc.db().log_bytes();
     let started = Instant::now();
     let mut handles = Vec::new();
     for index in 0..args.threads {
@@ -527,7 +527,7 @@ fn run(path: &Path, coalesce: bool, args: &Args, progress: bool) -> Result<Outco
     }
     let secs = started.elapsed().as_secs_f64();
     let versions = svc.db().version() - version_before;
-    let bytes = svc.db().size_on_disk() - bytes_before;
+    let bytes = svc.db().log_bytes() - bytes_before;
     thread::sleep(Duration::from_millis(args.ttl_max + 20));
     quiet.store(true, Ordering::Relaxed);
     tally.absorb(sweeping.join().expect("sweeper panicked"));

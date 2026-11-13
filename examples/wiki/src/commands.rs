@@ -260,7 +260,7 @@ pub fn run(w: &mut dyn Write, db: &Db<Wiki>, command: Command) -> Res<()> {
             let stats = query::stats(&snapshot, deep);
             writeln!(w, "branch:    {}", db.branch_name())?;
             writeln!(w, "version:   v{}", snapshot.version())?;
-            writeln!(w, "database:  {}", bytes(db.size_on_disk()))?;
+            writeln!(w, "database:  {}", bytes(db.log_bytes()))?;
             writeln!(w, "pages:     {}", stats.pages)?;
             writeln!(w, "terms:     {}", stats.terms)?;
             writeln!(w, "postings:  {}", stats.postings)?;

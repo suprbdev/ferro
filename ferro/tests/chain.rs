@@ -27,7 +27,7 @@ fn every_version_is_reachable_through_skip_pointers() {
         assert_eq!(snapshot.version(), version);
         assert_eq!(*snapshot.get(&0).unwrap(), version);
         assert_eq!(
-            db.log().get(&version).unwrap().message,
+            db.log().get(version).unwrap().message,
             format!("c{version}")
         );
     }

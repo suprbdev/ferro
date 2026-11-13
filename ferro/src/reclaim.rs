@@ -164,7 +164,7 @@ pub struct Space {
     /// so it is never less than [`Space::log_bytes`].
     pub file_bytes: u64,
     /// The bytes the file's log takes, from the start of the file to the end of its newest
-    /// commit, as [`Db::size_on_disk`](crate::Db::size_on_disk) reports them. The staging frames
+    /// commit, as [`Db::log_bytes`](crate::Db::log_bytes) reports them. The staging frames
     /// of a refused receive that a commit followed count here until the next cycle, though on
     /// Linux their records take no disk.
     pub log_bytes: u64,

@@ -287,8 +287,7 @@ fn a_closure_cannot_restore_or_merge_into_its_own_branch() {
         let results = inside_b(kind, &files, |f| {
             let snapshot = f.b.read();
             vec![
-                ("restore", f.b.restore(&snapshot).map(drop)),
-                ("restore_with", f.b.restore_with(&snapshot, "x").map(drop)),
+                ("restore", f.b.restore(&snapshot, "x").map(drop)),
                 ("merge_with", f.b.merge_with(&f.c, merge).map(drop)),
                 (
                     "try_merge_with",
@@ -395,7 +394,7 @@ fn a_closure_cannot_write_a_branch_that_sorts_before_its_own() {
                         out = Some(vec![
                             ("update", files.b.update(|_| ())),
                             ("update_async", block_on(files.a.update_async(|_| ()))),
-                            ("restore", files.b.restore(&files.b.read()).map(drop)),
+                            ("restore", files.b.restore(&files.b.read(), "x").map(drop)),
                             (
                                 "merge into a",
                                 files.a.merge_with(&files.b, merge).map(drop),
@@ -483,7 +482,7 @@ fn a_closure_may_write_branches_that_sort_after_its_own() {
                     block_on(f.c.update_async(|root| set(root, 4))),
                 ),
                 ("merge into c", f.c.merge_with(&f.a, merge).map(drop)),
-                ("restore", f.main.restore(&f.main.read()).map(drop)),
+                ("restore", f.main.restore(&f.main.read(), "x").map(drop)),
                 ("fork from c", f.c.fork("d").map(drop)),
                 ("drop_branch", f.main.drop_branch("d")),
                 ("branch", f.main.branch("c").map(drop)),

@@ -747,9 +747,9 @@ fn commits<T: Data + Default>(
     let mut file = File::open(path).unwrap();
     let mut tally = Tally::default();
     for i in 0..count {
-        let start = db.size_on_disk();
+        let start = db.log_bytes();
         db.update(|root| change(root, i)).unwrap();
-        let end = db.size_on_disk();
+        let end = db.log_bytes();
         split_frame(
             &read_frame(&mut file, start, end),
             start,
@@ -791,14 +791,14 @@ fn main() {
     if all || workload == "u64" {
         let path = dir.path().join("u64.ferro");
         let db = Options::new().open::<Map<u64, u64>>(&path).unwrap();
-        let start = db.size_on_disk();
+        let start = db.log_bytes();
         db.update(|root| {
             for i in 0..n {
                 root.insert(mix(i), i);
             }
         })
         .unwrap();
-        let end = db.size_on_disk();
+        let end = db.log_bytes();
         drop(db);
         shape(&path, start, end, n);
         let parsers: [Parser; 1] = [parse_node::<u64, u64>];

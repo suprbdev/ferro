@@ -17,7 +17,7 @@ println!("{:?}, {} bytes in", pulled.outcome, pulled.received_bytes);
 ```
 
 `pull` copies the other file's branch into this one as the branch `phone`, then brings this branch
-up to it. It returns a `Pulled` with the `outcome`, the merge closure's `value` if it ran, the
+up to it. It returns a `Synced` with the `outcome`, the merge closure's `value` if it ran, the
 `version` this branch is at afterwards, the number of `objects` the bundle carried, and the
 `sent_bytes` and `received_bytes` of the transfer. The outcome is `UpToDate` when the remote brought
 nothing this branch lacks, `Ahead` when this branch already has all of it and more, `FastForward`
