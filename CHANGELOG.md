@@ -11,6 +11,16 @@ says so under **Format**, and a build refuses a file of another format with `Err
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
+The public API is narrowed to what users need, and the derives' support and the test hooks move out
+of it. Files and sync messages are unchanged.
+
+### Format
+
+- File format 7 and sync format 2, as in 0.1.0: 0.2.0 reads the files 0.1.0 writes, and the two
+  sync with each other.
+
 ### Added
 
 - `#[ferro(crate = "path")]` on a type that derives `Data` or `Record` gives the path its generated
@@ -93,5 +103,6 @@ is one of your own types, persisted in one file, with every commit kept as an im
 Each change is tested on Linux. The tests last ran on Windows on 2026-11-03, before this release,
 and never on macOS. Windows needs NTFS. See [Limitations](docs/guide/limitations.md) for the rest.
 
-[Unreleased]: https://github.com/archlemon/ferro/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/archlemon/ferro/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/archlemon/ferro/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/archlemon/ferro/releases/tag/v0.1.0
