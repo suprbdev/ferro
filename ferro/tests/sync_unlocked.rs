@@ -458,7 +458,7 @@ fn a_base_pruned_between_placing_and_landing_fails_and_leaves_a_file_that_reclai
     let cell: Cell = Arc::default();
     let options = fast()
         .history(Keep::Last(1))
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .hook(hooked(cell.clone(), "placed", prune_away_base));
     let pair = Pair::new(2_000, 1_500, options);
     let Pair { a, b, bundle, .. } = &pair;
@@ -500,7 +500,7 @@ fn a_pull_whose_base_is_pruned_between_placing_and_landing_tries_again_and_lands
     };
     let options = fast()
         .history(Keep::Last(1))
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .hook(hook);
     let pair = Pair::new(2_000, 1_500, options);
     let Pair { a, b, bundle, .. } = &pair;
@@ -552,9 +552,9 @@ fn commits_between_placing_and_landing_keep_their_frames() {
 
 #[test]
 fn reclamation_due_during_a_large_receive_runs_once_it_lands() {
-    let options = fast().history(Keep::Last(8)).reclaim(Reclaim {
-        every_bytes: 1 << 20,
-    });
+    let options = fast()
+        .history(Keep::Last(8))
+        .reclaim(Reclaim::every(1 << 20));
     let pair = Pair::new(2_000, 1_500, options);
     let Pair { a, b, bundle, .. } = &pair;
     let before = b.space().unwrap().cycles;

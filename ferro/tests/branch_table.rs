@@ -16,7 +16,7 @@ fn dir() -> TempDir {
 fn options() -> Options {
     Options::new()
         .durability(Durability::Buffered)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
 }
 
 fn name(branch: u64) -> String {

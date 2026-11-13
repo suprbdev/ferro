@@ -1360,7 +1360,7 @@ fn damaged_branch_table(path: &Path, aside: Option<&str>) {
 }
 
 fn manual() -> Options {
-    Options::new().reclaim(Reclaim { every_bytes: 0 })
+    Options::new().reclaim(Reclaim::off())
 }
 
 #[test]

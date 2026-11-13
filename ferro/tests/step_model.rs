@@ -14,7 +14,7 @@ fn options(keep: Keep, cache: u64) -> Options {
     Options::new()
         .durability(Durability::Buffered)
         .history(keep)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .cache_bytes(cache)
 }
 

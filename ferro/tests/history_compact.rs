@@ -152,6 +152,7 @@ fn retained(versions: &[Version], keep: Keep) -> Vec<u64> {
             }
         }
         Keep::Within(_) => unreachable!("the strategy never picks an age"),
+        _ => unreachable!("the model knows every Keep"),
     }
     all.iter().map(|v| v.version).collect()
 }

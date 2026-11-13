@@ -14,6 +14,7 @@ use std::io;
 /// The variants that carry a `String` describe what was found, for a person to read; match on the
 /// variant, not on the text.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A call to the operating system failed.
     ///

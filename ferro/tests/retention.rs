@@ -11,7 +11,7 @@ use ferro::{Db, Error, Keep, Map, Options, Reclaim};
 type Root = Map<u64, u64>;
 
 fn options() -> Options {
-    fast().reclaim(Reclaim { every_bytes: 0 })
+    fast().reclaim(Reclaim::off())
 }
 
 fn put(db: &Db<Root>, key: u64) {
@@ -194,6 +194,7 @@ impl Modeled {
             Keep::Last(count) => (last + 1).saturating_sub(count.max(1) as u64),
             Keep::Since(cut) => since(cut),
             Keep::Within(age) => since(now.saturating_sub(age.as_millis() as u64)),
+            _ => unreachable!("the model knows every Keep"),
         };
         first.max(self.first).min(*last)
     }

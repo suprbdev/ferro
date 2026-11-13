@@ -32,7 +32,7 @@ pub fn options() -> Options {
     Options::new()
         .durability(Durability::Buffered)
         .cache_bytes(1 << 20)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .clock(Clock(Arc::new(|| CLOCK_MS)))
 }
 

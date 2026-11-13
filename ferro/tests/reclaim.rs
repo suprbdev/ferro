@@ -18,7 +18,7 @@ use tempfile::TempDir;
 
 type Root = Map<u64, String>;
 
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 fn dir() -> TempDir {
     tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
@@ -894,9 +894,7 @@ fn the_history_option_prunes_on_commit_and_reclaims_in_the_background() {
     let path = path_in(&dir);
     let db: Db<Root> = fast()
         .history(Keep::Last(5))
-        .reclaim(Reclaim {
-            every_bytes: 256 << 10,
-        })
+        .reclaim(Reclaim::every(256 << 10))
         .open(&path)
         .unwrap();
     let started = Instant::now();
@@ -927,9 +925,7 @@ fn dropping_the_last_handle_stops_the_background_thread_and_frees_the_lock() {
     for _ in 0..5 {
         let db: Db<Root> = fast()
             .history(Keep::Last(1))
-            .reclaim(Reclaim {
-                every_bytes: 4 << 10,
-            })
+            .reclaim(Reclaim::every(4 << 10))
             .open(&path)
             .unwrap();
         fill(&db, 300, 20);
@@ -960,9 +956,7 @@ fn shutting_down_during_a_copy_abandons_it_and_leaves_no_temp_file() {
     };
     let db: Db<Root> = fast()
         .history(Keep::Last(2))
-        .reclaim(Reclaim {
-            every_bytes: 32 << 10,
-        })
+        .reclaim(Reclaim::every(32 << 10))
         .hook(Hook(Arc::new(hook)))
         .open(&path)
         .unwrap();
@@ -1170,9 +1164,7 @@ fn a_trigger_raised_during_a_cycle_does_not_run_another() {
     let db: Db<Root> = Options::new()
         .durability(Durability::Buffered)
         .history(Keep::Last(1))
-        .reclaim(Reclaim {
-            every_bytes: 64 << 10,
-        })
+        .reclaim(Reclaim::every(64 << 10))
         .hook(Hook(Arc::new(hook)))
         .open(&path)
         .unwrap();

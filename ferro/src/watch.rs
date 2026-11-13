@@ -720,6 +720,7 @@ enum Look<T> {
 /// # Panics
 ///
 /// A receive that runs a filter on its own thread panics if the filter panics.
+#[must_use = "a watcher hands out new snapshots only while it is held"]
 pub struct Watcher<T> {
     feed: Arc<Feed<T>>,
     gate: Arc<Gate<T>>,

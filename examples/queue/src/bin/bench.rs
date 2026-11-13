@@ -477,9 +477,7 @@ fn cycle(args: &HashMap<String, String>) {
         &path,
         QueueOptions {
             history: Keep::Last(keep),
-            reclaim: Reclaim {
-                every_bytes: every << 20,
-            },
+            reclaim: Reclaim::every(every << 20),
             ..QueueOptions::default()
         },
     )

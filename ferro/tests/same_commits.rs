@@ -18,7 +18,7 @@ fn options(cache: u64, keep: Keep) -> Options {
     fast()
         .cache_bytes(cache)
         .history(keep)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .clock(Clock(Arc::new(|| 1_700_000_000_000)))
 }
 

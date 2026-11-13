@@ -10,7 +10,7 @@ use ferro::{Keep, Options, Reclaim};
 
 let db = Options::new()
     .history(Keep::Last(1000))
-    .reclaim(Reclaim { every_bytes: 64 << 20 })
+    .reclaim(Reclaim::every(64 << 20))
     .open::<Shop>("shop.ferro")?;
 
 let space = db.space()?;
@@ -32,7 +32,7 @@ does. A cycle copies what is retained to a new file and swaps it in. Writers wai
 for the swap, and readers do not wait at all.
 
 Background cycles run only on a writer with a `history` other than `Keep::All`, and
-`Reclaim { every_bytes: 0 }` turns them off. A cycle walks the log on the calling or background
+`Reclaim::off()` turns them off. A cycle walks the log on the calling or background
 thread and copies the trees it reaches, checking every object's hash, on up to seven more.
 `Options::copy_threads` sets the total, which defaults to the number of cores up to 8, and
 `copy_threads(1)` keeps a cycle on one thread. The copy is the same file at any number of threads,

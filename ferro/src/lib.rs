@@ -74,6 +74,7 @@
 //! internals, which describe how each part works and what it costs.
 
 #![warn(missing_docs)]
+#![warn(missing_debug_implementations)]
 
 extern crate self as ferro;
 
@@ -99,6 +100,7 @@ mod refs;
 pub mod set;
 mod shared;
 mod stack;
+#[doc(hidden)]
 pub mod store;
 pub mod sync;
 pub mod table;

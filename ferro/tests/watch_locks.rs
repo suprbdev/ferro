@@ -18,7 +18,7 @@ use ferro::{Db, Keep, Map, Options, Reclaim};
 type Root = Map<u64, u64>;
 
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;

@@ -521,7 +521,7 @@ fn open_options(run: &Run) -> Options {
         .durability(durability)
         .cache_bytes(1 << 28)
         .history(Keep::Last(run.keep))
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
 }
 
 fn run_metrics(path: &Path, run: &Run) {
@@ -707,15 +707,12 @@ fn copy(path: &Path, rounds: u64, threads: &[usize]) {
         for &count in threads {
             fs::copy(path, &work).unwrap();
             if again {
-                let db: Db<Opaque> = Options::new()
-                    .reclaim(Reclaim { every_bytes: 0 })
-                    .open(&work)
-                    .unwrap();
+                let db: Db<Opaque> = Options::new().reclaim(Reclaim::off()).open(&work).unwrap();
                 db.compact(keep).unwrap();
             }
             File::open(&work).unwrap().sync_all().unwrap();
             let db: Db<Opaque> = Options::new()
-                .reclaim(Reclaim { every_bytes: 0 })
+                .reclaim(Reclaim::off())
                 .copy_threads(count)
                 .open(&work)
                 .unwrap();

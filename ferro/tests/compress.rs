@@ -194,7 +194,7 @@ fn a_damaged_raw_length_fails_verify_a_read_and_a_cycle() {
     for threads in [1, 4] {
         let db = fast()
             .cache_bytes(1)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .copy_threads(threads)
             .open::<Root>(&path)
             .unwrap();

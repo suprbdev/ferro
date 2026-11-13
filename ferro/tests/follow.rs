@@ -11,7 +11,7 @@ use ferro::{Db, Error, Keep, Map, Reclaim};
 type Root = Map<u64, u64>;
 
 const SOON: Duration = Duration::from_secs(10);
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 const QUICK: Option<Duration> = Some(Duration::from_millis(2));
 
 fn put(db: &Db<Root>, key: u64, value: u64) {

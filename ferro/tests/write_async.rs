@@ -23,7 +23,7 @@ use tempfile::TempDir;
 
 type Root = Map<u64, u64>;
 
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 const PATIENCE: Duration = Duration::from_secs(30);
 
 struct Flag {

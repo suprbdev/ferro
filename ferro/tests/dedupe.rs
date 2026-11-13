@@ -98,7 +98,7 @@ fn a_deduplicated_commit_survives_a_reopen_and_compaction() {
 
 fn same_clock() -> Options {
     fast()
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .clock(Clock(Arc::new(|| 1_700_000_000_000)))
 }
 

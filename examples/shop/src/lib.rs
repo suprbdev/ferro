@@ -81,9 +81,9 @@ pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Shop>> {
         .read_only(config.replica)
         .follow(config.replica);
     let options = match config.keep_versions {
-        Some(count) if !config.replica => options.history(Keep::Last(count)).reclaim(Reclaim {
-            every_bytes: config.reclaim_bytes,
-        }),
+        Some(count) if !config.replica => options
+            .history(Keep::Last(count))
+            .reclaim(Reclaim::every(config.reclaim_bytes)),
         _ => options,
     };
     options.open::<Shop>(path)

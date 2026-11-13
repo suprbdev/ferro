@@ -853,7 +853,7 @@ fn merge_beside_pruning_commits_in_their_sync(durability: Durability) {
     let main: Db<Events> = Options::new()
         .durability(durability)
         .history(Keep::Last(2))
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .hook(hook)
         .open(dir.path().join("m.ferro"))
         .unwrap();

@@ -25,7 +25,7 @@ const DROP_AT: u64 = 15;
 const SPREAD: u64 = 1 << 32;
 const SECTOR: usize = 512;
 const LOG_START: u64 = 8192;
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 fn dir() -> TempDir {
     tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()

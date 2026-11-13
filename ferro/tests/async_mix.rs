@@ -409,10 +409,8 @@ fn run(options: Options, seed: u64) -> BTreeMap<&'static str, usize> {
 
 #[test]
 fn awaited_and_blocking_writes_survive_forks_drops_merges_and_compaction() {
-    let manual = Reclaim { every_bytes: 0 };
-    let background = Reclaim {
-        every_bytes: 1 << 15,
-    };
+    let manual = Reclaim::off();
+    let background = Reclaim::every(1 << 15);
     let kinds = [
         Options::new()
             .durability(Durability::Buffered)

@@ -239,7 +239,7 @@ fn a_file_a_cycle_retires_while_a_writer_caches_what_it_wrote_closes_once_nothin
         Options::new()
             .durability(Durability::Buffered)
             .cache_bytes(64 << 20)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .shared(true)
             .open::<Nested>(&path)
             .unwrap()

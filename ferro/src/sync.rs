@@ -190,6 +190,7 @@ pub enum Outcome {
 
 /// What a pull or receive did.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Pulled<R> {
     /// How this branch was brought up to the remote one.
     pub outcome: Outcome,

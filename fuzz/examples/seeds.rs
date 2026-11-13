@@ -87,7 +87,7 @@ fn options() -> Options {
     Options::new()
         .durability(Durability::Buffered)
         .cache_bytes(1 << 20)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
 }
 
 fn text(seed: u64, len: usize) -> String {

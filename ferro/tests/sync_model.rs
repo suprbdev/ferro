@@ -127,7 +127,7 @@ fn open(path: &Path, setup: Setup, now: &Arc<AtomicU64>) -> Db<Counts> {
     let options = fast()
         .clock(Clock(Arc::new(move || now.fetch_add(1, Ordering::SeqCst))))
         .history(setup.keep)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .shared(setup.shared);
     options.open(path).unwrap()
 }

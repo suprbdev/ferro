@@ -19,7 +19,7 @@ use ferro::{Data, Db, Durability, Error, Map, Options, Reclaim};
 type Root = Map<u64, u64>;
 
 const PATIENCE: Duration = Duration::from_secs(30);
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 const BRANCHES: [&str; 4] = ["main", "a", "b", "c"];
 const HUNG: [u64; 6] = [5, 183, 2344, 3255, 7393, 8082];
 

@@ -2342,7 +2342,7 @@ fn keep_last_prunes_a_branch_a_pull_brings_up_and_the_branch_it_landed() {
     let a = open(&dir, "a.ferro");
     let b: Db<Root> = fast()
         .history(Keep::Last(2))
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .open(dir.path().join("b.ferro"))
         .unwrap();
     let lens = |b: &Db<Root>| (b.log().len(), b.branch("a").unwrap().log().len());
@@ -6559,7 +6559,7 @@ fn a_pull_whose_have_goes_stale_on_every_attempt_gives_up_after_three() {
     let a = open(&dir, "a.ferro");
     let b: Db<Root> = fast()
         .history(Keep::Last(1))
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .hook(hook)
         .open(dir.path().join("b.ferro"))
         .unwrap();
@@ -6593,7 +6593,7 @@ fn a_pull_whose_have_goes_stale_on_every_attempt_gives_up_after_three() {
 fn pruned_events(path: &Path, keep: usize) -> Db<Events> {
     fast()
         .history(Keep::Last(keep))
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .open(path)
         .unwrap()
 }
@@ -6881,7 +6881,7 @@ fn a_remote_landed_again_after_a_drop_keeps_the_links_it_landed_with() {
         let now = now.clone();
         fast()
             .history(keep)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .clock(Clock(Arc::new(move || now.fetch_add(1, Ordering::SeqCst))))
             .open(dir.path().join(name))
             .unwrap()
@@ -6925,7 +6925,7 @@ fn a_reader_verifies_a_remote_landed_again_after_a_drop() {
     let open = |name: &str, keep: Keep| -> Db<Events> {
         fast()
             .history(keep)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .open(dir.path().join(name))
             .unwrap()
     };
@@ -6968,7 +6968,7 @@ fn a_writer_with_a_small_cache_verifies_a_remote_landed_again_after_a_drop() {
             fast()
                 .cache_bytes(cache)
                 .history(keep)
-                .reclaim(Reclaim { every_bytes: 0 })
+                .reclaim(Reclaim::off())
                 .open(dir.path().join(name))
                 .unwrap()
         };
@@ -7010,7 +7010,7 @@ fn a_remote_landed_again_during_every_stage_of_a_cycle_verifies_and_reopens() {
             let now = now.clone();
             let mut options = fast()
                 .history(keep)
-                .reclaim(Reclaim { every_bytes: 0 })
+                .reclaim(Reclaim::off())
                 .clock(Clock(Arc::new(move || now.fetch_add(1, Ordering::SeqCst))));
             if hooked {
                 let slot = slot.clone();
@@ -7097,7 +7097,7 @@ fn clocked(
     let now = now.clone();
     let mut options = fast()
         .history(keep)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .clock(Clock(Arc::new(move || now.fetch_add(1, Ordering::SeqCst))));
     if let Some((stage, armed)) = hook {
         let stage = stage.to_string();

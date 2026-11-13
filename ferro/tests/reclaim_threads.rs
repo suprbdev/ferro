@@ -16,7 +16,7 @@ use tempfile::TempDir;
 type Root = Map<u64, String>;
 
 const LOG_START: u64 = 8192;
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 static SERIAL: Mutex<()> = Mutex::new(());
 

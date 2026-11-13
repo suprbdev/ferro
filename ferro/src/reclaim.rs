@@ -84,8 +84,21 @@ impl Hasher for Spread {
 /// When background reclamation cycles run, set with [`Options::reclaim`](crate::Options::reclaim).
 ///
 /// Background cycles run only on a writer whose [`Options::history`](crate::Options::history) is
-/// not [`Keep::All`](crate::Keep::All).
+/// not [`Keep::All`](crate::Keep::All). [`Reclaim::every`] and [`Reclaim::off`] build one, and
+/// [`Reclaim::default`] runs a cycle every 64 MiB.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::{Keep, Options, Reclaim};
+///
+/// let options = Options::new()
+///     .history(Keep::Last(100))
+///     .reclaim(Reclaim::every(256 << 20));
+/// let manual = Options::new().history(Keep::Last(100)).reclaim(Reclaim::off());
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Reclaim {
     /// A cycle runs once the file has grown by this many bytes since the last one, or by its size
     /// after the last one if that is larger. Zero turns background cycles off. The default is 64
@@ -93,17 +106,29 @@ pub struct Reclaim {
     pub every_bytes: u64,
 }
 
+impl Reclaim {
+    /// Runs a cycle once the file has grown by `bytes` since the last one, or by its size after
+    /// the last one if that is larger. Zero turns background cycles off.
+    pub const fn every(bytes: u64) -> Self {
+        Reclaim { every_bytes: bytes }
+    }
+
+    /// Runs no background cycles, so that only [`Db::compact`](crate::Db::compact) reclaims.
+    pub const fn off() -> Self {
+        Reclaim::every(0)
+    }
+}
+
 impl Default for Reclaim {
     fn default() -> Self {
-        Reclaim {
-            every_bytes: 64 << 20,
-        }
+        Reclaim::every(64 << 20)
     }
 }
 
 /// What one reclamation cycle did, from [`Db::compact`](crate::Db::compact) or
 /// [`admin::compact`](crate::admin::compact).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Compacted {
     /// The length of the file before the cycle, in bytes, zeroes a writer preallocated past its
     /// log included.
@@ -129,6 +154,7 @@ pub struct Compacted {
 /// How a database file's size compares with what it holds, from [`Db::space`](crate::Db::space)
 /// or [`admin::space`](crate::admin::space).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Space {
     /// The length of the file, in bytes. It includes the zeroes that a writer under
     /// [`Durability::Fsync`](crate::Durability::Fsync) preallocates past the log, up to 4 MiB,

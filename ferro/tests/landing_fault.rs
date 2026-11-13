@@ -28,7 +28,7 @@ const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 const EIO: c_int = 5;
 const ENOSPC: c_int = 28;
 const PATIENCE: Duration = Duration::from_secs(30);
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;

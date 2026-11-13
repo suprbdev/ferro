@@ -258,11 +258,13 @@ impl<T: Data + Ord> Set<T> {
     /// Whether every value of this set is in `other`.
     ///
     /// Looks each value up in `other` through one cursor, after an O(1) check of the lengths.
+    #[must_use]
     pub fn is_subset(&self, other: &Set<T>) -> bool {
         self.len() <= other.len() && other.contains_many(self.iter()).all(|(_, found)| found)
     }
 
     /// A new set with the values of both sets.
+    #[must_use]
     pub fn union(&self, other: &Set<T>) -> Set<T> {
         let mut out = self.clone();
         out.extend(other.iter());
@@ -272,6 +274,7 @@ impl<T: Data + Ord> Set<T> {
     /// A new set with the values of this set that `other` holds too.
     ///
     /// Looks each value of this set up in `other` through one cursor.
+    #[must_use]
     pub fn intersection(&self, other: &Set<T>) -> Set<T> {
         other
             .contains_many(self.iter())
@@ -283,6 +286,7 @@ impl<T: Data + Ord> Set<T> {
     /// A new set with the values of this set that `other` lacks.
     ///
     /// Looks each value of this set up in `other` through one cursor.
+    #[must_use]
     pub fn difference(&self, other: &Set<T>) -> Set<T> {
         other
             .contains_many(self.iter())

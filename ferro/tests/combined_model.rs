@@ -154,7 +154,7 @@ impl Device {
         fast()
             .cache_bytes(self.cache)
             .history(self.keep)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .coalesce(self.coalesce)
             .hook(Hook(Arc::new(move |step| {
                 let mut slot = armed.lock().unwrap();

@@ -260,9 +260,7 @@ fn writer_options() -> Options {
     Options::new()
         .durability(Durability::Buffered)
         .cache_bytes(TINY)
-        .reclaim(Reclaim {
-            every_bytes: 96 << 10,
-        })
+        .reclaim(Reclaim::every(96 << 10))
 }
 
 fn reader_options(cache: u64) -> Options {

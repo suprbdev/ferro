@@ -118,7 +118,7 @@ fn shared_with(durability: Durability) -> Options {
     Options::new()
         .durability(durability)
         .shared(true)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
 }
 
 fn durability_named(name: &str) -> Durability {
@@ -359,7 +359,7 @@ fn a_cycle_that_closes_the_file_it_replaced_after_a_receive_wrote_past_its_end_l
             _ => {}
         }))
     };
-    let b = case.open(fast().reclaim(Reclaim { every_bytes: 0 }).hook(hook));
+    let b = case.open(fast().reclaim(Reclaim::off()).hook(hook));
     let cycle = Mutex::new(None);
     let input = Tripwire::new(&case.bundle, 256 << 10, || {
         *cycle.lock().unwrap() = Some(compact_beside(&b));
@@ -413,7 +413,7 @@ fn objects_a_landing_refused_after_learning_them_serve_later_commits_through_reo
     let b = case.open(
         fast()
             .cache_bytes(1 << 28)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .history(Keep::Last(1))
             .hook(hook),
     );
@@ -434,7 +434,7 @@ fn objects_a_landing_refused_after_learning_them_serve_later_commits_through_reo
         assert_eq!(b.read().get(&key).as_deref(), Some(&text(key, VALUE)));
     }
     drop(b);
-    let b = case.open(fast().reclaim(Reclaim { every_bytes: 0 }));
+    let b = case.open(fast().reclaim(Reclaim::off()));
     b.verify_typed().unwrap();
     b.compact(Keep::All).unwrap();
     b.verify_typed().unwrap();
@@ -501,7 +501,7 @@ fn two_receives_staging_at_once_beside_commits_both_land() {
         fs::copy(case.path(), &path).unwrap();
         let b: Db<Root> = Options::new()
             .durability(durability)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .open(&path)
             .unwrap();
         received_at_once(&[b.clone(), b.clone(), b.clone()], &case);
@@ -662,11 +662,11 @@ fn compact_beside(db: &Db<Root>) -> JoinHandle<ferro::Result<ferro::Compacted>> 
 fn cycle_at(step: &'static str, nth: usize) {
     let case = Case::new();
     let cell: Cell = Arc::default();
-    let b = case.open(fast().reclaim(Reclaim { every_bytes: 0 }).hook(at_step(
-        step,
-        nth,
-        cell.clone(),
-    )));
+    let b = case.open(
+        fast()
+            .reclaim(Reclaim::off())
+            .hook(at_step(step, nth, cell.clone())),
+    );
     let ran = Arc::new(Mutex::new(None));
     {
         let (b, ran) = (b.clone(), ran.clone());
@@ -735,7 +735,7 @@ fn a_cycle_at_any_staging_frame_lands_the_bundle_whatever_is_left_in_memory() {
             fs::write(&path, &source).unwrap();
             let cell: Cell = Arc::default();
             let b: Db<Root> = fast()
-                .reclaim(Reclaim { every_bytes: 0 })
+                .reclaim(Reclaim::off())
                 .hook(at_step("staging", nth, cell.clone()))
                 .open(&path)
                 .unwrap();
@@ -764,11 +764,11 @@ fn a_cycle_that_replaces_the_file_once_a_bundle_is_checked_lands_it_in_the_new_f
 fn a_cycle_due_while_a_bundle_lands_runs_once_it_has_landed() {
     let case = Case::new();
     let cell: Cell = Arc::default();
-    let b = case.open(fast().reclaim(Reclaim { every_bytes: 0 }).hook(at_step(
-        "placed",
-        1,
-        cell.clone(),
-    )));
+    let b = case.open(
+        fast()
+            .reclaim(Reclaim::off())
+            .hook(at_step("placed", 1, cell.clone())),
+    );
     let cycle = Arc::new(Mutex::new(None));
     {
         let (b, cycle) = (b.clone(), cycle.clone());
@@ -859,7 +859,7 @@ fn a_bundle_cut_short_after_a_commit_followed_its_staging_frames_gives_its_disk_
 }
 
 fn shared() -> Options {
-    fast().shared(true).reclaim(Reclaim { every_bytes: 0 })
+    fast().shared(true).reclaim(Reclaim::off())
 }
 
 fn shared_receive(damaged: bool) {

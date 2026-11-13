@@ -9,6 +9,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::fmt;
 use std::hash::BuildHasherDefault;
 use std::mem;
 use std::ops::{Bound, RangeBounds};
@@ -1246,6 +1247,14 @@ pub struct Log {
     pub(crate) store: Store,
 }
 
+impl fmt::Debug for Log {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Log")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Log {
     /// The number of retained commits.
     pub fn len(&self) -> usize {
@@ -1367,10 +1376,17 @@ impl Log {
 /// # Panics
 ///
 /// A step panics on a read error, as collection reads do.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Iter {
     walk: Walk,
     front: VecDeque<Arc<Commit>>,
     remaining: usize,
+}
+
+impl fmt::Debug for Iter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
 }
 
 impl Iter {

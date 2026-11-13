@@ -100,7 +100,7 @@ fn publishing_panic(coalesce: bool, step: &'static str) {
     let main: Db<Root> = Options::new()
         .durability(Durability::Buffered)
         .coalesce(coalesce)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .hook(hook)
         .open(dir.path().join("p.ferro"))
         .unwrap();
@@ -143,7 +143,7 @@ fn a_panic_while_arriving_strands_no_later_coalesced_writer() {
     let main: Db<Root> = Options::new()
         .durability(Durability::Buffered)
         .coalesce(true)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .hook(hook)
         .open(dir.path().join("a.ferro"))
         .unwrap();
@@ -194,7 +194,7 @@ fn a_member_whose_batch_a_panicking_leader_failed_is_not_acknowledged() {
         let main: Db<Root> = Options::new()
             .durability(durability)
             .coalesce(true)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .hook(hook)
             .open(&path)
             .unwrap();

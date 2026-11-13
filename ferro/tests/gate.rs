@@ -22,11 +22,11 @@ struct Root {
 type Kind = (&'static str, fn() -> Options);
 
 fn manual() -> Options {
-    fast().shared(true).reclaim(Reclaim { every_bytes: 0 })
+    fast().shared(true).reclaim(Reclaim::off())
 }
 
 fn plain() -> Options {
-    fast().reclaim(Reclaim { every_bytes: 0 })
+    fast().reclaim(Reclaim::off())
 }
 
 fn tick(db: &Db<Root>) {

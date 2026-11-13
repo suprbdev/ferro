@@ -13,7 +13,7 @@ use ferro::codec::{Decoder, Encoder};
 use ferro::{Data, Db, Durability, Error, Keep, Map, Options, Reclaim};
 use tempfile::TempDir;
 
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 const PATIENCE: Duration = Duration::from_secs(60);
 
 type Slot = RefCell<Option<Box<dyn FnOnce()>>>;

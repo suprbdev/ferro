@@ -204,6 +204,7 @@ impl Commit {
 /// [`Db::commit_with`], [`Db::commit_stamped`], their `try_` and `_async` forms, the merges and
 /// [`Db::restore`] return one.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Committed<R> {
     /// The value the closure returned.
     pub value: R,
@@ -1578,6 +1579,7 @@ fn read_clock(clock: Option<&Clock>) -> u64 {
 /// # Ok(())
 /// # }
 /// ```
+#[must_use = "options do nothing until they open a database"]
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     store: StoreOptions,
@@ -1678,7 +1680,7 @@ impl Options {
     ///
     /// A cycle runs once the file has grown by [`Reclaim::every_bytes`], or by its size after the
     /// last cycle if that is larger. Cycles run only on a writer whose [`Options::history`] is not
-    /// [`Keep::All`], and `every_bytes: 0` turns them off.
+    /// [`Keep::All`], and [`Reclaim::off`] turns them off.
     pub fn reclaim(mut self, reclaim: Reclaim) -> Self {
         self.reclaim = reclaim;
         self
@@ -4412,6 +4414,7 @@ impl<T: Data> Db<T> {
     ///
     /// It never blocks. With [`Options::shared`], commits from other processes appear once this
     /// process catches up with them, as described there.
+    #[must_use]
     pub fn read(&self) -> Snapshot<T> {
         self.branch.state.load().snapshot.clone()
     }
@@ -6228,6 +6231,7 @@ impl<T: Data> Db<T> {
 
 /// What [`Db::verify`], [`Db::verify_typed`] or [`admin::verify`](crate::admin::verify) checked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Verified {
     /// The number of distinct objects re-hashed.
     pub objects: u64,

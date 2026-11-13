@@ -6,6 +6,7 @@
 //! [`History::take_while`] and [`History::while_some`] stop the walk early without reading past
 //! where they stop.
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::codec::Data;
@@ -21,6 +22,7 @@ use crate::store::Store;
 /// asked for an item, and each item costs the commits walked to find it. It holds the file it walks
 /// open, and goes on reading it after a reclamation cycle replaces the file or prunes what it has
 /// not reached yet.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct History<T, V, F> {
     chain: Chain,
     pending: Option<(u64, u64)>,
@@ -30,6 +32,12 @@ pub struct History<T, V, F> {
     genesis: Option<Arc<Genesis<T>>>,
     project: F,
     run: Option<(Arc<Commit>, V)>,
+}
+
+impl<T, V, F> fmt::Debug for History<T, V, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("History").finish_non_exhaustive()
+    }
 }
 
 impl<T: Data, V: PartialEq, F: Fn(&T) -> V> History<T, V, F> {
@@ -147,7 +155,14 @@ fn present<X>(item: &(Commit, Option<X>)) -> bool {
 }
 
 /// A walk over a projection's history while it is `Some`, from [`History::while_some`].
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct WhileSome<T, X, F>(TakeWhile<T, Option<X>, F, Present<X>>);
+
+impl<T, X, F> fmt::Debug for WhileSome<T, X, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WhileSome").finish_non_exhaustive()
+    }
+}
 
 impl<T: Data, X: PartialEq, F: Fn(&T) -> Option<X>> WhileSome<T, X, F> {
     /// The next commit that changed the projection while it is `Some`, or `None` at the end.
@@ -170,11 +185,18 @@ impl<T: Data, X: PartialEq, F: Fn(&T) -> Option<X>> Iterator for WhileSome<T, X,
 }
 
 /// A walk over a projection's history while a test holds, from [`History::take_while`].
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct TakeWhile<T, V, F, P> {
     history: History<T, V, F>,
     keep: P,
     last: Option<Commit>,
     done: bool,
+}
+
+impl<T, V, F, P> fmt::Debug for TakeWhile<T, V, F, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TakeWhile").finish_non_exhaustive()
+    }
 }
 
 impl<T: Data, V: PartialEq, F: Fn(&T) -> V, P: Fn(&(Commit, V)) -> bool> TakeWhile<T, V, F, P> {

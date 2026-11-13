@@ -376,6 +376,12 @@ pub struct Stored<D> {
     pub unknown: bool,
 }
 
+impl<D> fmt::Debug for Stored<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stored").finish_non_exhaustive()
+    }
+}
+
 /// A row that changed between two versions of a table, as it was and as it is, `None` on the
 /// side that does not hold it, which [`TableData::diff_slots`] takes the entries that left and
 /// came from.
@@ -399,9 +405,21 @@ pub struct Differ<'a, 'p> {
     store: &'p Store,
 }
 
+impl fmt::Debug for Differ<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Differ").finish_non_exhaustive()
+    }
+}
+
 /// A diff of two versions of an index that [`Differ::start`] started.
 #[doc(hidden)]
 pub struct Started<K, V>(Differing<K, V>);
+
+impl<K, V> fmt::Debug for Started<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Started").finish_non_exhaustive()
+    }
+}
 
 impl<'p> Differ<'_, 'p> {
     /// Starts the diff of `old` and `new`, two versions of one index, on the threads of the pool.
@@ -517,6 +535,12 @@ const QUEUED_ENTRIES: usize = 1 << 12;
 /// A check that an index holds exactly the entries of its rows, which [`Differ::verify`] queued.
 #[doc(hidden)]
 pub struct Verifying(Arc<Told>);
+
+impl fmt::Debug for Verifying {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Verifying").finish_non_exhaustive()
+    }
+}
 
 struct Told {
     latch: Latch,
@@ -1555,6 +1579,12 @@ pub struct RowMut<'a, T: Record> {
     made_panicking: bool,
 }
 
+impl<T: Record + fmt::Debug> fmt::Debug for RowMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
 impl<T: Record> Deref for RowMut<'_, T> {
     type Target = T;
 
@@ -1681,9 +1711,11 @@ where
 /// The [`Record`](derive@crate::Record) derive generates one for every index with a `cover(...)`
 /// list, so that covered fields the index is keyed on come from the entry rather than being stored
 /// twice.
+#[doc(hidden)]
 pub type Project<I, S, C> = fn(&I, S) -> C;
 
 /// The [`Project`] of an index that covers nothing.
+#[doc(hidden)]
 pub fn plain<I>(_value: &I, _stored: ()) {}
 
 /// Calls `f` on each value an index holds for the row, until `f` returns `true`, and returns
@@ -1694,12 +1726,14 @@ pub fn plain<I>(_value: &I, _stored: ()) {}
 /// reading the lookup's entries: one value for most indexes, each element for an
 /// `#[index(each)]`, and none for a unique `Option` field that holds `None`. It is for the code
 /// the derive generates, and changes with it.
+#[doc(hidden)]
 pub type Indexed<T, I> = fn(&T, &mut dyn FnMut(&I) -> bool) -> bool;
 
 /// Whether a covered field is unchanged and its index entry can stay as it is.
 ///
 /// A field counts as unchanged only when `==` holds and both values encode to the same bytes, so
 /// a float that turns from `0.0` to `-0.0` is rewritten.
+#[doc(hidden)]
 pub fn same_stored<D: Data + PartialEq>(old: &D, new: &D) -> bool {
     old == new && old.same_encoding(new)
 }
@@ -1766,6 +1800,12 @@ pub struct Fresh<'a, K, V> {
     map: &'a mut Map<K, V>,
     undo: Option<Undo<V, ()>>,
     back: bool,
+}
+
+impl<K, V> fmt::Debug for Fresh<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fresh").finish_non_exhaustive()
+    }
 }
 
 impl<'a, K: Data + Ord, V: Data> Fresh<'a, K, V> {
@@ -2137,9 +2177,16 @@ impl<K, C: 'static> EntryCursor<K, ()> for Uncovered<K, C> {
 /// let busy: Vec<u64> = bookings.by_customer_range(8..).map(|booking| booking.id).collect();
 /// assert_eq!(busy, [2]);
 /// ```
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IndexIter<T: Record, C = ()> {
     rows: Finder<T::Key, T>,
     entries: Box<dyn EntryCursor<T::Key, C>>,
+}
+
+impl<T: Record, C> fmt::Debug for IndexIter<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexIter").finish_non_exhaustive()
+    }
 }
 
 impl<T: Record, C: 'static> IndexIter<T, C> {
@@ -2318,7 +2365,14 @@ impl<T: Record, C> ExactSizeIterator for IndexIter<T, C> {}
 
 /// `(key, covered fields)` pairs of an index lookup, in index order, from
 /// [`IndexIter::covered`]. Reads no rows.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IndexCovered<T: Record, C = ()>(Box<dyn EntryCursor<T::Key, C>>);
+
+impl<T: Record, C> fmt::Debug for IndexCovered<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexCovered").finish_non_exhaustive()
+    }
+}
 
 impl<T: Record, C> Iterator for IndexCovered<T, C> {
     type Item = (T::Key, C);
@@ -2343,7 +2397,14 @@ impl<T: Record, C> DoubleEndedIterator for IndexCovered<T, C> {
 impl<T: Record, C> ExactSizeIterator for IndexCovered<T, C> {}
 
 /// The primary keys of an index lookup, in index order, from [`IndexIter::keys`]. Reads no rows.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct IndexKeys<T: Record>(Box<dyn KeyCursor<T::Key>>);
+
+impl<T: Record> fmt::Debug for IndexKeys<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexKeys").finish_non_exhaustive()
+    }
+}
 
 impl<T: Record> Iterator for IndexKeys<T> {
     type Item = T::Key;
@@ -2533,11 +2594,18 @@ impl<T: Record, C: Send + 'static> IntoMatches<T> for Matches<T, C> {
 ///     .collect();
 /// assert_eq!(either, [2, 3]);
 /// ```
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Matches<T: Record, C = ()> {
     rows: Finder<T::Key, T>,
     more: More<T>,
     stream: Box<dyn Stream<T::Key, C>>,
     started: bool,
+}
+
+impl<T: Record, C> fmt::Debug for Matches<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Matches").finish_non_exhaustive()
+    }
 }
 
 type More<T> = Option<Box<Vec<Finder<<T as Record>::Key, T>>>>;
@@ -2997,7 +3065,14 @@ impl<T: Record, C> DoubleEndedIterator for Matches<T, C> {
 
 /// The primary keys of [`Matches`], in key order, from [`Matches::keys`]. Reads no rows but those
 /// tested against a range or prefix lookup.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct MatchKeys<T: Record>(Box<dyn Stream<T::Key, ()>>);
+
+impl<T: Record> fmt::Debug for MatchKeys<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatchKeys").finish_non_exhaustive()
+    }
+}
 
 impl<T: Record> Iterator for MatchKeys<T> {
     type Item = T::Key;
@@ -3019,7 +3094,14 @@ impl<T: Record> DoubleEndedIterator for MatchKeys<T> {
 
 /// `(key, covered fields)` pairs of [`Matches`], in key order, from [`Matches::covered`]. Reads
 /// no rows but those tested against a range or prefix lookup.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct MatchCovered<T: Record, C = ()>(Box<dyn Stream<T::Key, C>>);
+
+impl<T: Record, C> fmt::Debug for MatchCovered<T, C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatchCovered").finish_non_exhaustive()
+    }
+}
 
 impl<T: Record, C> Iterator for MatchCovered<T, C> {
     type Item = (T::Key, C);
@@ -3049,6 +3131,7 @@ impl<T: Record, C> DoubleEndedIterator for MatchCovered<T, C> {
 /// its own sides. `Display` prints the tree one step a line, each side indented below the step it
 /// belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Explain {
     /// What the step is.
     pub step: Step,
@@ -3107,6 +3190,7 @@ impl fmt::Display for Explain {
 
 /// What one step of an [`Explain`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Step {
     /// A lookup of one value of a non-unique index from the `find()` view, in key order.
     Value,
@@ -3124,6 +3208,7 @@ pub enum Step {
 
 /// How one step of an [`Explain`] is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Read {
     /// Stepped through in key order. The walked sides of an `and` lead it, and when both are
     /// walked they leapfrog.
@@ -4962,6 +5047,7 @@ const FINGERPRINT_BYTES: usize = 8;
 /// from the rows when the table is read, as
 /// [the schema evolution guide](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
 /// describes.
+#[doc(hidden)]
 pub fn index_fingerprint(describe: impl FnOnce(&mut Description)) -> u64 {
     let mut d = Description::new();
     d.word("index");
@@ -4973,9 +5059,16 @@ pub fn index_fingerprint(describe: impl FnOnce(&mut Description)) -> u64 {
 /// decoded.
 ///
 /// The [`Record`](derive@crate::Record) derive builds one per table type, once per process.
+#[doc(hidden)]
 pub struct Fingerprints<const N: usize> {
     values: [u64; N],
     order: [usize; N],
+}
+
+impl<const N: usize> fmt::Debug for Fingerprints<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fingerprints").finish_non_exhaustive()
+    }
 }
 
 impl<const N: usize> Fingerprints<N> {
@@ -5031,6 +5124,7 @@ impl<const N: usize> Fingerprints<N> {
 /// # Errors
 ///
 /// Returns the error encoding the map returns.
+#[doc(hidden)]
 pub fn encode_index<M: Data>(fingerprint: u64, index: &M, w: &mut Encoder<'_>) -> Result<()> {
     w.raw(&fingerprint.to_le_bytes());
     index.encode(w)
@@ -5069,6 +5163,7 @@ impl Drop for Rebuilding {
 /// Returns a read or decode error where a plain read would panic, so a damaged row node fails the
 /// open instead, and [`Error::Decode`] for a row stored under a key other than its own, which an
 /// index built from it would file under the wrong key.
+#[doc(hidden)]
 pub fn stored_rows<T: Record>(rows: &Map<T::Key, T>) -> Result<Vec<Val<T>>> {
     if REBUILDING.get() {
         let store = rows.store().ok_or(Error::Detached)?;
@@ -5096,6 +5191,7 @@ pub fn stored_rows<T: Record>(rows: &Map<T::Key, T>) -> Result<Vec<Val<T>>> {
 }
 
 /// The row whose unique index entry is `value`. Backs a unique index's generated `by_x`.
+#[doc(hidden)]
 pub fn unique_eq<I, T, Q>(
     rows: &Map<T::Key, T>,
     index: &Map<I, T::Key>,
@@ -5184,6 +5280,7 @@ where
 ///
 /// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
 /// changes with the derive's, so call the generated lookup rather than this.
+#[doc(hidden)]
 #[inline(always)]
 pub fn unique_rows<I, T>(
     rows: &Map<T::Key, T>,
@@ -5202,6 +5299,7 @@ where
 ///
 /// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
 /// changes with the derive's, so call the generated lookup rather than this.
+#[doc(hidden)]
 #[inline(always)]
 pub fn unique_rows_covered<I, T, S, C>(
     rows: &Map<T::Key, T>,
@@ -5230,6 +5328,7 @@ where
 ///
 /// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
 /// changes with the derive's, so call the generated lookup rather than this.
+#[doc(hidden)]
 #[inline(always)]
 pub fn index_where<I, T, S, C>(
     rows: &Map<T::Key, T>,
@@ -5253,6 +5352,7 @@ where
 }
 
 /// The rows whose indexed value equals `value`, in key order. Backs the generated `by_x`.
+#[doc(hidden)]
 #[inline(always)]
 pub fn index_eq<I, T, S, C, Q>(
     rows: &Map<T::Key, T>,
@@ -5279,6 +5379,7 @@ where
 
 /// The rows whose `Option` index holds `Some(value)`, in key order, where `value` may be
 /// borrowed. Backs the generated `by_x_some`.
+#[doc(hidden)]
 #[inline(always)]
 pub fn index_eq_some<X, T, S, C, Q>(
     rows: &Map<T::Key, T>,
@@ -5311,6 +5412,7 @@ where
 ///
 /// It is for the code the [`Record`](derive@crate::Record) derive generates, and its signature
 /// changes with the derive's, so call the generated lookup rather than this.
+#[doc(hidden)]
 #[inline(always)]
 pub fn index_range<I, T, S, C, Q, R>(
     rows: &Map<T::Key, T>,
@@ -5357,6 +5459,7 @@ where
 
 /// The rows whose indexed value equals `value` and whose key is greater than `after`, in key
 /// order. Backs the generated `by_x_after`.
+#[doc(hidden)]
 #[inline(always)]
 pub fn index_after<I, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
@@ -5390,6 +5493,7 @@ where
 
 /// The rows whose `Option` index holds `Some(value)` and whose key is greater than `after`, in
 /// key order. Backs the generated `by_x_some_after`.
+#[doc(hidden)]
 #[inline(always)]
 pub fn index_after_some<X, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
@@ -5442,6 +5546,7 @@ where
 }
 
 /// [`index_eq`] as [`Matches`] that can seek within the value. Backs `by_x` on the `find()` view.
+#[doc(hidden)]
 pub fn match_eq<I, T, S, C, Q>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
@@ -5463,6 +5568,7 @@ where
 }
 
 /// [`index_eq_some`] as [`Matches`]. Backs `by_x_some` on the `find()` view.
+#[doc(hidden)]
 pub fn match_eq_some<X, T, S, C, Q>(
     rows: &Map<T::Key, T>,
     index: &Map<(Option<X>, T::Key), S>,
@@ -5484,6 +5590,7 @@ where
 }
 
 /// [`index_after`] as [`Matches`]. Backs `by_x_after` on the `find()` view.
+#[doc(hidden)]
 pub fn match_after<I, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
@@ -5512,6 +5619,7 @@ where
 }
 
 /// [`index_after_some`] as [`Matches`]. Backs `by_x_some_after` on the `find()` view.
+#[doc(hidden)]
 pub fn match_after_some<X, T, S, C, Q, A>(
     rows: &Map<T::Key, T>,
     index: &Map<(Option<X>, T::Key), S>,
@@ -5542,6 +5650,7 @@ where
 /// Each distinct value of an index with the number of rows that hold it, in value order.
 ///
 /// Takes one seek per distinct value and reads no rows. Backs the generated `by_x_counts`.
+#[doc(hidden)]
 pub fn index_counts<I: Data + Ord, K: Data + Ord, S: Data>(
     index: &Map<(I, K), S>,
 ) -> Vec<(I, usize)> {

@@ -522,9 +522,7 @@ fn retention_keeps_a_busy_queue_small_without_stopping_it() {
     let options = QueueOptions {
         durability: Durability::Buffered,
         history: Keep::Last(50),
-        reclaim: Reclaim {
-            every_bytes: 256 << 10,
-        },
+        reclaim: Reclaim::every(256 << 10),
         ..QueueOptions::default()
     };
     let q = Queue::open(&path, options).unwrap();

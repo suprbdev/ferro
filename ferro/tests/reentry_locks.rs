@@ -12,7 +12,7 @@ use ferro::db::Hook;
 use ferro::{Bundle, Data, Db, Durability, Error, Keep, Map, Options, Reclaim, Snapshot};
 use tempfile::TempDir;
 
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 const PATIENCE: Duration = Duration::from_secs(60);
 const CACHE: u64 = 64 << 10;
 const SMALL: u64 = 200;

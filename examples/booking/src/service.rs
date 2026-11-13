@@ -40,9 +40,9 @@ impl Reservations {
             options = options.durability(Durability::Buffered);
         }
         if let Some(versions) = config.keep_last {
-            options = options.history(Keep::Last(versions)).reclaim(Reclaim {
-                every_bytes: 32 << 20,
-            });
+            options = options
+                .history(Keep::Last(versions))
+                .reclaim(Reclaim::every(32 << 20));
         }
         Ok(Reservations::new(options.open(path)?))
     }

@@ -19,7 +19,7 @@ type Shared = Arc<Mutex<(Rng, BTreeMap<u64, Model>)>>;
 
 const SECTOR: usize = 512;
 const SLOT_BYTES: usize = 4096;
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 fn dir() -> TempDir {
     tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap()

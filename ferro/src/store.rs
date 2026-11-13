@@ -31,6 +31,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, RandomState};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -319,6 +320,7 @@ static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 /// [Durability and crash safety](https://github.com/archlemon/ferro/blob/main/docs/guide/durability.md)
 /// describes what each promises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Durability {
     /// Every commit is synced before it is acknowledged, one fdatasync covering every commit
     /// queued meanwhile, so an acknowledged commit survives a power cut. The default.
@@ -3001,6 +3003,15 @@ pub struct Store {
     inner: Shared<Inner>,
 }
 
+impl fmt::Debug for Store {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Store")
+            .field("id", &self.id())
+            .field("path", &self.path())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The store of an iterator, cursor or row finder: borrowed through a hazard slot without a count,
 /// or a clone it owns when it has no slot.
 ///
@@ -5501,6 +5512,12 @@ pub struct Txn {
     /// Set once [`Txn::rebase`] has moved the draft in place without rewriting it yet: where the
     /// drafted records began and ended, and how far they moved.
     shifted: Option<(u64, u64, u64)>,
+}
+
+impl fmt::Debug for Txn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Txn").finish_non_exhaustive()
+    }
 }
 
 /// The offset of every object a transaction wrote or found, by hash.

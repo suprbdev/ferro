@@ -994,7 +994,7 @@ fn run_devices(acts: Vec<Act>, keep: Option<Keep>) -> Result<Crossed, TestCaseEr
     devices.graph.push(&[], None);
     for device in 0..DEVICES {
         let options = match keep {
-            Some(keep) => fast().history(keep).reclaim(Reclaim { every_bytes: 0 }),
+            Some(keep) => fast().history(keep).reclaim(Reclaim::off()),
             None => fast(),
         };
         let db: Db<Events> = options
@@ -1055,7 +1055,7 @@ proptest! {
         ops in prop::collection::vec(op(), 1..60),
         keep in 2..8usize,
     ) {
-        let options = fast().history(Keep::Last(keep)).reclaim(Reclaim { every_bytes: 0 });
+        let options = fast().history(Keep::Last(keep)).reclaim(Reclaim::off());
         run_graph(ops, options, Keep::Last(keep), true)?;
     }
 
@@ -1119,9 +1119,7 @@ fn branches_that_keep_syncing_merge_exactly_with_bounded_history() {
             ops.extend([Op::Fork(0), Op::Fork(0)]);
         }
     }
-    let options = fast()
-        .history(Keep::Last(40))
-        .reclaim(Reclaim { every_bytes: 0 });
+    let options = fast().history(Keep::Last(40)).reclaim(Reclaim::off());
     run_graph(ops, options, Keep::Last(40), false).unwrap();
 }
 
@@ -1427,9 +1425,7 @@ fn pruned_graphs_that_once_found_a_wrong_base_or_changed_after_a_cycle() {
     ];
     for _ in 0..50 {
         for (keep, ops) in &cases {
-            let options = fast()
-                .history(Keep::Last(*keep))
-                .reclaim(Reclaim { every_bytes: 0 });
+            let options = fast().history(Keep::Last(*keep)).reclaim(Reclaim::off());
             run_graph(ops.clone(), options, Keep::Last(*keep), true).unwrap();
         }
     }
@@ -1782,11 +1778,7 @@ fn pairs(dbs: &[Db<Events>]) -> Vec<String> {
 fn merge_bases_survive_pruning_and_do_not_change_when_a_cycle_reclaims() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("p.ferro");
-    let options = || {
-        fast()
-            .history(Keep::Last(4))
-            .reclaim(Reclaim { every_bytes: 0 })
-    };
+    let options = || fast().history(Keep::Last(4)).reclaim(Reclaim::off());
     let main: Db<Events> = options().open(&path).unwrap();
     let mut next = 0;
     let mut bump = |db: &Db<Events>| {
@@ -1844,9 +1836,7 @@ fn merge_bases_survive_pruning_and_do_not_change_when_a_cycle_reclaims() {
 fn crossed_under_pruning(path: &std::path::Path, keep: usize, step: u64) -> [Db<Events>; 3] {
     let ticks = Arc::new(AtomicU64::new(1_700_000_000_000));
     let clock = Clock(Arc::new(move || ticks.fetch_add(step, Ordering::Relaxed)));
-    let options = fast()
-        .history(Keep::Last(keep))
-        .reclaim(Reclaim { every_bytes: 0 });
+    let options = fast().history(Keep::Last(keep)).reclaim(Reclaim::off());
     let main: Db<Events> = options.clock(clock).open(path).unwrap();
     let b1 = main.fork("b1").unwrap();
     event(&b1, "n1", 1);
@@ -1890,9 +1880,7 @@ fn a_pruned_search_does_not_report_a_base_below_another_and_the_merge_goes_throu
 #[test]
 fn a_base_pruned_from_our_branch_but_kept_on_theirs_is_found() {
     let dir = tempfile::tempdir().unwrap();
-    let options = fast()
-        .history(Keep::Last(3))
-        .reclaim(Reclaim { every_bytes: 0 });
+    let options = fast().history(Keep::Last(3)).reclaim(Reclaim::off());
     let main: Db<Events> = options.open(dir.path().join("k.ferro")).unwrap();
     event(&main, "m1", 1);
     let side = main.fork("side").unwrap();
@@ -1949,7 +1937,7 @@ fn pulled_then_forked(
     let clock = ticking();
     let main: Db<Events> = fast()
         .history(history)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .clock(clock.clone())
         .open(dir.join("a.ferro"))
         .unwrap();
@@ -2082,7 +2070,7 @@ fn a_commit_two_branches_pulled_apart_is_refused_when_pruned_history_could_hold_
     let clock = ticking();
     let open = |name: &str| -> Db<Events> {
         fast()
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .clock(clock.clone())
             .open(dir.path().join(name))
             .unwrap()
@@ -2123,7 +2111,7 @@ fn a_commit_two_branches_pulled_apart_is_refused_when_pruned_history_could_hold_
 #[test]
 fn a_later_merge_does_not_reach_history_an_earlier_merge_let_go() {
     let dir = tempfile::tempdir().unwrap();
-    let options = fast().reclaim(Reclaim { every_bytes: 0 });
+    let options = fast().reclaim(Reclaim::off());
     let main: Db<Events> = options.open(dir.path().join("l.ferro")).unwrap();
     let pause = || std::thread::sleep(std::time::Duration::from_millis(3));
     let fresh = main.fork("fresh").unwrap();
@@ -2154,7 +2142,7 @@ fn a_later_merge_does_not_reach_history_an_earlier_merge_let_go() {
 #[test]
 fn a_merged_branch_dropped_and_reclaimed_still_answers_later_merges() {
     let dir = tempfile::tempdir().unwrap();
-    let options = Options::new().reclaim(Reclaim { every_bytes: 0 });
+    let options = Options::new().reclaim(Reclaim::off());
     let main: Db<Events> = options.open(dir.path().join("d.ferro")).unwrap();
     event(&main, "m0", 0);
     let late = main.fork("late").unwrap();

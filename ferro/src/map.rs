@@ -3570,6 +3570,12 @@ pub struct Edits<K, V, S = ()> {
     staged: Pending<K, V, S>,
 }
 
+impl<K, V, S> fmt::Debug for Edits<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Edits").finish_non_exhaustive()
+    }
+}
+
 enum Pending<K, V, S> {
     Empty,
     One(K, Option<V>),
@@ -6229,6 +6235,12 @@ pub struct Cursor<K, V, S = ()> {
     index: Option<usize>,
 }
 
+impl<K, V, S> fmt::Debug for Cursor<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cursor").finish_non_exhaustive()
+    }
+}
+
 impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
     /// Moves to the first key, or to no position if the map is empty.
     pub fn rewind(&mut self) {
@@ -6699,6 +6711,7 @@ impl<'a, V: Data, S> Run<'a, V, S> {
 /// # Panics
 ///
 /// A step that cannot load a node or value from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Iter<K, V, S = ()> {
     store: Option<Lent>,
     front: Vec<Frame<K, V, S>>,
@@ -6707,6 +6720,12 @@ pub struct Iter<K, V, S = ()> {
     _root: Option<Hold<K, V, S>>,
     remaining: u64,
     spare: Option<Arc<V>>,
+}
+
+impl<K, V, S> fmt::Debug for Iter<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
 }
 
 impl<K: Data + Ord, V: Data, S: Data> Iter<K, V, S> {
@@ -6996,7 +7015,14 @@ impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Iter<K, V, S> {}
 ///
 /// It walks as [`Iter`] does and reads no value, so it costs no more than the keys themselves.
 /// [`Set`](crate::Set) hands it out for its values.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Keys<K, V, S = ()>(Iter<K, V, S>);
+
+impl<K, V, S> fmt::Debug for Keys<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Keys").finish_non_exhaustive()
+    }
+}
 
 impl<K: Data + Ord, V: Data, S: Data> Iterator for Keys<K, V, S> {
     type Item = K;
@@ -7035,7 +7061,14 @@ impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Keys<K, V, S> {}
 /// An iterator over values of a [`Map`], in key order, from either end, made by [`Map::values`].
 ///
 /// It walks as [`Iter`] does and clones no key. [`Table`](crate::Table) hands it out for its rows.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Values<K, V, S = ()>(Iter<K, V, S>);
+
+impl<K, V, S> fmt::Debug for Values<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Values").finish_non_exhaustive()
+    }
+}
 
 impl<K: Data + Ord, V: Data, S: Data> Values<K, V, S> {
     /// Steps to the next value from the front and lends it, where `next` hands out a [`Val`], as
@@ -7298,9 +7331,16 @@ where
 /// # Panics
 ///
 /// A step that cannot load a node or value from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Diff<K, V, S = ()> {
     old: Side<K, V, S>,
     new: Side<K, V, S>,
+}
+
+impl<K, V, S> fmt::Debug for Diff<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Diff").finish_non_exhaustive()
+    }
 }
 
 /// One version a [`Diff`] walks: its root until the walk opens it, then the nodes open from the

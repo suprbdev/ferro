@@ -35,6 +35,7 @@ const GAP: Duration = Duration::from_millis(1);
 /// How the follower that [`Options::follow`](crate::Options::follow) started has gone, from
 /// [`Db::following`](crate::Db::following).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Following {
     /// Whether the operating system tells it when the file changes, through inotify on 64-bit
     /// Linux. Without that it looks every 10 ms.

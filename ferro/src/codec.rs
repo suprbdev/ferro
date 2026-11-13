@@ -41,6 +41,7 @@ use std::any::{Any, TypeId, type_name};
 use std::borrow::{Borrow, Cow};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,6 +111,15 @@ pub struct Object {
     pub body: Vec<u8>,
     /// The links the value encoded, in order.
     pub links: Vec<Ptr>,
+}
+
+impl fmt::Debug for Object {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Object")
+            .field("body_bytes", &self.body.len())
+            .field("links", &self.links.len())
+            .finish_non_exhaustive()
+    }
 }
 
 const JOINED_BYTES: usize = 4096;
@@ -483,6 +493,16 @@ pub struct Staged<'a> {
     pub links: &'a [Ptr],
 }
 
+impl fmt::Debug for Staged<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Staged")
+            .field("raw", &self.raw)
+            .field("packed", &self.packed)
+            .field("links", &self.links.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Staged<'_> {
     /// The body before compression.
     ///
@@ -499,7 +519,7 @@ impl Staged<'_> {
 }
 
 /// A value that a store's cache can hold: every [`Data`] type, and the store's own records.
-pub trait Cached: Any + Send + Sync {}
+pub(crate) trait Cached: Any + Send + Sync {}
 
 impl<T: Data> Cached for T {}
 
@@ -508,6 +528,12 @@ pub struct Moves {
     from: u64,
     old: Vec<u64>,
     new: Vec<u64>,
+}
+
+impl fmt::Debug for Moves {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Moves").finish_non_exhaustive()
+    }
 }
 
 impl Moves {
@@ -612,6 +638,7 @@ pub trait Sink {
 ///
 /// [`hash_of`] encodes into one, and so does [`Map::root_hash`](crate::Map::root_hash) for a map
 /// with changes that are not yet committed.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct HashSink;
 
 impl Sink for HashSink {
@@ -929,6 +956,12 @@ pub struct Description {
     open: Vec<TypeId>,
 }
 
+impl fmt::Debug for Description {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Description").finish_non_exhaustive()
+    }
+}
+
 const FINGERPRINT_CONTEXT: &str = "ferro 2026-11-04 index fingerprint";
 
 impl Description {
@@ -1025,6 +1058,7 @@ pub fn try_hash_of<D: Data>(value: &D) -> Result<Hash> {
 /// # Panics
 ///
 /// Panics if `value` fails to encode, where [`try_hash_of`] returns the error.
+#[must_use]
 pub fn hash_of<D: Data>(value: &D) -> Hash {
     crate::map::fatal(try_hash_of(value))
 }
@@ -1127,6 +1161,15 @@ pub struct Encoder<'a> {
     unsettled: bool,
     empty_items: u64,
     depth: usize,
+}
+
+impl fmt::Debug for Encoder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Encoder")
+            .field("bytes", &self.buf.len())
+            .field("links", &self.links.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Appends `value` to `buf` as an LEB128 varint, as [`Encoder::varint`] writes it.
@@ -2188,6 +2231,12 @@ pub struct Tabled {
     found: bool,
 }
 
+impl fmt::Debug for Tabled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tabled").finish_non_exhaustive()
+    }
+}
+
 impl Tabled {
     /// Adds whether `D` can hold a table, as its [`Data::tables`] says.
     pub fn of<D: Data>(&mut self) {
@@ -2265,6 +2314,12 @@ pub struct Pairing<'s> {
     again: usize,
     waiting: Vec<Waiting>,
     aligning: bool,
+}
+
+impl fmt::Debug for Pairing<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pairing").finish_non_exhaustive()
+    }
 }
 
 /// What pairs the tables of two versions of a map, given their roots with the entry counts their
@@ -2919,6 +2974,14 @@ pub struct Decoder<'a> {
     recalled: Option<&'a Recalled>,
     rebuilds: bool,
     depth: usize,
+}
+
+impl fmt::Debug for Decoder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Decoder")
+            .field("remaining", &self.remaining())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> Decoder<'a> {

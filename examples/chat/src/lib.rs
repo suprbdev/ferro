@@ -72,9 +72,9 @@ pub fn open_db(path: &Path, config: &Config) -> ferro::Result<Db<Chat>> {
         .durability(config.durability)
         .coalesce(config.coalesce);
     let options = match config.keep_versions {
-        Some(count) => options.history(Keep::Last(count)).reclaim(Reclaim {
-            every_bytes: config.reclaim_bytes,
-        }),
+        Some(count) => options
+            .history(Keep::Last(count))
+            .reclaim(Reclaim::every(config.reclaim_bytes)),
         None => options,
     };
     options.open::<Chat>(path)

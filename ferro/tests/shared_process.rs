@@ -20,7 +20,7 @@ struct Root {
     last: Map<u64, u64>,
 }
 
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap()
@@ -430,9 +430,7 @@ fn padded(coalesce: bool) -> Options {
         .durability(Durability::Buffered)
         .cache_bytes(1 << 20)
         .history(Keep::Last(3))
-        .reclaim(Reclaim {
-            every_bytes: 128 << 10,
-        })
+        .reclaim(Reclaim::every(128 << 10))
         .coalesce(coalesce)
         .shared(true)
 }

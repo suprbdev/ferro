@@ -196,7 +196,7 @@ fn branches_forked_in_one_handle_are_seen_and_written_by_another() {
 fn a_cycle_in_one_handle_is_followed_by_another_that_keeps_writing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cycle.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let a: Db<Root> = shared()
         .history(Keep::Last(5))
         .reclaim(manual)
@@ -278,7 +278,7 @@ fn ticking() -> Clock {
 fn counted(path: &Path, keep: Keep, clock: &Clock) -> Db<Counts> {
     shared()
         .history(keep)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .clock(clock.clone())
         .open(path)
         .unwrap()
@@ -606,11 +606,7 @@ fn keep_last_prunes_a_pull_into_a_shared_file_for_every_handle() {
         bump(&source, 9, i);
     }
     let path = dir.path().join("pulled.ferro");
-    let options = || {
-        shared()
-            .history(Keep::Last(2))
-            .reclaim(Reclaim { every_bytes: 0 })
-    };
+    let options = || shared().history(Keep::Last(2)).reclaim(Reclaim::off());
     let a: Db<Root> = options().open(&path).unwrap();
     let b: Db<Root> = options().open(&path).unwrap();
     let lens = |db: &Db<Root>| (db.log().len(), db.branch("origin").unwrap().log().len());
@@ -642,9 +638,7 @@ fn keep_last_prunes_a_pull_into_a_shared_file_for_every_handle() {
 fn background_cycles_in_several_handles_run_one_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("background.ferro");
-    let reclaim = Reclaim {
-        every_bytes: 256 << 10,
-    };
+    let reclaim = Reclaim::every(256 << 10);
     let each = 400u64;
     let threads: Vec<_> = (0..3u64)
         .map(|writer| {
@@ -743,7 +737,7 @@ fn an_awaited_writes_wait_never_opens_a_branch_inside_a_cycles_pause() {
     for _ in 0..common::cases(4) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hole.ferro");
-        let manual = Reclaim { every_bytes: 0 };
+        let manual = Reclaim::off();
         let (hook, steps, resume) = hooked(&["synced", "paused"]);
         let a: Db<Root> = shared().reclaim(manual).hook(hook).open(&path).unwrap();
         let b: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
@@ -884,7 +878,7 @@ fn a_drop_and_fork_in_another_handle_wait_for_a_closure_on_that_branch() {
 
 #[test]
 fn a_branch_another_handle_dropped_and_forked_again_leaves_the_old_handles_dead() {
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     for (own_commits, cycle) in [(true, false), (false, false), (true, true), (false, true)] {
         let case = format!("own commits {own_commits}, cycle {cycle}");
         let dir = tempfile::tempdir().unwrap();
@@ -945,7 +939,7 @@ fn a_branch_another_handle_dropped_and_forked_again_leaves_the_old_handles_dead(
 fn a_prune_another_handle_writes_moves_no_watcher() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prune.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let other: Arc<std::sync::OnceLock<Db<Root>>> = Arc::default();
     let hook = {
         let other = other.clone();
@@ -979,7 +973,7 @@ fn a_prune_another_handle_writes_moves_no_watcher() {
 
 #[test]
 fn branch_after_another_handle_dropped_and_forked_again_gives_the_new_branch() {
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     for refork in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rebranch.ferro");
@@ -1023,7 +1017,7 @@ fn branch_after_another_handle_dropped_and_forked_again_gives_the_new_branch() {
 fn a_writer_that_opens_during_another_handles_cycle_pause_writes_the_new_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pause.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let armed = Arc::new(AtomicBool::new(false));
     let (paused, resume) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
     let hook = {
@@ -1092,7 +1086,7 @@ fn a_marker_left_by_a_dead_cycle_never_keeps_a_stranded_frame_after_a_power_cut(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kept.ferro");
     let len = || std::fs::metadata(&path).unwrap().len();
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let commit = |db: &Db<Padded>, fill: u64| {
         db.update(|root| {
             root.n += 1;
@@ -1141,7 +1135,7 @@ fn left_by_a_dead_writer(left: Left) {
     use std::os::unix::fs::FileExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("dead.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let mut rng = common::Rng::new(7);
     let mut commit = |db: &Db<Padded>| {
         let pad: Vec<u64> = (0..3000).map(|_| rng.next()).collect();
@@ -1267,7 +1261,7 @@ fn rotted(file: &std::fs::File, start: u64, rot: Rot) {
 fn below_the_superblock(durability: Durability, rot: Rot) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("lag.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let mut rng = common::Rng::new(5);
     let pads: Vec<Vec<u64>> = (0..5)
         .map(|_| (0..600).map(|_| rng.next()).collect())
@@ -1335,7 +1329,7 @@ fn a_writer_that_opens_beside_a_live_one_reports_a_frame_below_the_superblock_th
 {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("beside.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let mut rng = common::Rng::new(9);
     let commit = |db: &Db<Padded>, rng: &mut common::Rng| {
         let pad: Vec<u64> = (0..600).map(|_| rng.next()).collect();
@@ -1396,7 +1390,7 @@ fn near_copy_left_by_a_dead_writer(marker: bool) {
     use std::os::unix::fs::FileExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("near.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let mut rng = common::Rng::new(11);
     let pads: Vec<Vec<u64>> = (0..4)
         .map(|_| (0..3000).map(|_| rng.next() | 1 << 63).collect())
@@ -1530,7 +1524,7 @@ fn held_at_leading() -> Held {
 fn a_following_shared_writer_sees_another_handles_commits_and_cycles_without_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("follow.ferro");
-    let manual = Reclaim { every_bytes: 0 };
+    let manual = Reclaim::off();
     let a: Db<Root> = shared().reclaim(manual).open(&path).unwrap();
     let b: Db<Root> = shared().reclaim(manual).follow(true).open(&path).unwrap();
     let watcher = b.watch();
@@ -1666,7 +1660,7 @@ fn a_following_shared_writer_reports_a_named_frame_that_does_not_check() {
 }
 
 fn manual() -> Options {
-    shared().reclaim(Reclaim { every_bytes: 0 })
+    shared().reclaim(Reclaim::off())
 }
 
 fn writers_on_branches_of_their_own(
@@ -2930,10 +2924,7 @@ fn three_handles_that_fork_drop_merge_restore_pull_and_cycle_meet_only_expected_
             let found = finished.recv_timeout(Duration::from_secs(120));
             odd.extend(found.expect("a handle hung or panicked"));
         }
-        let db: Db<Kv> = fast()
-            .reclaim(Reclaim { every_bytes: 0 })
-            .open(&path)
-            .unwrap();
+        let db: Db<Kv> = fast().reclaim(Reclaim::off()).open(&path).unwrap();
         if let Err(error) = db.verify_typed() {
             odd.push(format!("verify_typed after a reopen: {error:?}"));
         }

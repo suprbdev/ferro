@@ -23,7 +23,7 @@ type Text = Map<u64, String>;
 type Model = BTreeMap<u64, String>;
 type Kind = (&'static str, fn() -> Options);
 
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 const PATIENCE: Duration = Duration::from_secs(30);
 const SPREAD: u64 = 1 << 32;
 const SECTOR: usize = 512;

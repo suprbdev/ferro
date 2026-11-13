@@ -20,7 +20,7 @@ type Kind = (&'static str, fn() -> Options);
 type Outcome = Arc<Mutex<Option<ferro::Result<()>>>>;
 type Results = Vec<(&'static str, ferro::Result<()>)>;
 
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 const PATIENCE: Duration = Duration::from_secs(20);
 
 fn dir() -> TempDir {

@@ -594,7 +594,7 @@ fn options(choice: u64) -> Options {
         1 => fast(),
         _ => uncached(),
     };
-    options.reclaim(Reclaim { every_bytes: 0 })
+    options.reclaim(Reclaim::off())
 }
 
 fn check(db: &Db<Root>, model: &Model, seed: u64) {
@@ -859,7 +859,7 @@ fn coalesced_writers_keep_their_guarantees_and_match_a_fresh_build() {
     for (round, options) in choices.into_iter().enumerate() {
         let db = options()
             .coalesce(true)
-            .reclaim(Reclaim { every_bytes: 0 })
+            .reclaim(Reclaim::off())
             .open::<Counters>(&path)
             .unwrap();
         db.update(|root| root.clear()).unwrap();
@@ -951,7 +951,7 @@ fn large_commits_of_nested_maps_match_a_fresh_build() {
     }
     let other = fast().open::<Outer>(&other_path).unwrap();
     let mut db = roomy()
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .open::<Outer>(&path)
         .unwrap();
     let initial = outer_of(&model);

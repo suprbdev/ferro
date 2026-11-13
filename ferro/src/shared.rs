@@ -31,6 +31,7 @@
 
 use std::alloc::{Layout, dealloc};
 use std::any::{Any, TypeId};
+use std::fmt;
 use std::hint;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop, offset_of};
@@ -108,6 +109,12 @@ pub struct Weak<T> {
 pub struct Erased {
     ptr: NonNull<u8>,
     kind: &'static Kind,
+}
+
+impl fmt::Debug for Erased {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Erased").finish_non_exhaustive()
+    }
 }
 
 /// The offsets and drops of one erased type's [`Inner`], shared by every [`Erased`] of that type.

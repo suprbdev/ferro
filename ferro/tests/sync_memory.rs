@@ -672,10 +672,7 @@ fn a_receive_whose_file_a_cycle_replaced_before_it_spilled_holds_a_buffer_not_th
     for swap in [false, true] {
         let path = dir.path().join(format!("swap-{swap}.ferro"));
         std::fs::write(&path, &source).unwrap();
-        let b: Db<Root> = fast()
-            .reclaim(Reclaim { every_bytes: 0 })
-            .open(&path)
-            .unwrap();
+        let b: Db<Root> = fast().reclaim(Reclaim::off()).open(&path).unwrap();
         let base = Cell::new(0);
         let input = Tripwire::new(bundle.as_bytes(), 256 << 10, || {
             if swap {

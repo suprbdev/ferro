@@ -68,7 +68,7 @@ fn options(threads: usize) -> Options {
     Options::new()
         .durability(Durability::Buffered)
         .cache_bytes(1)
-        .reclaim(Reclaim { every_bytes: 0 })
+        .reclaim(Reclaim::off())
         .copy_threads(threads)
 }
 

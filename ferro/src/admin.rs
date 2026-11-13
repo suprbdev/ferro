@@ -53,6 +53,7 @@ type ByHash = BuildHasherDefault<Prehashed>;
 /// reclaimed its bytes yet, and version 0 goes when version 1 does. See
 /// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Keep {
     /// Every version, the default.
     #[default]
@@ -77,6 +78,7 @@ pub enum Keep {
 
 /// One branch as [`info`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BranchInfo {
     /// The branch's name.
     pub name: String,
@@ -90,6 +92,7 @@ pub struct BranchInfo {
 
 /// What [`info`] reports of a file.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Info {
     /// The length of the file in bytes, zeroes a writer preallocated past its log included.
     pub file_bytes: u64,
@@ -731,6 +734,7 @@ fn agreed(
 }
 
 /// Where the records that a compaction would copy lie in a file, from [`layout`].
+#[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
     /// The size of the file in bytes.
@@ -762,6 +766,7 @@ pub struct Layout {
 /// # Errors
 ///
 /// The errors of [`info`].
+#[doc(hidden)]
 pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     let (store, head) = read_only(path.as_ref())?;
     let mut extents = Vec::new();

@@ -139,7 +139,7 @@ concurrency](concurrency.md#awaited-writes).
 | `cache_bytes(u64)` | 1 GiB | Approximate bound on the decoded node cache. See [Cache weight](../internals/read-scaling.md#cache-weight). |
 | `read_only(bool)` | `false` | Opens without the writer lock. See [Writers and concurrency](concurrency.md#several-processes). |
 | `history(Keep)` | `Keep::All` | How much history to retain. See [Retention and reclamation](retention.md). |
-| `reclaim(Reclaim)` | `every_bytes: 64 << 20` | When background reclamation cycles run. |
+| `reclaim(Reclaim)` | `Reclaim::every(64 << 20)` | When background reclamation cycles run. |
 | `coalesce(bool)` | `false` | Lets queued closures share one version. See [Sharing a version between writers](concurrency.md#sharing-a-version-between-writers). |
 | `shared(bool)` | `false` | Lets other processes that open the file with it write too. See [Several processes](concurrency.md#several-processes). |
 | `follow(bool)` | `false` | Keeps a read-only handle or a shared writer up to date with other processes' commits on a thread of its own. See [Following other processes](concurrency.md#following-other-processes). |

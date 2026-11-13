@@ -1291,9 +1291,7 @@ fn a_cycle_during_coalesced_commits_loses_nothing() {
     let db = fast()
         .coalesce(true)
         .history(Keep::Last(4))
-        .reclaim(Reclaim {
-            every_bytes: 64 << 10,
-        })
+        .reclaim(Reclaim::every(64 << 10))
         .open::<Root>(&path)
         .unwrap();
     let writers: Vec<_> = (0..6u64)

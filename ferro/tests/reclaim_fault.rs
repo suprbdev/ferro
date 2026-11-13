@@ -20,7 +20,7 @@ const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 const EIO: c_int = 5;
 const ENOSPC: c_int = 28;
 const SPLIT: usize = 200;
-const MANUAL: Reclaim = Reclaim { every_bytes: 0 };
+const MANUAL: Reclaim = Reclaim::off();
 
 unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -598,9 +598,7 @@ fn shutting_down_while_threads_verify_the_copy_joins_them_and_leaves_no_temp_fil
     let db: Db<Root> = options()
         .copy_threads(4)
         .history(Keep::Last(1 << 20))
-        .reclaim(Reclaim {
-            every_bytes: 8 << 20,
-        })
+        .reclaim(Reclaim::every(8 << 20))
         .hook(Hook(Arc::new(hook)))
         .open(&path)
         .unwrap();
