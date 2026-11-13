@@ -18,6 +18,9 @@ says so under **Format**, and a build refuses a file of another format with `Err
   `table::Keys` and `table::Diff`. `Set::diff` yields a `set::Change<T>`, `Added(T)` or
   `Removed(T)`, where it yielded a `Change<T, ()>`, and a set cursor reads its value with
   `set::Cursor::value` where it called `key`.
+- **Breaking:** the test hooks are behind a new `testing` cargo feature: `Options::hook`, `clock`,
+  `trace` and `follow_polling`, `Db::trace_op`, `db::Hook` and `db::Clock`, the `store` module and
+  `admin::layout`. A build without it does not have them, and its commits call no hook.
 
 ## [0.1.0] - 2026-11-13
 

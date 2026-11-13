@@ -25,7 +25,7 @@ machine passes the cap; set `JOBS` when `MEM` is not given in G.
 | `make test-one T=filter` | Library tests whose names match `T`. |
 | `make test-pkg P=booking T=filter` | One package's tests. |
 | `make test-stress` | The library's unit tests in `STRESS_COPIES` processes at once, `STRESS_ROUNDS` times over, 12 and 25 by default, as [How the protocol is checked](../internals/read-scaling.md#how-the-protocol-is-checked) describes. |
-| `make lint`, `make lint-windows` | clippy with warnings as errors, for Linux and for `x86_64-pc-windows-gnu`, with `undocumented_unsafe_blocks` and `missing_safety_doc` on. |
+| `make lint`, `make lint-windows` | clippy with warnings as errors, for Linux and for `x86_64-pc-windows-gnu`, with `undocumented_unsafe_blocks` and `missing_safety_doc` on: first on every target, then on the library alone, without the `testing` feature. |
 | `make ci` | `fmt-check`, `lint`, `lint-windows`, `fuzz-lint`, `doc-check`, `test` and `test-stress`, the local equivalent of CI. |
 | `make act` | The GitHub workflow's Linux job, locally with `act`. |
 | `make fmt`, `make fmt-check` | Format the workspace with rustfmt, or fail if any file is not formatted. |
@@ -42,4 +42,32 @@ machine passes the cap; set `JOBS` when `MEM` is not given in G.
 --release -p ferro-bench --bin <tool>`.
 `make ARGS='...'` passes arguments through to any of them.
 
-CI runs clippy and every test on Linux, and clippy and the library's tests on `windows-latest`.
+CI runs both clippy passes of `make lint` and every test on Linux, and both clippy passes and the
+library's tests on `windows-latest`.
+
+## The `testing` feature
+
+The hooks that tests reach the library through are behind its `testing` cargo feature:
+`Options::hook`, `clock`, `trace` and `follow_polling`, `Db::trace_op`, `db::Hook` and
+`db::Clock`, the `store` module, and `admin::layout`. A build without the feature, as an
+application that depends on `ferro` gets, does not have them, and its commits call no hook.
+[Test hooks](../internals/testing.md#test-hooks) describes what each does.
+
+The tests turn it on themselves:
+
+- `ferro`'s own unit tests, integration tests in `ferro/tests`, doctests and examples get it from a
+  dev-dependency of `ferro` on itself with the feature. Cargo turns on a dev-dependency's features
+  only for targets that build with dev-dependencies, so `cargo test -p ferro` needs no flag, and
+  `cargo build -p ferro` and `cargo clippy -p ferro --lib` leave the feature off.
+- The fuzz crate depends on `ferro` with the feature, and the `notes` example's tests have it as a
+  dev-dependency.
+- `ferro-bench` has a `testing` feature of its own, on by default, that turns on the library's.
+  Its `collections`, `delta`, `follow` and `reclaim` tools need it. `cargo run --release -p
+  ferro-bench --no-default-features --bin <tool>` runs any other tool against the library as an
+  application builds it.
+
+A test in `ferro/tests` that uses a hook needs only an import, such as `use ferro::db::Hook;`, and
+a test in another package needs `ferro` with the feature among its dev-dependencies, as the `notes`
+example has. Since a workspace build turns the feature on for every package in it, `make lint` and
+`make lint-windows` run clippy on `-p ferro --lib` after the workspace, which checks the library
+without the feature, and `make doc-check` builds the API docs without it.

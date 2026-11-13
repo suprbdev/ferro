@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 blake3 = "1"
-ferro = { path = "../ferro" }
+ferro = { path = "../ferro", features = ["testing"] }
 libc = "0.2"
 libfuzzer-sys = "0.4"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }

@@ -333,6 +333,7 @@ pub enum Durability {
 }
 
 /// A file operation recorded in a [`Trace`], for tests that replay a crash.
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -353,6 +354,7 @@ pub enum Op {
 }
 
 /// The operations a store's file records, shared with the test that reads them.
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 pub type Trace = Arc<Mutex<Vec<Op>>>;
 
@@ -380,6 +382,7 @@ pub struct StoreOptions {
     /// a log under 1 MiB stays on one thread.
     pub copy_threads: usize,
     /// Records every write, sync and change of length to the file, for crash tests.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub trace: Option<Trace>,
 }
@@ -393,6 +396,7 @@ impl Default for StoreOptions {
             checkpoint_bytes: 64 << 20,
             shared: false,
             copy_threads: 0,
+            #[cfg(feature = "testing")]
             trace: None,
         }
     }
@@ -1658,6 +1662,7 @@ pub(crate) fn compressed(body: &[u8]) -> Option<Vec<u8>> {
 ///
 /// The body is LZ4 compressed when that makes the record shorter, and each link is stored as its
 /// hash and the distance back from `offset` to the link's own offset.
+#[cfg(feature = "testing")]
 pub fn append_record(buf: &mut Vec<u8>, offset: u64, body: &[u8], links: &[Ptr]) {
     let packed = compressed(body);
     append_staged(buf, offset, staged(body, packed.as_deref(), links));
@@ -1716,6 +1721,7 @@ fn append_link(buf: &mut Vec<u8>, offset: u64, link: &Ptr) {
 }
 
 /// The length in bytes of the record that `object` would take at `offset` in the log.
+#[cfg(feature = "testing")]
 pub fn record_len(offset: u64, object: &Object) -> usize {
     let mut buf = Vec::new();
     append_record(&mut buf, offset, &object.body, &object.links);
@@ -2670,13 +2676,14 @@ struct Arrivals {
     waiters: usize,
 }
 
-/// The store's file, recording every write, sync and change of length when a trace is given, for
-/// tests that replay a crash.
+/// The store's file, recording every write, sync and change of length when the `testing` feature
+/// is on and a trace is given, for tests that replay a crash.
 ///
 /// A write or a change of length is recorded before it is made, since it may land in part, and a
 /// sync once it has succeeded, since only then does it count.
 pub(crate) struct Traced {
     file: Arc<File>,
+    #[cfg(feature = "testing")]
     trace: Option<Trace>,
     /// The file's identity, which the trace names it by and which tells whether a path still
     /// names it.
@@ -2684,14 +2691,21 @@ pub(crate) struct Traced {
 }
 
 impl Traced {
-    /// Wraps `file`, recording to `trace` if one is given.
-    pub(crate) fn new(file: File, trace: Option<Trace>) -> Result<Traced> {
+    /// Wraps `file`, recording nothing.
+    pub(crate) fn new(file: File) -> Result<Traced> {
         let inode = platform::file_id(&file)?;
         Ok(Traced {
             file: Arc::new(file),
-            trace,
+            #[cfg(feature = "testing")]
+            trace: None,
             inode,
         })
+    }
+
+    /// The same file, recording to `trace` if one is given.
+    #[cfg(feature = "testing")]
+    pub(crate) fn tracing(self, trace: Option<Trace>) -> Traced {
+        Traced { trace, ..self }
     }
 
     /// The same open file, without the trace, for a [`Store::view`] that only reads it. Nothing
@@ -2699,12 +2713,14 @@ impl Traced {
     fn reader(&self) -> Traced {
         Traced {
             file: self.file.clone(),
+            #[cfg(feature = "testing")]
             trace: None,
             inode: self.inode,
         }
     }
 
     /// Records the operation that `op` makes from the file's identity, if there is a trace.
+    #[cfg(feature = "testing")]
     fn log(&self, op: impl FnOnce(u64) -> Op) {
         if let Some(trace) = &self.trace {
             trace.lock().push(op(self.inode));
@@ -2713,11 +2729,13 @@ impl Traced {
 
     /// Records that the file was created.
     pub(crate) fn created(&self) {
+        #[cfg(feature = "testing")]
         self.log(Op::Create);
     }
 
     /// Writes `bytes` at `at`.
     pub(crate) fn write_all_at(&self, bytes: &[u8], at: u64) -> std::io::Result<()> {
+        #[cfg(feature = "testing")]
         self.log(|inode| Op::Write(inode, at, bytes.to_vec()));
         self.file.write_all_at(bytes, at)
     }
@@ -2725,6 +2743,7 @@ impl Traced {
     /// Syncs the file's data.
     pub(crate) fn sync_data(&self) -> std::io::Result<()> {
         self.file.sync_data()?;
+        #[cfg(feature = "testing")]
         self.log(Op::Sync);
         Ok(())
     }
@@ -2732,12 +2751,14 @@ impl Traced {
     /// Syncs the file's data and metadata.
     fn sync_all(&self) -> std::io::Result<()> {
         self.file.sync_all()?;
+        #[cfg(feature = "testing")]
         self.log(Op::Sync);
         Ok(())
     }
 
     /// Sets the file's length.
     pub(crate) fn set_len(&self, len: u64) -> std::io::Result<()> {
+        #[cfg(feature = "testing")]
         self.log(|inode| Op::SetLen(inode, len));
         self.file.set_len(len)
     }
@@ -3230,7 +3251,9 @@ impl Store {
         let items = ((cache_bytes / 4096).max(64)) as usize;
         let dedupe = (cache_bytes / 4096).clamp(MIN_DEDUPE, MAX_DEDUPE) as usize;
         let head = sb.head;
-        let file = Traced::new(file, options.trace.clone())?;
+        let file = Traced::new(file)?;
+        #[cfg(feature = "testing")]
+        let file = file.tracing(options.trace.clone());
         let store = Store {
             inner: Shared::new(Inner {
                 id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -3350,6 +3373,7 @@ impl Store {
                 options: StoreOptions {
                     read_only: true,
                     shared: false,
+                    #[cfg(feature = "testing")]
                     trace: None,
                     ..inner.options.clone()
                 },
@@ -3556,13 +3580,16 @@ impl Store {
     }
 
     /// Records `op` in the store's trace, for tests.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn trace(&self, op: Op) {
         self.inner.file.log(|_| op);
     }
 
-    /// Records that this store's file was renamed over the database's path.
+    /// Records in the trace, with the `testing` feature, that this store's file was renamed over
+    /// the database's path.
     pub(crate) fn trace_rename(&self) {
+        #[cfg(feature = "testing")]
         self.inner.file.log(Op::Rename);
     }
 

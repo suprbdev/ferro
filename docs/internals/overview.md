@@ -47,9 +47,9 @@ The library is `ferro/src`:
   threads, described under [Trees on several threads](reclamation.md#trees-on-several-threads).
 - `follow.rs`: the thread behind `Options::follow` and `Following`, described under
   [Followers](processes.md#followers).
-- `admin.rs`: functions that work on a path without user types: `info`, `log`, `verify`, `layout`,
-  `space` and `compact`, and `Keep`, and the walk behind every verify, described under [Verifying a
-  file](verify.md).
+- `admin.rs`: functions that work on a path without user types: `info`, `log`, `verify`, `space`
+  and `compact`, `layout` with the `testing` feature, and `Keep`, and the walk behind every verify,
+  described under [Verifying a file](verify.md).
 - `platform.rs`: the file calls that differ between Unix and Windows, described under
   [Windows](windows.md).
 - `sync.rs`: `Have`, `Bundle`, and `Db::pull`, `push` and `receive`, which copy a branch between

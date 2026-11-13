@@ -20,5 +20,6 @@ ferro = { path = "../../ferro" }
 clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
+ferro = { path = "../../ferro", features = ["testing"] }
 assert_cmd = "2"
 tempfile = "3"

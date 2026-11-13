@@ -10,6 +10,22 @@ path = "src/main.rs"
 [[bin]]
 name = "reclaim"
 path = "src/bin/reclaim.rs"
+required-features = ["testing"]
+
+[[bin]]
+name = "collections"
+path = "src/bin/collections.rs"
+required-features = ["testing"]
+
+[[bin]]
+name = "delta"
+path = "src/bin/delta.rs"
+required-features = ["testing"]
+
+[[bin]]
+name = "follow"
+path = "src/bin/follow.rs"
+required-features = ["testing"]
 
 [[bin]]
 name = "group"
@@ -28,10 +44,6 @@ name = "tables"
 path = "src/bin/tables.rs"
 
 [[bin]]
-name = "delta"
-path = "src/bin/delta.rs"
-
-[[bin]]
 name = "merge"
 path = "src/bin/merge.rs"
 
@@ -40,7 +52,9 @@ name = "bytes"
 path = "src/bin/bytes.rs"
 
 [features]
+default = ["testing"]
 mimalloc = ["dep:mimalloc"]
+testing = ["ferro/testing"]
 
 [dependencies]
 booking = { path = "../examples/booking" }

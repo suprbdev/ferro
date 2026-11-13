@@ -18,9 +18,11 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
+#[cfg(feature = "testing")]
+use crate::codec::HashSink;
 use crate::codec::{
-    Checked, Data, Decoder, Encoder, HASH_BYTES, Hash, HashBatch, HashSink, Kind, PairRoots,
-    Pairing, Plans, Ptr, Tables, pair_roots,
+    Checked, Data, Decoder, Encoder, HASH_BYTES, Hash, HashBatch, Kind, PairRoots, Pairing, Plans,
+    Ptr, Tables, pair_roots,
 };
 use crate::db::{Commit, Refs};
 use crate::error::{Error, Result};
@@ -734,6 +736,7 @@ fn agreed(
 }
 
 /// Where the records that a compaction would copy lie in a file, from [`layout`].
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout {
@@ -766,6 +769,7 @@ pub struct Layout {
 /// # Errors
 ///
 /// The errors of [`info`].
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 pub fn layout(path: impl AsRef<Path>, keep: Keep) -> Result<Layout> {
     let (store, head) = read_only(path.as_ref())?;

@@ -41,9 +41,11 @@ use crate::reentry::{self, Crossing, Needs};
 use crate::refs::{self, Root};
 use crate::stack;
 use crate::store::{
-    Durability, Followed, Frame, Gate, Held, Landing, News, Op, Retired, Settling, Store,
-    StoreOptions, Trace, Txn, lane_of,
+    Durability, Followed, Frame, Gate, Held, Landing, News, Retired, Settling, Store, StoreOptions,
+    Txn, lane_of,
 };
+#[cfg(feature = "testing")]
+use crate::store::{Op, Trace};
 use crate::watch::{Feed, Filter, Notice, Seats, Watcher};
 
 const MAIN: &str = "main";
@@ -231,7 +233,7 @@ pub struct Stamp<'a> {
     version: u64,
     floor: u64,
     time: &'a OnceCell<u64>,
-    clock: Option<&'a Clock>,
+    hooks: &'a Hooks,
 }
 
 impl Stamp<'_> {
@@ -259,7 +261,7 @@ impl Stamp<'_> {
     pub fn time_ms(&self) -> u64 {
         *self
             .time
-            .get_or_init(|| read_clock(self.clock).max(self.floor))
+            .get_or_init(|| self.hooks.now_ms().max(self.floor))
     }
 }
 
@@ -1203,8 +1205,7 @@ struct Shared<T> {
     history: Keep,
     reclaim: Reclaim,
     automatic: bool,
-    hook: Option<Hook>,
-    clock: Option<Clock>,
+    hooks: Hooks,
     cycle: Mutex<()>,
     log: Mutex<CycleLog>,
     retired: Mutex<Vec<Retired>>,
@@ -1518,6 +1519,7 @@ impl<T> Clone for Db<T> {
 
 /// A callback that commits, cycles and sync call at named steps, for tests that inject faults
 /// between them.
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct Hook(
@@ -1525,6 +1527,7 @@ pub struct Hook(
     pub Arc<dyn Fn(&'static str) + Send + Sync>,
 );
 
+#[cfg(feature = "testing")]
 impl fmt::Debug for Hook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Hook")
@@ -1532,6 +1535,7 @@ impl fmt::Debug for Hook {
 }
 
 /// A source of commit times that replaces the system clock, for tests.
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct Clock(
@@ -1539,14 +1543,49 @@ pub struct Clock(
     pub Arc<dyn Fn() -> u64 + Send + Sync>,
 );
 
+#[cfg(feature = "testing")]
 impl fmt::Debug for Clock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Clock")
     }
 }
 
-fn read_clock(clock: Option<&Clock>) -> u64 {
-    clock.map_or_else(now_ms, |clock| (clock.0)())
+/// The hook and clock that tests set on [`Options`].
+///
+/// Without the `testing` feature it holds nothing, its step does nothing and its clock is the
+/// system's.
+#[derive(Clone, Debug, Default)]
+struct Hooks {
+    #[cfg(feature = "testing")]
+    hook: Option<Hook>,
+    #[cfg(feature = "testing")]
+    clock: Option<Clock>,
+}
+
+impl Hooks {
+    /// Calls the hook at the step `name`, if one is set.
+    #[cfg(feature = "testing")]
+    fn step(&self, name: &'static str) {
+        if let Some(hook) = &self.hook {
+            (hook.0)(name);
+        }
+    }
+
+    /// Does nothing, as there is no hook without the `testing` feature.
+    #[cfg(not(feature = "testing"))]
+    fn step(&self, _: &'static str) {}
+
+    /// The time in milliseconds since the Unix epoch, from the clock if one is set.
+    #[cfg(feature = "testing")]
+    fn now_ms(&self) -> u64 {
+        self.clock.as_ref().map_or_else(now_ms, |clock| (clock.0)())
+    }
+
+    /// The system clock's time in milliseconds since the Unix epoch.
+    #[cfg(not(feature = "testing"))]
+    fn now_ms(&self) -> u64 {
+        now_ms()
+    }
 }
 
 /// Settings for opening a database, set by chaining.
@@ -1589,8 +1628,7 @@ pub struct Options {
     lock_wait: Duration,
     follow: bool,
     follow_poll: Option<Duration>,
-    hook: Option<Hook>,
-    clock: Option<Clock>,
+    hooks: Hooks,
 }
 
 impl Options {
@@ -1791,6 +1829,7 @@ impl Options {
 
     /// Makes a follower look every `every` even where inotify could tell it of changes, for tests
     /// and benchmarks.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn follow_polling(mut self, every: Duration) -> Self {
         self.follow_poll = Some(every);
@@ -1798,20 +1837,23 @@ impl Options {
     }
 
     /// Calls `hook` at named steps of commits, cycles and sync, for fault injection in tests.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn hook(mut self, hook: Hook) -> Self {
-        self.hook = Some(hook);
+        self.hooks.hook = Some(hook);
         self
     }
 
     /// Takes commit times from `clock` instead of the system clock, for tests.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn clock(mut self, clock: Clock) -> Self {
-        self.clock = Some(clock);
+        self.hooks.clock = Some(clock);
         self
     }
 
     /// Records the file operations of the store in `trace`, for crash tests.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn trace(mut self, trace: Trace) -> Self {
         self.store.trace = Some(trace);
@@ -1922,8 +1964,7 @@ impl Options {
             history: self.history,
             reclaim: self.reclaim,
             automatic,
-            hook: self.hook,
-            clock: self.clock,
+            hooks: self.hooks,
             cycle: Mutex::new(()),
             log: Mutex::new(CycleLog::default()),
             retired: Mutex::new(Vec::new()),
@@ -3719,7 +3760,7 @@ impl<T: Data> Shared<T> {
     }
 
     fn now(&self) -> u64 {
-        read_clock(self.clock.as_ref())
+        self.hooks.now_ms()
     }
 
     /// Finishes a frame placed under `tip` and writes it: builds the branch's new state and makes
@@ -4012,9 +4053,7 @@ impl<T: Data> Shared<T> {
     }
 
     fn step(&self, name: &'static str) {
-        if let Some(hook) = &self.hook {
-            (hook.0)(name);
-        }
+        self.hooks.step(name);
     }
 
     fn spawn(shared: &Arc<Self>) -> JoinHandle<()> {
@@ -4256,6 +4295,7 @@ impl<T: Data> Shared<T> {
             old.poison();
             return Err(error.into());
         }
+        #[cfg(feature = "testing")]
         fresh.trace(Op::SyncDir);
         self.take_genesis(named, notices);
         tip.take(Some(head), loaded);
@@ -4400,6 +4440,7 @@ impl<T: Data> Db<T> {
     }
 
     /// Records `op` in the trace that [`Options::trace`] set, for crash tests.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub fn trace_op(&self, op: Op) {
         self.shared.store().trace(op);
@@ -4997,7 +5038,7 @@ impl<T: Data> Db<T> {
             version: before.saturating_add(1),
             floor: state.snapshot.commit.floor(),
             time: &time,
-            clock: self.shared.clock.as_ref(),
+            hooks: &self.shared.hooks,
         };
         let ran = f(&state, &mut working, &stamp);
         let result = ran.and_then(|(message, value, mut intent)| {
@@ -5058,7 +5099,7 @@ impl<T: Data> Db<T> {
             version: before.saturating_add(1),
             floor: group.state.snapshot.commit.floor(),
             time: &group.time,
-            clock: shared.clock.as_ref(),
+            hooks: &shared.hooks,
         };
         let base = &group.state.snapshot.value;
         let working = &mut group.working;
@@ -6289,7 +6330,7 @@ impl<T: Data> Db<T> {
         self.shared.store()
     }
 
-    /// Calls the [`Options::hook`] at the step `name`, if one is set.
+    /// Calls the hook that `Options::hook` set at the step `name`, if one is set.
     pub(crate) fn step(&self, name: &'static str) {
         self.shared.step(name);
     }

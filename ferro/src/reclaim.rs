@@ -1226,7 +1226,10 @@ impl<'a> Copier<'a> {
         let source = store.metadata()?;
         file.set_permissions(source.permissions())?;
         copy_owner(&file, &source);
-        let file = Arc::new(Traced::new(file, options.trace.clone())?);
+        let file = Traced::new(file)?;
+        #[cfg(feature = "testing")]
+        let file = file.tracing(options.trace.clone());
+        let file = Arc::new(file);
         file.created();
         file.set_len(LOG_START)?;
         let threads = copy_threads(options);

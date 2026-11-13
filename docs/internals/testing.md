@@ -765,6 +765,39 @@ handle is about to be dropped, so the copy is still running when it is. The othe
 with a fixed amount of work going until the other side has done its part, or start it once the
 other side is under way, so that the work they count has happened before they count it.
 
+## Test hooks
+
+Tests, fuzz targets and some `ferro-bench` tools reach inside the library through hooks that only
+a build with its `testing` cargo feature has, as
+[Development](../guide/development.md#the-testing-feature) describes:
+
+- `Options::hook` takes a `db::Hook`, a callback that commits, cycles, catch-ups and sync call
+  with the name of each step they reach, such as `drafted`, `landing` and `published` in a commit,
+  `created`, `copied` and `swapped` in a cycle, and `received` and `placed` in a receive; the calls
+  to `step` in `db.rs` and `sync.rs` name them all. A test injects a fault at a step by panicking
+  there, blocking until another thread has acted, or acting on the database itself.
+- `Options::clock` takes a `db::Clock`, which replaces the system clock for commit times.
+- `Options::trace` takes a `store::Trace`, which records each creation, write, change of length,
+  sync and rename of the store's file, and each sync of its directory, as a `store::Op`: a write or
+  a change of length before it is made, since it may land in part, and a sync once it succeeds.
+  Crash tests replay a prefix of the trace to build the image that a power cut at that point could
+  leave. `Db::trace_op` adds a test's own marks, such as `Op::Acked` for a commit acknowledged at a
+  version.
+- `Options::follow_polling` makes a follower look at an interval even where inotify could tell it
+  of changes.
+- The `store` module, public only with the feature, opens a `Store` and writes `Txn`s outside a
+  database, and `admin::layout` lists where the records a compaction would copy lie in a file.
+
+Without the feature none of these exist. `Options` and a database's shared state hold an empty
+`Hooks`, whose step is an empty function and whose clock is the system's, and the store's file
+wrapper holds no trace and records nothing, so the commit and write paths call no hook and test no
+`Option` for one. A Buffered single-key commit measured on 2026-11-13 with `ferro-bench`'s
+`batch --batch 1 --n 1000 --commits 20000 --durability buffered`, built with `--no-default-features`
+and with the feature, in seven alternating runs of each, took a median 102,887 user-space
+instructions outside its closure for a new key without the feature against 103,055 with it, 168
+fewer, and 58,971 against 58,979 for an overwrite, within the 100 that the runs of either build
+spread over. Wall time was the same, 15 to 20 µs for a new key and 8 to 10 µs for an overwrite.
+
 ## Where the other tests are described
 
 Tests are described next to what they test:

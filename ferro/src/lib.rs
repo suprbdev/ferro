@@ -100,8 +100,11 @@ mod refs;
 pub mod set;
 mod shared;
 mod stack;
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 pub mod store;
+#[cfg(not(feature = "testing"))]
+mod store;
 pub mod sync;
 pub mod table;
 pub mod watch;

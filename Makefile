@@ -78,11 +78,13 @@ test-stress: ## Run the library's unit tests in STRESS_COPIES processes at once,
 	fi; \
 	echo "test-stress: $$runs runs of the library's unit tests, $(STRESS_COPIES) at a time, all passed"
 
-lint: ## Run clippy on every target with warnings as errors
+lint: ## Run clippy with warnings as errors on every target, then on the library without the testing feature
 	$(RUN) clippy --workspace --all-targets --release -- -D warnings $(LINTS)
+	$(RUN) clippy -p ferro --lib --release -- -D warnings $(LINTS)
 
-lint-windows: ## Run clippy for the Windows target
+lint-windows: ## Run both clippy passes of lint for the Windows target
 	$(RUN) clippy --target $(WIN_TARGET) --workspace --all-targets --release -- -D warnings $(LINTS)
+	$(RUN) clippy --target $(WIN_TARGET) -p ferro --lib --release -- -D warnings $(LINTS)
 
 fmt: ## Format the workspace with rustfmt
 	$(CARGO) fmt --all
