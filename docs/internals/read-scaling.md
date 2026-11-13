@@ -1111,10 +1111,11 @@ lookup, and so is a row stored on its own. `get` takes the same descent, made ge
 makes of the row it finds, so a lookup through `next` builds its `Val` where it did and runs the
 instructions it ran before, within 0.4%.
 
-`Iter` and `Values` have the same pair, so `Table::iter`, `range` and `prefix` and a map's iterators
-lend too. `next_ref` lends the entry from the frame that holds it and keeps a value stored on its
-own in the iterator, an `Arc` of 8 bytes, until the next step. `visit` takes a run of a node's
-entries at a time, as `fold` does.
+`Iter` and `Values` have the same pair, and the `table::Iter` and `list::Iter` that wrap `Values`
+pass it on, so `Table::iter`, `range` and `prefix`, `List::iter` and a map's iterators lend too.
+`next_ref` lends the entry from the frame that holds it and keeps a value stored on its own in the
+iterator, an `Arc` of 8 bytes, until the next step. `visit` takes a run of a node's entries at a
+time, as `fold` does.
 
 A lent row is a borrow of a node that the lookup or iterator already holds, by a slot, an anchor or
 a count, for as long as the reference can live, so no step of the protocol changed and nothing new

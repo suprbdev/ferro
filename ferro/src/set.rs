@@ -3,6 +3,9 @@
 //! [`Set<T>`] is a [`Map<T, ()>`](Map) with a set's methods, so it shares the map's tree: cloning
 //! is O(1), `==` compares root hashes in O(1), lookups cost O(log n), and range cuts and joins
 //! touch O(log n) nodes however many values move.
+//!
+//! [`Set::iter`], [`Set::range`] and [`Set::prefix`] return an [`Iter`], [`Set::cursor`] a
+//! [`Cursor`], and [`Set::diff`] a [`Diff`] of [`Change`]s.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -10,7 +13,7 @@ use std::ops::RangeBounds;
 
 use crate::codec::{Data, Decoder, Description, Encoder};
 use crate::error::Result;
-use crate::map::{Cursor, Diff, Keys, Map};
+use crate::map::{self, Map};
 use crate::prefix::Prefix;
 
 /// An ordered set of values, stored as a Merkle search tree.
@@ -134,37 +137,39 @@ impl<T: Data + Ord> Set<T> {
     }
 
     /// A [`Cursor`] over the values, whose seeks cost the distance moved.
-    pub fn cursor(&self) -> Cursor<T, ()> {
-        self.0.cursor()
+    ///
+    /// The cursor starts with no position: [`Cursor::seek`] or [`Cursor::rewind`] gives it one.
+    pub fn cursor(&self) -> Cursor<T> {
+        Cursor(self.0.cursor())
     }
 
     /// Every value, in order, from either end.
-    pub fn iter(&self) -> Keys<T, ()> {
-        self.0.keys()
+    pub fn iter(&self) -> Iter<T> {
+        Iter(self.0.keys())
     }
 
     /// The values that lie in `range`, in order, from either end.
     ///
     /// Finding the start costs O(log n), and the iterator knows its length at once.
-    pub fn range<Q, R>(&self, range: R) -> Keys<T, ()>
+    pub fn range<Q, R>(&self, range: R) -> Iter<T>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
-        self.0.range::<Q, R>(range).into_keys()
+        Iter(self.0.range::<Q, R>(range).into_keys())
     }
 
     /// The tuple values whose first field is `head`, in order, from either end.
     ///
     /// The values must be tuples of two to four fields, or a type of your own that implements
     /// [`Prefix`]. It costs what the same [`range`](Set::range) does.
-    pub fn prefix<Q>(&self, head: &Q) -> Keys<T, ()>
+    pub fn prefix<Q>(&self, head: &Q) -> Iter<T>
     where
         T: Prefix<Q>,
         Q: Ord + ?Sized,
     {
-        self.0.prefix(head).into_keys()
+        Iter(self.0.prefix(head).into_keys())
     }
 
     /// The smallest value.
@@ -248,11 +253,24 @@ impl<T: Data + Ord> Set<T> {
     }
 
     /// The values added and removed between this set and `newer`, in order, as
-    /// [`Change::Added`](crate::Change::Added) and [`Change::Removed`](crate::Change::Removed).
+    /// [`Change::Added`] and [`Change::Removed`].
     ///
     /// Subtrees with the same hash are skipped, so a diff costs O(changes).
-    pub fn diff(&self, newer: &Set<T>) -> Diff<T, ()> {
-        self.0.diff(&newer.0)
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::Set;
+    /// use ferro::set::Change;
+    ///
+    /// let old: Set<u32> = [1, 2, 3].into_iter().collect();
+    /// let new: Set<u32> = [2, 3, 4].into_iter().collect();
+    ///
+    /// let changes: Vec<Change<u32>> = old.diff(&new).collect();
+    /// assert_eq!(changes, [Change::Removed(1), Change::Added(4)]);
+    /// ```
+    pub fn diff(&self, newer: &Set<T>) -> Diff<T> {
+        Diff(self.0.diff(&newer.0))
     }
 
     /// Whether every value of this set is in `other`.
@@ -349,9 +367,193 @@ impl<T: Data + Ord> FromIterator<T> for Set<T> {
 
 impl<T: Data + Ord> IntoIterator for &Set<T> {
     type Item = T;
-    type IntoIter = Keys<T, ()>;
+    type IntoIter = Iter<T>;
 
-    fn into_iter(self) -> Keys<T, ()> {
+    fn into_iter(self) -> Iter<T> {
         self.iter()
+    }
+}
+
+/// An iterator over the values of a [`Set`], in order, from either end, made by [`Set::iter`],
+/// [`Set::range`] and [`Set::prefix`].
+///
+/// It knows its length from the start, for a range as for the whole set, and holds the set as it
+/// was when it was made, so changes to the set afterwards do not reach it.
+///
+/// # Panics
+///
+/// A step that cannot load a node from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Iter<T>(map::Keys<T, ()>);
+
+impl<T> fmt::Debug for Iter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
+}
+
+impl<T: Data + Ord> Iterator for Iter<T> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, T) -> B>(self, init: B, f: F) -> B {
+        self.0.fold(init, f)
+    }
+}
+
+impl<T: Data + Ord> DoubleEndedIterator for Iter<T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<T> {
+        self.0.next_back()
+    }
+}
+
+impl<T: Data + Ord> ExactSizeIterator for Iter<T> {}
+
+/// A position among the values of a [`Set`], made by [`Set::cursor`], that keeps its path through
+/// the tree, so a seek costs the distance it moves rather than a walk from the root.
+///
+/// A new cursor has no position until [`seek`](Cursor::seek), [`seek_back`](Cursor::seek_back) or
+/// [`rewind`](Cursor::rewind) gives it one, and it loses its position when a move goes past
+/// either end. It reads the set as it was when it was made, so changes to the set afterwards do
+/// not reach it.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::Set;
+///
+/// let evens: Set<u32> = (0..100).step_by(2).collect();
+/// let mut cursor = evens.cursor();
+/// assert_eq!(cursor.value(), None);
+///
+/// assert!(!cursor.seek(&41));
+/// assert_eq!(cursor.value(), Some(&42));
+/// assert_eq!(cursor.advance(), Some(&44));
+///
+/// assert!(!cursor.seek_back(&41));
+/// assert_eq!(cursor.value(), Some(&40));
+///
+/// cursor.rewind();
+/// assert_eq!(cursor.value(), Some(&0));
+/// ```
+///
+/// # Panics
+///
+/// A move that cannot load a node from the file, or finds one damaged, panics.
+pub struct Cursor<T>(map::Cursor<T, ()>);
+
+impl<T> fmt::Debug for Cursor<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cursor").finish_non_exhaustive()
+    }
+}
+
+impl<T: Data + Ord> Cursor<T> {
+    /// Moves to the smallest value, or to no position if the set is empty.
+    pub fn rewind(&mut self) {
+        self.0.rewind();
+    }
+
+    /// Moves to `value` if the set holds it, and otherwise to the first value after it, returning
+    /// whether it found `value`.
+    ///
+    /// With no value after it, the cursor is left with no position.
+    pub fn seek<Q>(&mut self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0.seek(value)
+    }
+
+    /// Moves to `value` if the set holds it, and otherwise to the last value before it, returning
+    /// whether it found `value`.
+    ///
+    /// With no value before it, the cursor is left with no position.
+    pub fn seek_back<Q>(&mut self, value: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.0.seek_back(value)
+    }
+
+    /// Moves to the next value in order and returns it.
+    ///
+    /// Past the largest value it returns `None` and leaves the cursor with no position, and a
+    /// cursor with no position stays where it is and returns `None`.
+    pub fn advance(&mut self) -> Option<&T> {
+        self.0.advance()
+    }
+
+    /// The value at the cursor, or `None` if it has no position.
+    pub fn value(&self) -> Option<&T> {
+        self.0.key()
+    }
+}
+
+/// One difference between two versions of a [`Set`], from the older to the newer, as [`Diff`]
+/// yields them.
+///
+/// See [`Set::diff`] for an example.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Change<T> {
+    /// The newer set holds this value, and the older one does not.
+    Added(T),
+    /// The older set held this value, and the newer one does not.
+    Removed(T),
+}
+
+impl<T> Change<T> {
+    /// The value that was added or removed.
+    pub fn value(&self) -> &T {
+        match self {
+            Change::Added(value) | Change::Removed(value) => value,
+        }
+    }
+}
+
+/// An iterator over the [`Change`]s between two versions of a [`Set`], in order, made by
+/// [`Set::diff`].
+///
+/// It is lazy: each step expands only the subtrees the two versions do not share, until it finds
+/// the next change, so stopping early costs only what was read. It holds both versions, and
+/// changes to either set afterwards do not reach it.
+///
+/// # Panics
+///
+/// A step that cannot load a node from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Diff<T>(map::Diff<T, ()>);
+
+impl<T> fmt::Debug for Diff<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Diff").finish_non_exhaustive()
+    }
+}
+
+impl<T: Data + Ord> Iterator for Diff<T> {
+    type Item = Change<T>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Change<T>> {
+        loop {
+            match self.0.next()? {
+                map::Change::Added(value, _) => return Some(Change::Added(value)),
+                map::Change::Removed(value, _) => return Some(Change::Removed(value)),
+                map::Change::Changed(..) => {}
+            }
+        }
     }
 }

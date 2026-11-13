@@ -49,10 +49,11 @@
 //! # Reading rows
 //!
 //! [`get`](Table::get), [`contains`](Table::contains), [`first`](Table::first) and
-//! [`last`](Table::last) find one row in O(log n). [`iter`](Table::iter), [`range`](Table::range),
-//! [`keys`](Table::keys) and [`prefix`](Table::prefix) walk rows in key order from either end, and
-//! [`rows`](Table::rows) gives the underlying [`Map`] for `(key, row)` pairs and everything else a
-//! map can do.
+//! [`last`](Table::last) find one row in O(log n). [`iter`](Table::iter), [`range`](Table::range)
+//! and [`prefix`](Table::prefix) return an [`Iter`] over rows, and [`keys`](Table::keys) a [`Keys`],
+//! each in key order from either end. [`diff`](Table::diff) returns a [`Diff`] of the rows that
+//! changed between two versions, and [`rows`](Table::rows) gives the underlying [`Map`] for
+//! `(key, row)` pairs and everything else a map can do.
 //!
 //! # Index lookups
 //!
@@ -159,8 +160,8 @@ use crate::codec::{
 };
 use crate::error::{Error, Result};
 use crate::map::{
-    Changed, Conflict, Cursor, Diff, Differing, Finder, Iter, Keys, Map, Undo, Val, Values, differ,
-    kin, same_value, unwound, walked, walked_until,
+    self, Change, Changed, Conflict, Cursor, Differing, Finder, Map, Undo, Val, differ, kin,
+    same_value, unwound, walked, walked_until,
 };
 use crate::pool::{Latch, Pool};
 use crate::prefix::Prefix;
@@ -924,13 +925,13 @@ impl<T: Record> Table<T> {
     }
 
     /// Every row, in key order, from either end.
-    pub fn iter(&self) -> Values<T::Key, T> {
-        self.0.rows().values()
+    pub fn iter(&self) -> Iter<T> {
+        Iter(self.0.rows().values())
     }
 
     /// Every primary key, in order, from either end.
-    pub fn keys(&self) -> Keys<T::Key, T> {
-        self.0.rows().keys()
+    pub fn keys(&self) -> Keys<T> {
+        Keys(self.0.rows().keys())
     }
 
     /// Calls `f` on every row in key order, lending each row instead of cloning a [`Val`].
@@ -951,13 +952,13 @@ impl<T: Record> Table<T> {
     /// The rows whose key lies in `range`, in key order, from either end.
     ///
     /// Finding the start costs O(log n), and the iterator knows its length at once.
-    pub fn range<Q, R>(&self, range: R) -> Values<T::Key, T>
+    pub fn range<Q, R>(&self, range: R) -> Iter<T>
     where
         T::Key: Borrow<Q>,
         Q: Ord + ?Sized,
         R: RangeBounds<Q>,
     {
-        self.0.rows().range::<Q, R>(range).into_values()
+        Iter(self.0.rows().range::<Q, R>(range).into_values())
     }
 
     /// The rows whose tuple key starts with `head`, in key order, from either end.
@@ -986,12 +987,12 @@ impl<T: Record> Table<T> {
     /// let cash: i64 = postings.prefix("cash").map(|posting| posting.amount).sum();
     /// assert_eq!(cash, 45);
     /// ```
-    pub fn prefix<Q>(&self, head: &Q) -> Values<T::Key, T>
+    pub fn prefix<Q>(&self, head: &Q) -> Iter<T>
     where
         T::Key: Prefix<Q>,
         Q: Ord + ?Sized,
     {
-        self.0.rows().prefix(head).into_values()
+        Iter(self.0.rows().prefix(head).into_values())
     }
 
     /// The row with the smallest key.
@@ -1363,12 +1364,13 @@ impl<T: Record> Table<T> {
         );
     }
 
-    /// The rows added, removed and changed between this table and `newer`, in key order.
+    /// The rows added, removed and changed between this table and `newer`, in key order, as a
+    /// [`Change`] each.
     ///
     /// Subtrees with the same hash are skipped, so a diff costs O(changes), not O(rows). Rows are
     /// compared by their encoding, not with `==`.
-    pub fn diff(&self, newer: &Table<T>) -> Diff<T::Key, T> {
-        self.0.rows().diff(newer.0.rows())
+    pub fn diff(&self, newer: &Table<T>) -> Diff<T> {
+        Diff(self.0.rows().diff(newer.0.rows()))
     }
 
     /// Merges into this table the changes `theirs` made since `base`, three-way, and returns how
@@ -1722,6 +1724,234 @@ where
     }
 }
 
+/// An iterator over the rows of a [`Table`], in key order, from either end, made by
+/// [`Table::iter`], [`Table::range`] and [`Table::prefix`].
+///
+/// It knows its length from the start, and holds the table as it was when it was made, so
+/// changes to the table afterwards do not reach it. Each row comes as a [`Val`], and
+/// [`next_ref`](Iter::next_ref) and [`visit`](Iter::visit) lend it instead, as [Reading rows in
+/// place](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md#reading-rows-in-place)
+/// describes.
+///
+/// # Panics
+///
+/// A step that cannot load a node or row from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Iter<T: Record>(map::Values<T::Key, T>);
+
+impl<T: Record> fmt::Debug for Iter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
+}
+
+impl<T: Record> Iter<T> {
+    /// Steps to the next row from the front and lends it, where `next` hands out a [`Val`].
+    ///
+    /// The row is read in place, without the reference count a [`Val`] takes on its node's
+    /// column, and stays lent until the iterator moves again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     total: u64,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=10 {
+    ///     orders.insert(Order { id, total: id * 100 });
+    /// }
+    ///
+    /// let mut rows = orders.range(3..);
+    /// let mut page = Vec::new();
+    /// while page.len() < 3
+    ///     && let Some(order) = rows.next_ref()
+    /// {
+    ///     page.push(order.total);
+    /// }
+    /// assert_eq!(page, [300, 400, 500]);
+    /// assert_eq!(rows.len(), 5);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or row cannot be read, as `next` does.
+    pub fn next_ref(&mut self) -> Option<&T> {
+        self.0.next_ref()
+    }
+
+    /// Calls `f` on each row the iterator has left, in key order from the front, lending it as
+    /// [`next_ref`](Iter::next_ref) does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::{Data, Record, Table};
+    ///
+    /// #[derive(Data, Record, Clone)]
+    /// struct Order {
+    ///     #[key]
+    ///     id: u64,
+    ///     total: u64,
+    /// }
+    ///
+    /// let mut orders: Table<Order> = Table::new();
+    /// for id in 1..=10 {
+    ///     orders.insert(Order { id, total: id * 100 });
+    /// }
+    ///
+    /// let mut total = 0;
+    /// orders.range(3..=5).visit(|order| total += order.total);
+    /// assert_eq!(total, 1200);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or row cannot be read, as `next` does.
+    pub fn visit(self, f: impl FnMut(&T)) {
+        self.0.visit(f);
+    }
+}
+
+impl<T: Record> Iterator for Iter<T> {
+    type Item = Val<T>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Val<T>> {
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, Val<T>) -> B>(self, init: B, f: F) -> B {
+        self.0.fold(init, f)
+    }
+}
+
+impl<T: Record> DoubleEndedIterator for Iter<T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Val<T>> {
+        self.0.next_back()
+    }
+}
+
+impl<T: Record> ExactSizeIterator for Iter<T> {}
+
+/// An iterator over the primary keys of a [`Table`], in order, from either end, made by
+/// [`Table::keys`].
+///
+/// It reads no rows, knows its length from the start, and holds the table as it was when it was
+/// made.
+///
+/// # Panics
+///
+/// A step that cannot load a node from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Keys<T: Record>(map::Keys<T::Key, T>);
+
+impl<T: Record> fmt::Debug for Keys<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Keys").finish_non_exhaustive()
+    }
+}
+
+impl<T: Record> Iterator for Keys<T> {
+    type Item = T::Key;
+
+    #[inline]
+    fn next(&mut self) -> Option<T::Key> {
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, T::Key) -> B>(self, init: B, f: F) -> B {
+        self.0.fold(init, f)
+    }
+}
+
+impl<T: Record> DoubleEndedIterator for Keys<T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<T::Key> {
+        self.0.next_back()
+    }
+}
+
+impl<T: Record> ExactSizeIterator for Keys<T> {}
+
+/// An iterator over the [`Change`]s between two versions of a [`Table`], in key order, made by
+/// [`Table::diff`].
+///
+/// Each change carries the primary key and the row before, after or both. It is lazy: each step
+/// expands only the subtrees the two versions do not share, until it finds the next change, so
+/// stopping early costs only what was read. It holds both versions, and changes to either table
+/// afterwards do not reach it.
+///
+/// # Examples
+///
+/// ```
+/// use ferro::{Change, Data, Record, Table};
+///
+/// #[derive(Data, Record, Clone)]
+/// struct Order {
+///     #[key]
+///     id: u64,
+///     total: u64,
+/// }
+///
+/// let mut old: Table<Order> = Table::new();
+/// old.insert(Order { id: 1, total: 100 });
+/// old.insert(Order { id: 2, total: 200 });
+/// let mut new = old.clone();
+/// new.remove(&1);
+/// new.insert(Order { id: 2, total: 250 });
+///
+/// let changed: Vec<String> = old
+///     .diff(&new)
+///     .map(|change| match change {
+///         Change::Added(id, order) => format!("+{id} {}", order.total),
+///         Change::Removed(id, order) => format!("-{id} {}", order.total),
+///         Change::Changed(id, before, after) => format!("~{id} {} {}", before.total, after.total),
+///     })
+///     .collect();
+/// assert_eq!(changed, ["-1 100", "~2 200 250"]);
+/// ```
+///
+/// # Panics
+///
+/// A step that cannot load a node or row from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Diff<T: Record>(map::Diff<T::Key, T>);
+
+impl<T: Record> fmt::Debug for Diff<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Diff").finish_non_exhaustive()
+    }
+}
+
+impl<T: Record> Iterator for Diff<T> {
+    type Item = Change<T::Key, T>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Change<T::Key, T>> {
+        self.0.next()
+    }
+}
+
 trait KeyCursor<K>: Send {
     fn forward(&mut self) -> Option<K>;
     fn backward(&mut self) -> Option<K>;
@@ -1898,7 +2128,7 @@ impl<K: Data + Ord, V: Data> IndexSink<K, V> for Fresh<'_, K, V> {
 }
 
 struct Entries<I, K, S, C> {
-    iter: Iter<(I, K), S>,
+    iter: map::Iter<(I, K), S>,
     project: Project<I, S, C>,
 }
 
@@ -1973,7 +2203,7 @@ impl<I: Data + Ord, K: Data + Ord, S: Data, C> Span<I, K> for Entries<I, K, S, C
 }
 
 struct Holders<I, K> {
-    iter: Iter<I, K>,
+    iter: map::Iter<I, K>,
 }
 
 impl<I: Data + Ord, K: Data + Ord> KeyCursor<K> for Holders<I, K> {
@@ -2026,7 +2256,7 @@ impl<I: Data + Ord, K: Data + Ord> Span<I, K> for Holders<I, K> {
 }
 
 struct CoveredHolders<I, K, S, C> {
-    iter: Iter<I, (K, S)>,
+    iter: map::Iter<I, (K, S)>,
     project: fn(S) -> C,
 }
 
@@ -2241,7 +2471,7 @@ impl<T: Record, C: 'static> IndexIter<T, C> {
     #[inline(always)]
     fn over<I: Data + Ord, S: Data>(
         rows: &Map<T::Key, T>,
-        entries: Iter<(I, T::Key), S>,
+        entries: map::Iter<(I, T::Key), S>,
         project: Project<I, S, C>,
     ) -> Self {
         IndexIter {
@@ -3386,7 +3616,7 @@ const STEPS: usize = 16;
 
 struct EqualStream<I, K, S, C> {
     index: Map<(I, K), S>,
-    iter: Iter<(I, K), S>,
+    iter: map::Iter<(I, K), S>,
     project: Project<I, S, C>,
     covering: bool,
     started: bool,
@@ -3401,7 +3631,7 @@ struct EqualStream<I, K, S, C> {
 }
 
 impl<I: Data + Ord, K: Data + Ord, S: Data, C: Send> EqualStream<I, K, S, C> {
-    fn new(index: Map<(I, K), S>, iter: Iter<(I, K), S>, project: Project<I, S, C>) -> Self {
+    fn new(index: Map<(I, K), S>, iter: map::Iter<(I, K), S>, project: Project<I, S, C>) -> Self {
         EqualStream {
             index,
             iter,
@@ -5290,7 +5520,7 @@ where
 ///
 /// It is for the code the [`Record`](derive@crate::Record) derive generates.
 #[doc(hidden)]
-pub fn unique_some_range<X, V, Q, R>(index: &Map<Option<X>, V>, range: R) -> Iter<Option<X>, V>
+pub fn unique_some_range<X, V, Q, R>(index: &Map<Option<X>, V>, range: R) -> map::Iter<Option<X>, V>
 where
     X: Data + Ord + Borrow<Q>,
     V: Data,
@@ -5332,7 +5562,7 @@ where
 #[inline(always)]
 pub fn unique_rows<I, T>(
     rows: &Map<T::Key, T>,
-    entries: Iter<I, T::Key>,
+    entries: map::Iter<I, T::Key>,
     indexed: Indexed<T, I>,
 ) -> IndexIter<T>
 where
@@ -5351,7 +5581,7 @@ where
 #[inline(always)]
 pub fn unique_rows_covered<I, T, S, C>(
     rows: &Map<T::Key, T>,
-    entries: Iter<I, (T::Key, S)>,
+    entries: map::Iter<I, (T::Key, S)>,
     project: fn(S) -> C,
     indexed: Indexed<T, I>,
 ) -> IndexIter<T, C>
@@ -5576,7 +5806,7 @@ where
 fn seeking<I, T, S, C>(
     rows: &Map<T::Key, T>,
     index: &Map<(I, T::Key), S>,
-    entries: Iter<(I, T::Key), S>,
+    entries: map::Iter<(I, T::Key), S>,
     project: Project<I, S, C>,
 ) -> Matches<T, C>
 where

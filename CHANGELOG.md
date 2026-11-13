@@ -11,6 +11,14 @@ says so under **Format**, and a build refuses a file of another format with `Err
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Set`, `List` and `Table` return iterator types of their own rather than the `Map`
+  types behind them: `set::Iter`, `set::Cursor` and `set::Diff`, `list::Iter`, and `table::Iter`,
+  `table::Keys` and `table::Diff`. `Set::diff` yields a `set::Change<T>`, `Added(T)` or
+  `Removed(T)`, where it yielded a `Change<T, ()>`, and a set cursor reads its value with
+  `set::Cursor::value` where it called `key`.
+
 ## [0.1.0] - 2026-11-13
 
 The first tagged release. ferro is an experimental embedded database for Rust in which the database

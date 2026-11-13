@@ -3925,11 +3925,15 @@ mod diffed {
         let cut = rng.below(want.len() as u64 + 2) as usize;
         let prefix = got(old.bytes.diff(&new.bytes).take(cut), Vec::clone);
         assert_eq!(prefix[..], want[..cut.min(want.len())], "bytes prefix");
-        assert_eq!(
-            got(old.set.diff(&new.set), |_| ()),
-            wanted(&keyed(&a.set), &keyed(&b.set)),
-            "set"
-        );
+        let set: Changes<u64, ()> = old
+            .set
+            .diff(&new.set)
+            .map(|change| match change {
+                ferro::set::Change::Added(value) => (value, None, Some(())),
+                ferro::set::Change::Removed(value) => (value, Some(()), None),
+            })
+            .collect();
+        assert_eq!(set, wanted(&keyed(&a.set), &keyed(&b.set)), "set");
         let rows = got(old.rows.diff(&new.rows), |row: &Row| {
             (row.id, row.note.clone())
         });

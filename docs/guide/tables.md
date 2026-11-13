@@ -296,13 +296,13 @@ let mut owed = 0;
 snapshot.orders.by_customer("wile").visit(|order| owed += order.total_cents);
 ```
 
-`IndexIter`, `Matches` and the `Values` that `iter`, `range` and `prefix` return all have both, and
-a map's `Iter` lends `(&K, &V)` the same way. Read rows this way where the code uses a row where
-it finds it: a page that copies the fields it shows, a total, a filter, a hot path that many
-threads run over the same rows. Keep `next` and the iterator adapters where the rows themselves
-go on, into a `Vec`, a channel or a response built later, since a lent row lasts only until the
-next step and a clone of the row costs more than a `Val`. The loop around `next_ref` can `break`,
-`return` or use `?` as it likes, and the lookup goes on from the next row.
+`IndexIter`, `Matches` and the `table::Iter` that `iter`, `range` and `prefix` return all have both,
+and a map's `Iter` lends `(&K, &V)` the same way. Read rows this way where the code uses a row where
+it finds it: a page that copies the fields it shows, a total, a filter, a hot path that many threads
+run over the same rows. Keep `next` and the iterator adapters where the rows themselves go on, into
+a `Vec`, a channel or a response built later, since a lent row lasts only until the next step and a
+clone of the row costs more than a `Val`. The loop around `next_ref` can `break`, `return` or use
+`?` as it likes, and the lookup goes on from the next row.
 
 On 200,000 rows, measured on 2026-11-05, 32 threads reading pages of the same 200 rows through
 `next_ref` read 4.1 million pages a second where `next` read 1.5 million, and one thread 305,000

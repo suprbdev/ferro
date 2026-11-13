@@ -24,8 +24,9 @@ The library is `ferro/src`:
 - `prefix.rs`: the `Prefix` trait, which lets `Map::prefix` read the entries whose tuple key starts
   with a given first field.
 - `set.rs` and `list.rs`: `Set<T>`, a wrapper over `Map<T, ()>`, and `List<T>`, a wrapper over
-  `Map<u64, T>`.
-- `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes.
+  `Map<u64, T>`, each with iterator types of its own that wrap the map's.
+- `table.rs`: `Table<T: Record>`, a keyed collection with automatic secondary indexes, and the
+  `Iter`, `Keys` and `Diff` its reads return.
 - `db.rs`: `Db<T>`, `Snapshot<T>`, `Options`, commits, branches, coalescing, merges and reclamation
   cycles.
 - `refs.rs`: the branch table a file's head points at, and the steps that change it one branch at a

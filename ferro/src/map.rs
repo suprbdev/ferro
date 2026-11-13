@@ -314,6 +314,7 @@ const fn by_copy<V>() -> bool {
 /// keep a value without keeping its column. A share of a column is a reference count, which every
 /// thread reading values of the same node writes, so a value read in place and not kept is
 /// cheaper lent: the `next_ref` and `visit` of [`Iter`], [`Values`],
+/// [`list::Iter`](crate::list::Iter), [`table::Iter`](crate::table::Iter),
 /// [`IndexIter`](crate::table::IndexIter) and [`Matches`](crate::table::Matches) lend `&V`
 /// instead.
 ///
@@ -7014,7 +7015,6 @@ impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Iter<K, V, S> {}
 /// An iterator over keys of a [`Map`], in order, from either end, made by [`Map::keys`].
 ///
 /// It walks as [`Iter`] does and reads no value, so it costs no more than the keys themselves.
-/// [`Set`](crate::Set) hands it out for its values.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Keys<K, V, S = ()>(Iter<K, V, S>);
 
@@ -7060,7 +7060,7 @@ impl<K: Data + Ord, V: Data, S: Data> ExactSizeIterator for Keys<K, V, S> {}
 
 /// An iterator over values of a [`Map`], in key order, from either end, made by [`Map::values`].
 ///
-/// It walks as [`Iter`] does and clones no key. [`Table`](crate::Table) hands it out for its rows.
+/// It walks as [`Iter`] does and clones no key.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Values<K, V, S = ()>(Iter<K, V, S>);
 
@@ -7074,37 +7074,25 @@ impl<K: Data + Ord, V: Data, S: Data> Values<K, V, S> {
     /// Steps to the next value from the front and lends it, where `next` hands out a [`Val`], as
     /// [`Iter::next_ref`] does.
     ///
-    /// For a table's rows from [`Table::iter`](crate::Table::iter),
-    /// [`Table::range`](crate::Table::range) or [`Table::prefix`](crate::Table::prefix), this
-    /// reads each row in place, without the reference count a [`Val`] takes on its node's column,
-    /// until the iterator moves again.
+    /// The value is read in place, without the reference count a [`Val`] takes on its node's
+    /// column, and stays lent until the iterator moves again.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ferro::{Data, Record, Table};
+    /// use ferro::Map;
     ///
-    /// #[derive(Data, Record, Clone)]
-    /// struct Order {
-    ///     #[key]
-    ///     id: u64,
-    ///     total: u64,
-    /// }
+    /// let names: Map<u32, String> = (0..10).map(|id| (id, format!("user {id}"))).collect();
     ///
-    /// let mut orders: Table<Order> = Table::new();
-    /// for id in 1..=10 {
-    ///     orders.insert(Order { id, total: id * 100 });
-    /// }
-    ///
-    /// let mut rows = orders.range(3..);
+    /// let mut values = names.values();
     /// let mut page = Vec::new();
     /// while page.len() < 3
-    ///     && let Some(order) = rows.next_ref()
+    ///     && let Some(name) = values.next_ref()
     /// {
-    ///     page.push(order.total);
+    ///     page.push(name.clone());
     /// }
-    /// assert_eq!(page, [300, 400, 500]);
-    /// assert_eq!(rows.len(), 5);
+    /// assert_eq!(page, ["user 0", "user 1", "user 2"]);
+    /// assert_eq!(values.len(), 7);
     /// ```
     ///
     /// # Panics
@@ -7120,23 +7108,13 @@ impl<K: Data + Ord, V: Data, S: Data> Values<K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use ferro::{Data, Record, Table};
+    /// use ferro::Map;
     ///
-    /// #[derive(Data, Record, Clone)]
-    /// struct Order {
-    ///     #[key]
-    ///     id: u64,
-    ///     total: u64,
-    /// }
+    /// let names: Map<u32, String> = (0..10).map(|id| (id, format!("user {id}"))).collect();
     ///
-    /// let mut orders: Table<Order> = Table::new();
-    /// for id in 1..=10 {
-    ///     orders.insert(Order { id, total: id * 100 });
-    /// }
-    ///
-    /// let mut total = 0;
-    /// orders.range(3..=5).visit(|order| total += order.total);
-    /// assert_eq!(total, 1200);
+    /// let mut letters = 0;
+    /// names.values().visit(|name| letters += name.len());
+    /// assert_eq!(letters, 60);
     /// ```
     ///
     /// # Panics

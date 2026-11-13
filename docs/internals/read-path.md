@@ -375,8 +375,8 @@ They now share one walk until they part and count only the links between them, s
 reads each node once and sums almost nothing, and `range(key..).next()` went from 860 to 565 ns.
 `floor` is one walk that remembers the last node with a key before the target. Built on a cursor it
 was 20% slower than `get`, and it would have written the reference counts of pinned nodes.
-`Set::range` returns the named `Keys`, so it has `len` and `next_back`, and the set operations probe
-through `contains_many`.
+`Set::range` returns a `set::Iter`, which wraps the map's `Keys`, so it has `len` and `next_back`,
+and the set operations probe through `contains_many`.
 
 `IndexIter` fetched rows through a cursor. Rows of one index value sit in key order, so those went
 from 163 to 60 ns each, and rows scattered across the table from 208 to 161 ns. It now fetches them

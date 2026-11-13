@@ -62,6 +62,7 @@ fn reports_and_settings_are_send_sync_and_debug() {
     shared::<Reclaim>();
     shared::<Durability>();
     shared::<Change<u32, String>>();
+    shared::<ferro::set::Change<String>>();
     shared::<Conflict<u32, String>>();
     shared::<Taken<u32>>();
     shared::<Explain>();
@@ -74,6 +75,13 @@ fn iterators_are_send_and_debug() {
     sent::<ferro::map::Values<u32, String>>();
     sent::<ferro::map::Diff<u32, String>>();
     sent::<ferro::map::Cursor<u32, String>>();
+    sent::<ferro::set::Iter<String>>();
+    sent::<ferro::set::Cursor<String>>();
+    sent::<ferro::set::Diff<String>>();
+    sent::<ferro::list::Iter<u64>>();
+    sent::<ferro::table::Iter<Row>>();
+    sent::<ferro::table::Keys<Row>>();
+    sent::<ferro::table::Diff<Row>>();
     sent::<ferro::log::Iter>();
     sent::<IndexIter<Row>>();
     sent::<Matches<Row>>();

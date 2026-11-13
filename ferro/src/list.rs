@@ -2,13 +2,13 @@
 //!
 //! [`List<T>`] keeps its values in a [`Map<u64, T>`](Map) keyed by position, so it shares the
 //! map's tree: cloning is O(1), `==` compares root hashes in O(1), and reading or writing a
-//! position costs O(log n).
+//! position costs O(log n). [`List::iter`] returns an [`Iter`].
 
 use std::fmt;
 
 use crate::codec::{Data, Decoder, Description, Encoder, Pairing, Tabled};
 use crate::error::Result;
-use crate::map::{Map, Val, Values};
+use crate::map::{self, Map, Val};
 
 /// A sequence of values that grows and shrinks at the end, with indexed access.
 ///
@@ -140,8 +140,8 @@ impl<T: Data> List<T> {
     }
 
     /// Every value, in order, from either end.
-    pub fn iter(&self) -> Values<u64, T> {
-        self.0.values()
+    pub fn iter(&self) -> Iter<T> {
+        Iter(self.0.values())
     }
 }
 
@@ -212,9 +212,106 @@ impl<T: Data> FromIterator<T> for List<T> {
 
 impl<T: Data> IntoIterator for &List<T> {
     type Item = Val<T>;
-    type IntoIter = Values<u64, T>;
+    type IntoIter = Iter<T>;
 
-    fn into_iter(self) -> Values<u64, T> {
+    fn into_iter(self) -> Iter<T> {
         self.iter()
     }
 }
+
+/// An iterator over the values of a [`List`], in order, from either end, made by [`List::iter`].
+///
+/// It knows its length from the start, and holds the list as it was when it was made, so changes
+/// to the list afterwards do not reach it. Each value comes as a [`Val`], and
+/// [`next_ref`](Iter::next_ref) and [`visit`](Iter::visit) lend it instead.
+///
+/// # Panics
+///
+/// A step that cannot load a node or value from the file, or finds one damaged, panics.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Iter<T>(map::Values<u64, T>);
+
+impl<T> fmt::Debug for Iter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
+}
+
+impl<T: Data> Iter<T> {
+    /// Steps to the next value from the front and lends it, where `next` hands out a [`Val`].
+    ///
+    /// The value is read in place, without the reference count a [`Val`] takes on its node's
+    /// column, and stays lent until the iterator moves again.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::List;
+    ///
+    /// let words: List<String> = ["one", "three", "five"].into_iter().map(String::from).collect();
+    ///
+    /// let mut values = words.iter();
+    /// let mut letters = 0;
+    /// while let Some(word) = values.next_ref() {
+    ///     letters += word.len();
+    /// }
+    /// assert_eq!(letters, 12);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value cannot be read, as `next` does.
+    pub fn next_ref(&mut self) -> Option<&T> {
+        self.0.next_ref()
+    }
+
+    /// Calls `f` on each value the iterator has left, in order from the front, lending it as
+    /// [`next_ref`](Iter::next_ref) does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferro::List;
+    ///
+    /// let words: List<String> = ["one", "three", "five"].into_iter().map(String::from).collect();
+    ///
+    /// let mut letters = 0;
+    /// words.iter().visit(|word| letters += word.len());
+    /// assert_eq!(letters, 12);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if a node or value cannot be read, as `next` does.
+    pub fn visit(self, f: impl FnMut(&T)) {
+        self.0.visit(f);
+    }
+}
+
+impl<T: Data> Iterator for Iter<T> {
+    type Item = Val<T>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Val<T>> {
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+
+    #[inline]
+    fn fold<B, F: FnMut(B, Val<T>) -> B>(self, init: B, f: F) -> B {
+        self.0.fold(init, f)
+    }
+}
+
+impl<T: Data> DoubleEndedIterator for Iter<T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Val<T>> {
+        self.0.next_back()
+    }
+}
+
+impl<T: Data> ExactSizeIterator for Iter<T> {}
