@@ -318,12 +318,15 @@ well doubled the indexes, and a name change then cost twice the bytes and 2.6 ti
 
 In `bench-tables`, booking-style commits on the example's model with its customer index covering
 six fields ran 5% more instructions for a hold, 10% for a confirm and 11% for a cancel, since a
-confirm and a cancel change the covered status, and wrote 8.9% more per write. The same commits on
-the plain model ran the instructions they did before covering existed, 611k, 747k and 924k, within
-0.3%, and so did the plain workloads in `scaling`. Index lookups at 32 threads with the 1 GiB cache
-fell into the two modes described under [Iterator frames](read-scaling.md#iterator-frames) in both
-builds, with medians of 2.54M and 2.57M a second over eight alternating runs. The booking example's
-own numbers are under [Example apps](../guide/examples.md#booking).
+confirm and a cancel change the covered status, and wrote 8.9% more per write. In
+[Performance](../guide/performance.md), a hold and a confirm took 86 and 106 µs of CPU on
+2026-11-05, 4 and 14% more than the 82 and 93 µs measured on 2026-11-03, before the example's
+customer index covered its bookings. The same commits on the plain model ran the instructions they
+did before covering existed, 611k, 747k and 924k, within 0.3%, and so did the plain workloads in
+`scaling`. Index lookups at 32 threads with the 1 GiB cache fell into the two modes described under
+[Iterator frames](read-scaling.md#iterator-frames) in both builds, with medians of 2.54M and 2.57M a
+second over eight alternating runs. The booking example's own numbers are under [Example
+apps](../guide/examples.md#booking).
 
 The feature stays. A page or lookup that needs only a few fields runs 3.4 to 11 times as fast with
 everything cached and over 100 times as fast when the rows do not fit, and the cost lands only on

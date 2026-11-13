@@ -15,14 +15,12 @@ refs is one small record per commit however many branches there are, and a commi
 another branch's frame overtook only rewrites its links' distances in place, once it has let that
 lock go. So with one writer on each of 16 branches, single-key commits and `Durability::Buffered`,
 the file took about 135,000 commits a second on the test machine on 2026-11-09, against 48,000 for
-one writer on one branch. Moving the rest of the work that does not need the lock out from under
-it, on 2026-11-12, cut what a commit runs under it at 16 branches from about 21,000 instructions to
-8,900, and gave 1.31 to 1.47 times the commits a second at 16 branches in runs alternating with the
-tree before on the same machine, then shared with other work. Decoding a moved draft's root went
-back under the lock, so that an error or a panic from it fails only its commit, which costs about
-590 of those instructions back, as described under [Less under
-`tip`](../internals/commit-path.md#less-under-tip). A reclamation cycle, and `receive` once its
-bundle has arrived, wait for the closure running on every branch before they hold up all of them.
+one writer on one branch. Under the lock for the whole file such a commit runs about 8,300
+instructions, measured on 2026-11-12, and the work that does not need it runs once the lock is let
+go. A moved draft's root is decoded under the lock, so that an error or a panic from it fails only
+its commit, as described under [Less under `tip`](../internals/commit-path.md#less-under-tip). A
+reclamation cycle, and `receive` once its bundle has arrived, wait for the closure running on every
+branch before they hold up all of them.
 
 ## Awaited writes
 
@@ -69,13 +67,13 @@ touched. With `coalesce`, closures on one branch that queue up while a sync is r
 write and one version. They still run one at a time, each on its caller's thread, so they need not
 be `Send`, and each sees what the ones before it did. Each branch groups its own closures. An `Err`
 or a panic rolls back that closure alone. On `examples/queue` at 32 workers, measured on
-2026-11-03, that took jobs from 9,700 to 16,900 a second, bytes per job from 2,691 to 146 and p99
-from 2.3 to 0.8 ms. A closure that runs long against an fsync does not gain: at 50 µs it lost 20%
-of its throughput with 8 writers and 19% with 32 on 2026-11-04. A closure waits for another that
-is still on its way to the lock only while handing over has lately cost less than writing and
-syncing a version. So where a sync is nearly free, on tmpfs or with `Durability::Buffered`, and the
-cores are busy, `coalesce` runs at about the speed of plain group commit; it used to run up to ten
-times slower there. See [Coalescing](../internals/coalescing.md#waiting-for-a-thread-on-its-way).
+2026-11-03, `coalesce` ran 16,900 jobs a second where plain commits ran 9,700, at 146 bytes a job
+against 2,691 and a p99 of 0.8 ms against 2.3. A closure that runs long against an fsync does not
+gain: at 50 µs it lost 20% of its throughput with 8 writers and 19% with 32 on 2026-11-04. A
+closure waits for another that is still on its way to the lock only while handing over has lately
+cost less than writing and syncing a version. So where a sync is nearly free, on tmpfs or with
+`Durability::Buffered`, and the cores are busy, `coalesce` runs at about the speed of plain group
+commit. See [Coalescing](../internals/coalescing.md#waiting-for-a-thread-on-its-way).
 
 What you give up is a version per closure. `Committed::version` and `time_ms` are the group's, `at`
 cannot show the state between two closures of a group, and `history_of` reports the group's net

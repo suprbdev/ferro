@@ -127,12 +127,12 @@ destructures the tuple, and the compiler cannot tell.
 
 A covered field is copied into every entry, and changing it rewrites the entry where a plain index
 is left alone. On 200,000 rows, measured on 2026-11-05, a page of 200 rows read through a covered
-index went from 183,000 to 855,000 a second on one thread and from 1.5 million to 9.3 million on
-32, and a lookup of 20 rows by a range from 232,000 to 2.5 million on one thread. Covering one
-integer grew the indexes 17%, and a commit that changed it wrote 36% more and took 28% more CPU. A
-commit that changed nothing covered cost the same. Cover what a hot page shows and what seldom
-changes after the row is written, and leave wide strings and fields rewritten on most commits out.
-A plain `#[index]` is unchanged and costs nothing more. [Covering
+index ran 855,000 a second on one thread where a plain index ran 183,000, and 9.3 million on 32
+where it ran 1.5 million, and a lookup of 20 rows by a range 2.5 million on one thread where it ran
+232,000. Covering one integer grew the indexes 17%, and a commit that changed it wrote 36% more and
+took 28% more CPU. A commit that changed nothing covered cost the same. Cover what a hot page shows
+and what seldom changes after the row is written, and leave wide strings and fields rewritten on
+most commits out. A plain `#[index]` is unchanged and costs nothing more. [Covering
 indexes](../internals/schema-and-unique-indexes.md#covering-indexes) has the measurements.
 
 Changing a cover list rebuilds that index the next time the table is read, as [Changing your
@@ -172,9 +172,10 @@ keys first, each only for a key every lookup before it holds. Written in another
 yields the rows and covered fields of its leftmost lookup, and costs the same, and an `and` nested
 on the right, as in `a.and(b.and(c))`, joins the chain as its lookups, so it plans as
 `a.and(b).and(c)` does. On 200,000 rows, measured on 2026-11-11, a lookup of 100,000 keys, then one
-of 1,000, then one of 1,000 took 12 µs where they took 47 µs before chains were planned, as long as
-written smallest first. `explain()` shows the plan without reading anything, one line a lookup,
-each side indented below its `and` or `or`:
+of 1,000, then one of 1,000 took 12 µs, the same as written smallest first, as [What planning
+measured](../internals/schema-and-unique-indexes.md#what-planning-measured) describes. `explain()`
+shows the plan without reading anything, one line a lookup, each side indented below its `and` or
+`or`:
 
 ```rust
 let find = shop.orders.find();
@@ -241,13 +242,14 @@ reads its rows through the range's own finder and the range borrows that side's.
 an `or`, which lends the finder of a range it reads in full, and only a side whose every range is
 itself tested has none to lend. A lookup of an `and` nested on the right lends like any other side
 of the chain, as long as the nested `and`'s first lookup reads that table at that version as well.
-10 keys against a range of 100,000 written that way took 1.4 µs, where it had taken 2.4 ms. Of two
-ranges, the one with fewer keys leads and the other is tested. In a chain, the keys led to a range
-are estimated from the lookups walked before it, as if they matched independently, so two lookups
-of 50,000 keys that share 12,500 and a range of 100,000 took 3.0 ms where they took 4.6 ms with the
-range read in full. A range tests each key led to it once, from whichever end the combination is
-read, so the tests stop once they number a quarter of the range's keys only when the estimate was
-too low, and then cost about what reading the range would, as rows read from the file do.
+On 2026-11-11, 10 keys against a range of 100,000 written that way took 1.4 µs, where reading the
+range took 2.4 ms. Of two ranges, the one with fewer keys leads and the other is tested. In a chain,
+the keys led to a range are estimated from the lookups walked before it, as if they matched
+independently, so two lookups of 50,000 keys that share 12,500 and a range of 100,000 took 3.0 ms,
+where reading the range in full took 4.6 ms. A range tests each key led to it once, from whichever
+end the combination is read, so the tests stop once they number a quarter of the range's keys only
+when the estimate was too low, and then cost about what reading the range would, as rows read from
+the file do.
 
 Lookups of two tables of the same row type, or of two versions of one table, such as a snapshot's
 and the one inside a commit, combine as well. Each answers for the table and version it was made
@@ -304,8 +306,8 @@ next step and a clone of the row costs more than a `Val`. The loop around `next_
 
 On 200,000 rows, measured on 2026-11-05, 32 threads reading pages of the same 200 rows through
 `next_ref` read 4.1 million pages a second where `next` read 1.5 million, and one thread 305,000
-where it read 182,000. A lookup of about 20 scattered rows through `visit` went from 4.5 million to
-5.1 million a second on 32 threads, and from 236,000 to 240,000 on one. [Rows lent in
+where it read 182,000. A lookup of about 20 scattered rows through `visit` read 5.1 million a second
+on 32 threads where `next` read 4.5 million, and 240,000 on one where it read 236,000. [Rows lent in
 place](../internals/read-scaling.md#rows-lent-in-place) has the measurements.
 
 ## Lookups

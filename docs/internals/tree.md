@@ -343,6 +343,19 @@ keys with one `extend`, which sorts the batch and builds the tree bottom-up as d
 [Batches](#batches-extend-fromiterator-and-apply), took 0.41 s. A `Map::from_sorted` for input
 already in key order would save only the sort, about 33 ms at 1M pairs, so it was not added.
 
+Between the figures [Performance](../guide/performance.md) gave on 2026-11-04 and on 2026-11-05,
+those changes and the walk described under [One loop for borrowed
+nodes](read-path.md#one-loop-for-borrowed-nodes) took `ferro-bench`'s bulk insert from 0.71 to
+0.66 s, its peak RSS from 379 to 344 MiB and a full scan from 19 to 18 ns a key, and the compare
+harness's scan from 19 to 18 ns a key too. In `bulk` the load went from 0.73 to 0.66 s, its inserts
+from 0.53 to 0.48 s, its commit and drop from 0.20 to 0.19 s and its peak RSS from 378 to 342 MiB.
+Seven runs of `ferro-bench` alternating with the build of 2026-11-04 found the same: the bulk insert
+took 661 ns and 3,932 instructions a key against 718 ns and 4,114, and a scan 17.9 ns against 19.1.
+A get ran 1,025 instructions against 1,204 and a table's row get 829 against 988, but a get took
+0.31 µs in both builds, and reads beside the writers came to 73M and 72M a second. The booking
+commits of `tables` moved by less than the spread of their runs: a hold took 86.4 µs against 85.5
+and a confirm 106.5 against 105.4, at the same instructions within 0.3%.
+
 ## Measured and rejected
 
 - Prefetching the child's header, count and flag lines with its hint as an insert steps into it:

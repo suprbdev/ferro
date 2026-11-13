@@ -896,6 +896,14 @@ covered pages, 4% and 5% slower. In `reads` and the main tool the heap per key, 
 a commit writes and the instructions of a bulk load or a commit did not move, and only row reads
 through the finder ran 2 to 3% more instructions.
 
+The table under [Reads from many threads](../guide/performance.md#reads-from-many-threads) was
+measured again with hazards in iterators on 2026-11-05, with other work under one core busy in
+every cell. Against the figures it gave on 2026-11-04, covered lookups at 32 threads read 37.7M a
+second against 15.4M, plain lookups 4.4M against 2.8M, covered pages 9.3M against 3.4M and pages of
+rows 1.5M against 987,000. Measured once more that day with nothing else running, after the fixes
+above, only gets at 32 threads with the 1 GiB cache moved by more than the spread of their rounds,
+from 65.9M to 70.3M a second.
+
 The fenced clear of a slot, described under [The root and the store](#the-root-and-the-store), was
 measured against the build before it with no writer at 1, 8 and 32 threads. Over two alternating
 runs of every workload, five rounds each, every cell ran the instructions it ran before, within the

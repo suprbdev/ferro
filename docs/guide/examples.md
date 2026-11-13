@@ -89,10 +89,11 @@ A customer's bookings page, `customer show` and `Hotels::lines_of`, reads its li
 `#[index(cover(status, venue, room, first, nights, total))]` on the customer index, so it touches no
 booking row. `booking-stress --browsers 4` runs four threads paging the newest 20 bookings of
 random customers beside the writers. With 16 writer threads and the fsync on, medians of three
-interleaved 5 second rounds measured on 2026-11-04, pages went from 2.14 million a second to 5.26
-million, page p50 from 1.7 to 0.7 us and p99 from 4.0 to between 1.1 and 2.1 us. Bytes per write
-rose from 10,900 to 12,400, and writes a second stayed within the spread of the runs, 4,000 to 5,700
-either way. The full check confirms at every 50th version that the covered lines match the rows.
+interleaved 5 second rounds measured on 2026-11-04, the covered index served 5.26 million pages a
+second where reading the rows served 2.14 million, at a page p50 of 0.7 us against 1.7 and a p99 of
+1.1 to 2.1 us against 4.0. A write took 12,400 bytes against 10,900 without the cover, and writes a
+second stayed within the spread of the runs, 4,000 to 5,700 either way. The full check confirms at
+every 50th version that the covered lines match the rows.
 
 A confirm records its own version from the `Stamp`, so a receipt is `at` that version. Audit trails
 and price history come from `history_of`. A what-if reprice or venue closure runs on a fork, which
@@ -111,14 +112,13 @@ cargo run --release -p booking --bin booking-stress -- --threads 64
 
 `booking-stress` races threads for the same rooms and nights while holds lapse, then checks every
 transition between versions and every 50th version in full. With 64 threads, the fsync on, and three
-5 second rounds on 2026-11-03, the median rose from 5,300 writes a second alone to 12,900 with
-`coalesce`. Bytes per write fell from 11.2 KB to 2.6 KB, and hold p99 fell from 13.7 to 6.1 ms. At
-16 threads, where the writer was less busy, the gain was 9%. No round found a violation.
+5 second rounds on 2026-11-03, the median was 12,900 writes a second with `coalesce` against 5,300
+alone, at 2.6 KB a write against 11.2 KB and a hold p99 of 6.1 ms against 13.7. At 16 threads,
+where the writer was less busy, `coalesce` gained 9%. No round found a violation.
 
 Without `coalesce` the limit is CPU, not the fsync. A booking write changes about ten small trees,
 the rows and their indexes, and re-encodes each path under the writer lock. A node on such a path
-now copies the encoded entries it did not change, and outside its closure a hold costs 21% less CPU
-than it did, a confirm 37% less and a cancel 31% less, as [Commits of a few
+copies the encoded entries it did not change, as [Commits of a few
 rows](../internals/commit-cost.md) describes. With `Durability::Buffered` and 64 threads, median of
-three interleaved rounds on 2026-11-03, the writes alone went from 5,100 to 6,100 a second, and with
-`coalesce` from 14,500 to 15,600.
+three interleaved rounds on 2026-11-03, the writes ran 6,100 a second alone and 15,600 with
+`coalesce`.

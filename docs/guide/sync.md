@@ -59,15 +59,12 @@ let pulled = phone.receive_from("laptop", BufReader::new(download), merge)?;
 
 `bundle` and `receive` are the same calls on a byte buffer, and `pull` streams between the two
 files. Cloning a 330 MB file of a million keys took 0.82 s and 17 MiB at peak on 2026-11-05, and a
-pull of three small commits into it 1.3 ms with fsync. The in-memory version that streaming
-replaced took 1.1 GB, and 2.6 s where streaming took 2.3 s in the same runs, with small pulls as
-fast. Staging the bundle in a scratch file, so that commits go on while it arrives, added about a
-seventh to a clone and nothing to its memory, and staging it in the file instead, where it
-lands, took a sixth off a 1 GB receive and wrote it once, as described under [Staging in the log,
-measured](../internals/sync-receive.md#staging-in-the-log-measured). A first pull's bundle is read,
-hashed and encoded on up to four threads besides the caller's, once it carries 4,096 objects:
-cloning a history of 100,000 keys and 2,000 commits, 33.5 MiB, took 404 ms where it took 863, and
-building its bundle 76 ms where it took 365, as described under [A first pull of a
+pull of three small commits into it 1.3 ms with fsync. A large bundle is staged in the file where it
+lands, so commits go on while it arrives and its bytes are written once, as described under
+[Staging in the log, measured](../internals/sync-receive.md#staging-in-the-log-measured). A first
+pull's bundle is read, hashed and encoded on up to four threads besides the caller's, once it
+carries 4,096 objects: cloning a history of 100,000 keys and 2,000 commits, 33.5 MiB, took 404 ms on
+2026-11-12, 76 ms of it building the bundle, as described under [A first pull of a
 history](../internals/sync.md#a-first-pull-of-a-history).
 
 A have lists the commits the pulling file holds, a few hundred bytes. A bundle carries the commits
@@ -175,8 +172,9 @@ a crash interrupts, unless its frames end the log, which the next open drops. A 
 that replaces the file while a bundle arrives makes `receive` copy what arrived into the new file
 before it lands, writing it twice. A large `receive` syncs once before it lands, even under
 `Durability::Buffered`, and a commit beside it under `Durability::Fsync` waits for the bundle's
-writeback in its own sync: 0.68 ms at the median beside a 1 GB receive, against 0.41 when bundles
-were staged in a scratch file. Files that share no commit send everything on their first pull.
+writeback in its own sync: 0.68 ms at the median beside a 1 GB receive on 2026-11-11, as described
+under [Staging in the log, measured](../internals/sync-receive.md#staging-in-the-log-measured).
+Files that share no commit send everything on their first pull.
 
 Peers need the same `Summary` of each map, and the receiving side must declare every index of a
 table that the sending side's tables hold. When a table gains an index, or an index changes kind or
