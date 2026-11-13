@@ -57,16 +57,19 @@ impl<T> Default for List<T> {
 
 impl<T: Data> List<T> {
     /// Creates an empty list.
+    #[must_use]
     pub fn new() -> Self {
         List::default()
     }
 
     /// The number of values, in O(1).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Whether the list has no values.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -88,6 +91,7 @@ impl<T: Data> List<T> {
     }
 
     /// The value at `index`, in O(log n), or `None` past the end.
+    #[must_use]
     pub fn get(&self, index: usize) -> Option<Val<T>> {
         self.0.get(&(index as u64))
     }
@@ -116,11 +120,13 @@ impl<T: Data> List<T> {
     }
 
     /// The first value.
+    #[must_use]
     pub fn first(&self) -> Option<Val<T>> {
         self.get(0)
     }
 
     /// The last value.
+    #[must_use]
     pub fn last(&self) -> Option<Val<T>> {
         self.get(self.len().checked_sub(1)?)
     }

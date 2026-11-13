@@ -1257,11 +1257,13 @@ impl fmt::Debug for Log {
 
 impl Log {
     /// The number of retained commits.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.chain.len()
     }
 
     /// Whether the branch has no commits.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.chain.tip.is_none()
     }
@@ -1285,6 +1287,7 @@ impl Log {
     /// # Panics
     ///
     /// On a read error, as collection reads do. [`Log::try_get`] returns it instead.
+    #[must_use]
     pub fn get(&self, version: u64) -> Option<Arc<Commit>> {
         crate::map::fatal(self.try_get(version))
     }
@@ -1294,6 +1297,7 @@ impl Log {
     /// # Panics
     ///
     /// On a read error, as collection reads do.
+    #[must_use]
     pub fn first(&self) -> Option<(u64, Arc<Commit>)> {
         self.get(self.chain.first)
             .map(|commit| (self.chain.first, commit))
@@ -1304,6 +1308,7 @@ impl Log {
     /// # Panics
     ///
     /// On a read error, as collection reads do.
+    #[must_use]
     pub fn last(&self) -> Option<(u64, Arc<Commit>)> {
         let entry = crate::map::fatal(self.chain.tip_entry(&self.store))?;
         Some((self.chain.last, entry.commit.clone()))
@@ -1319,6 +1324,7 @@ impl Log {
     /// # Panics
     ///
     /// On a read error, as collection reads do.
+    #[must_use]
     pub fn hash_at(&self, version: u64) -> Option<Hash> {
         if self.is_empty() || version < self.chain.first || version > self.chain.last {
             return None;
@@ -1366,6 +1372,7 @@ impl Log {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn values(&self) -> impl DoubleEndedIterator<Item = Arc<Commit>> + ExactSizeIterator {
         self.iter().map(|(_, commit)| commit)
     }

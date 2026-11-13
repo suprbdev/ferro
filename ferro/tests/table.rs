@@ -1209,7 +1209,7 @@ mod failed_loads {
                 let mut after = model.clone();
                 after.retain(|id, _| !(low..low + 30).contains(id));
                 sweep(table, &model, &after, "take_range", |table| {
-                    table.take_range(low..low + 30);
+                    let _ = table.take_range(low..low + 30);
                 });
                 sweep(table, &model, &after, "remove_range", |table| {
                     table.remove_range(low..low + 30);
@@ -1487,7 +1487,7 @@ mod failed_loads {
                 table.retain(|shelf| shelf.kind.0 != 2)
             });
             *table = swept(table, "take_range", |table| {
-                table.take_range(Brittle(40)..Brittle(46));
+                let _ = table.take_range(Brittle(40)..Brittle(46));
             });
             *table = swept(table, "remove_range", |table| {
                 table.remove_range(Brittle(46)..Brittle(50));

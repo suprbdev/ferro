@@ -109,11 +109,13 @@ pub struct Reclaim {
 impl Reclaim {
     /// Runs a cycle once the file has grown by `bytes` since the last one, or by its size after
     /// the last one if that is larger. Zero turns background cycles off.
+    #[must_use]
     pub const fn every(bytes: u64) -> Self {
         Reclaim { every_bytes: bytes }
     }
 
     /// Runs no background cycles, so that only [`Db::compact`](crate::Db::compact) reclaims.
+    #[must_use]
     pub const fn off() -> Self {
         Reclaim::every(0)
     }

@@ -160,6 +160,7 @@ impl Commit {
     /// [`Options::coalesce`] made of several yields each closure's non-empty message, whole even if
     /// it holds newlines of its own. A commit whose log entry does not record how its message was
     /// joined yields the message's non-empty lines.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn messages(&self) -> impl Iterator<Item = &str> {
         let messages: Vec<&str> = match &self.parts {
             Parts::Lines => self
@@ -242,6 +243,7 @@ impl Stamp<'_> {
     /// [`Db::at`] of it later shows the state the closure wrote. With [`Options::coalesce`] it is
     /// the group's version, the same for every closure in the group, so that state includes the
     /// closures that ran after this one.
+    #[must_use]
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -258,6 +260,7 @@ impl Stamp<'_> {
     ///
     /// With [`Options::coalesce`] the first closure of a group to call it fixes the group's time,
     /// and if that closure fails, the next one to call it fixes it again.
+    #[must_use]
     pub fn time_ms(&self) -> u64 {
         *self
             .time
@@ -682,11 +685,13 @@ impl<T> fmt::Debug for Snapshot<T> {
 
 impl<T> Snapshot<T> {
     /// The version this snapshot shows, 0 for the value before the first commit.
+    #[must_use]
     pub fn version(&self) -> u64 {
         self.commit.version
     }
 
     /// The commit this snapshot shows.
+    #[must_use]
     pub fn commit(&self) -> &Commit {
         &self.commit
     }
@@ -4348,6 +4353,7 @@ impl<T: Data> Db<T> {
     }
 
     /// The path the database was opened with, as given.
+    #[must_use]
     pub fn path(&self) -> PathBuf {
         self.shared.path.clone()
     }
@@ -4357,6 +4363,7 @@ impl<T: Data> Db<T> {
     /// The file itself can be up to 4 MiB longer, by zeroes a writer preallocated past the log,
     /// and longer still by the staging frames of a large receive past the newest commit, as
     /// [`Space::file_bytes`] from [`Db::space`], its length, describes.
+    #[must_use]
     pub fn log_bytes(&self) -> u64 {
         self.shared.store().size()
     }
@@ -4451,6 +4458,7 @@ impl<T: Data> Db<T> {
     }
 
     /// The name of the branch this handle reads and writes.
+    #[must_use]
     pub fn branch_name(&self) -> &str {
         &self.branch.name
     }
@@ -4465,6 +4473,7 @@ impl<T: Data> Db<T> {
     }
 
     /// The version [`Db::read`] would show, 0 before the first commit.
+    #[must_use]
     pub fn version(&self) -> u64 {
         self.branch.state.load().snapshot.commit.version
     }
@@ -4497,11 +4506,13 @@ impl<T: Data> Db<T> {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn head_hash(&self) -> Option<Hash> {
         self.branch.state.load().log.tip.map(|ptr| ptr.hash)
     }
 
     /// The log of this branch's retained commits, as of its newest published version.
+    #[must_use]
     pub fn log(&self) -> Log {
         let state = self.branch.state.load();
         Log {
@@ -6017,6 +6028,7 @@ impl<T: Data> Db<T> {
     }
 
     /// The names of every branch in the file, sorted, `main` included.
+    #[must_use]
     pub fn branches(&self) -> Vec<String> {
         let refs = self.shared.published.lock();
         let mut names: Vec<String> = refs.table.keys().collect();
@@ -6195,6 +6207,7 @@ impl<T: Data> Db<T> {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn following(&self) -> Option<Following> {
         self.keeper.follower.as_ref().map(Follower::status)
     }

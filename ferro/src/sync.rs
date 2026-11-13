@@ -120,6 +120,7 @@ pub struct Have(Vec<u8>);
 
 impl Have {
     /// The have's bytes, to send to the other file.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -149,6 +150,7 @@ pub struct Bundle(Vec<u8>);
 
 impl Bundle {
     /// The bundle's bytes, to send to the receiving file.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }

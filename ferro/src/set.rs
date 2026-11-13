@@ -72,6 +72,7 @@ impl<T> Default for Set<T> {
 
 impl<T: Data + Ord> Set<T> {
     /// Creates an empty set.
+    #[must_use]
     pub fn new() -> Self {
         Set::default()
     }
@@ -82,11 +83,13 @@ impl<T: Data + Ord> Set<T> {
     }
 
     /// The number of values, in O(1).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Whether the set has no values.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -115,6 +118,7 @@ impl<T: Data + Ord> Set<T> {
     }
 
     /// Whether the set holds `value`, in O(log n).
+    #[must_use]
     pub fn contains<Q>(&self, value: &Q) -> bool
     where
         T: Borrow<Q>,
@@ -128,6 +132,7 @@ impl<T: Data + Ord> Set<T> {
     /// One cursor answers them all, so items in ascending order cost the distance between them
     /// rather than a search from the root each. Items out of order still get the right answer, at
     /// the cost of a fresh search.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn contains_many<I>(&self, items: I) -> impl Iterator<Item = (I::Item, bool)> + use<I, T>
     where
         I: IntoIterator,
@@ -139,6 +144,7 @@ impl<T: Data + Ord> Set<T> {
     /// A [`Cursor`] over the values, whose seeks cost the distance moved.
     ///
     /// The cursor starts with no position: [`Cursor::seek`] or [`Cursor::rewind`] gives it one.
+    #[must_use]
     pub fn cursor(&self) -> Cursor<T> {
         Cursor(self.0.cursor())
     }
@@ -173,11 +179,13 @@ impl<T: Data + Ord> Set<T> {
     }
 
     /// The smallest value.
+    #[must_use]
     pub fn first(&self) -> Option<T> {
         self.0.first().map(|(key, _)| key)
     }
 
     /// The largest value.
+    #[must_use]
     pub fn last(&self) -> Option<T> {
         self.0.last().map(|(key, _)| key)
     }
@@ -207,6 +215,7 @@ impl<T: Data + Ord> Set<T> {
     /// Removes the values that lie in `range` and returns them as a set of their own.
     ///
     /// The cut touches O(log n) nodes however many values move.
+    #[must_use = "use `remove_range` if the removed entries are not needed"]
     pub fn take_range<Q, R>(&mut self, range: R) -> Set<T>
     where
         T: Borrow<Q>,
@@ -231,6 +240,7 @@ impl<T: Data + Ord> Set<T> {
     /// Splits the set at `value`: returns the values from `value` up and keeps the rest.
     ///
     /// Touches O(log n) nodes however many values move.
+    #[must_use = "use `remove_range` if the entries split off are not needed"]
     pub fn split_off<Q>(&mut self, value: &Q) -> Set<T>
     where
         T: Borrow<Q>,
@@ -498,6 +508,7 @@ impl<T: Data + Ord> Cursor<T> {
     }
 
     /// The value at the cursor, or `None` if it has no position.
+    #[must_use]
     pub fn value(&self) -> Option<&T> {
         self.0.key()
     }
@@ -517,6 +528,7 @@ pub enum Change<T> {
 
 impl<T> Change<T> {
     /// The value that was added or removed.
+    #[must_use]
     pub fn value(&self) -> &T {
         match self {
             Change::Added(value) | Change::Removed(value) => value,

@@ -260,6 +260,7 @@ pub trait Summary<K, V>: Data {
     fn of(key: &K, value: &V) -> Self;
     /// The summary of a run of entries made of the run `self` summarizes followed by the run
     /// `other` summarizes.
+    #[must_use]
     fn combine(&self, other: &Self) -> Self;
 }
 
@@ -367,6 +368,7 @@ impl<V: Clone> Val<V> {
     }
 
     /// Wraps `value`, for code that hands out values the way a map does.
+    #[must_use]
     pub fn new(value: V) -> Self {
         if by_copy::<V>() {
             Val(Held::Copied(ManuallyDrop::new(value)))
@@ -379,6 +381,7 @@ impl<V: Clone> Val<V> {
     ///
     /// A value held by copy is moved out, one shared with a column is cloned, and one in an
     /// [`Arc`] is moved out when this was its last handle and cloned otherwise.
+    #[must_use]
     pub fn into_owned(self) -> V {
         match self.0 {
             Held::Copied(value) => ManuallyDrop::into_inner(value),
@@ -388,6 +391,7 @@ impl<V: Clone> Val<V> {
     }
 
     /// The value in an [`Arc`], without a copy when it is already held in one.
+    #[must_use]
     pub fn into_arc(self) -> Arc<V> {
         match self.0 {
             Held::Single(value) => value,
@@ -4073,6 +4077,7 @@ impl<K, V> Map<K, V> {
     ///
     /// A map with a [`Summary`] starts from [`Map::default`] instead, since a default type
     /// parameter takes no part in inference.
+    #[must_use]
     pub fn new() -> Self {
         Map::default()
     }
@@ -4080,11 +4085,13 @@ impl<K, V> Map<K, V> {
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// The number of entries, in O(1).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.root.count() as usize
     }
 
     /// Whether the map has no entries.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.root.count() == 0
     }
@@ -4096,6 +4103,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// removing an absent key, leaves it clean, and so does a batch of such edits, which for a
     /// zero-sized `V`, as in a [`Set`](crate::Set), includes storing under a key the map holds. A
     /// commit writes the nodes a dirty map changed, and the version it commits reads back clean.
+    #[must_use]
     pub fn is_dirty(&self) -> bool {
         matches!(self.root, Link::Mem(..))
     }
@@ -4179,6 +4187,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ///
     /// Panics if a node or value on the way cannot be read, where [`try_get`](Map::try_get)
     /// returns the error.
+    #[must_use]
     pub fn get<Q>(&self, key: &Q) -> Option<Val<V>>
     where
         K: Borrow<Q>,
@@ -4193,6 +4202,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// A value stored as an object of its own is not read: its hash is the one its node links to
     /// it by. A value inside its node is encoded to hash it. The hash suits an HTTP `ETag` for one
     /// entry.
+    #[must_use]
     pub fn value_hash<Q>(&self, key: &Q) -> Option<Hash>
     where
         K: Borrow<Q>,
@@ -4212,6 +4222,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     }
 
     /// Whether the map holds `key`, in O(log n). No value is read.
+    #[must_use]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -4412,11 +4423,13 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     }
 
     /// The entry with the smallest key, in O(log n).
+    #[must_use]
     pub fn first(&self) -> Option<(K, Val<V>)> {
         self.iter().next()
     }
 
     /// The entry with the largest key, in O(log n).
+    #[must_use]
     pub fn last(&self) -> Option<(K, Val<V>)> {
         self.iter().next_back()
     }
@@ -4439,6 +4452,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ///
     /// Every link records how many entries lie below it, so the walk skips whole subtrees rather
     /// than counting through them. `None` if `index` is not below [`len`](Map::len).
+    #[must_use]
     pub fn nth(&self, index: usize) -> Option<(K, Val<V>)> {
         let mut remaining = index as u64;
         let found = self.walk(|node| {
@@ -4608,6 +4622,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// A [`Cursor`] over the map as it is now, whose seeks cost the distance they move.
     ///
     /// The cursor starts with no position: [`Cursor::seek`] or [`Cursor::rewind`] gives it one.
+    #[must_use]
     pub fn cursor(&self) -> Cursor<K, V, S> {
         let hazards = Hazards::new();
         Cursor {
@@ -4620,6 +4635,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     }
 
     /// The entry with the largest key at or before `key`, in one walk of O(log n).
+    #[must_use]
     pub fn floor<Q>(&self, key: &Q) -> Option<(K, Val<V>)>
     where
         K: Borrow<Q>,
@@ -4682,6 +4698,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ///     .collect();
     /// assert_eq!(found, [(3, Some(6)), (500, Some(1000)), (2000, None)]);
     /// ```
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn get_many<I>(
         &self,
         keys: I,
@@ -4699,6 +4716,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 
     /// Pairs each of `keys` with whether the map holds it, looking them all up through one
     /// [`Cursor`], as [`get_many`](Map::get_many) does, without reading any value.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
     pub fn contains_many<I>(
         &self,
         keys: I,
@@ -4872,6 +4890,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     ///
     /// A committed map keeps it on its root link, so it costs O(1). Nodes changed since the last
     /// commit are folded again on each call.
+    #[must_use]
     pub fn summary(&self) -> Option<S> {
         self.root.summary()
     }
@@ -4882,6 +4901,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// The predicates are those of [`range_by`](Map::range_by). The fold combines the stored
     /// summaries of the subtrees between the two ends with the entries along the two paths, so it
     /// reads no node inside the range. Nodes changed since the last commit are folded on demand.
+    #[must_use]
     pub fn summary_by(&self, below: impl Fn(&K) -> bool, within: impl Fn(&K) -> bool) -> Option<S> {
         let guard = epoch::pin();
         let store = self.store();
@@ -4900,6 +4920,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// are none.
     ///
     /// See [`Summary`] for an example.
+    #[must_use]
     pub fn range_summary<Q, R>(&self, range: R) -> Option<S>
     where
         K: Borrow<Q>,
@@ -4926,6 +4947,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
 
     /// The [`Summary`] of the entries whose key starts with `head`, in O(log n), or `None` if there
     /// are none.
+    #[must_use]
     pub fn prefix_summary<Q>(&self, head: &Q) -> Option<S>
     where
         K: KeyPrefix<Q>,
@@ -4957,6 +4979,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// assert!(middle.is_empty());
     /// assert_eq!(map.keys().collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6, 7]);
     /// ```
+    #[must_use = "use `remove_range` if the removed entries are not needed"]
     pub fn take_range<Q, R>(&mut self, range: R) -> Map<K, V, S>
     where
         K: Borrow<Q>,
@@ -5004,6 +5027,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// Splits the map at `key`: returns the entries from `key` up and keeps the rest.
     ///
     /// Touches O(log n) nodes however many entries move.
+    #[must_use = "use `remove_range` if the entries split off are not needed"]
     pub fn split_off<Q>(&mut self, key: &Q) -> Map<K, V, S>
     where
         K: Borrow<Q>,
@@ -5357,6 +5381,7 @@ impl<K: Data + Ord, V: Data, S: Summary<K, V>> Map<K, V, S> {
     /// # Panics
     ///
     /// Panics if a node changed since the last commit fails to encode.
+    #[must_use]
     pub fn root_hash(&self) -> Option<Hash> {
         match &self.root {
             Link::Empty => None,
@@ -6127,12 +6152,14 @@ impl<K: Data + Ord, V: Data, S: Data> Cursor<K, V, S> {
     }
 
     /// The key at the cursor, or `None` if it has no position.
+    #[must_use]
     pub fn key(&self) -> Option<&K> {
         let index = self.index?;
         self.path.last().map(|frame| &frame.node.keys[index])
     }
 
     /// The value at the cursor, or `None` if it has no position.
+    #[must_use]
     pub fn value(&self) -> Option<Val<V>> {
         let index = self.index?;
         self.path
@@ -6941,6 +6968,7 @@ pub enum Change<K, V> {
 
 impl<K, V> Change<K, V> {
     /// The key that changed.
+    #[must_use]
     pub fn key(&self) -> &K {
         match self {
             Change::Added(key, _) | Change::Removed(key, _) | Change::Changed(key, _, _) => key,
@@ -6948,6 +6976,7 @@ impl<K, V> Change<K, V> {
     }
 
     /// The value in the older map, or `None` for a key it lacked.
+    #[must_use]
     pub fn before(&self) -> Option<&Val<V>> {
         match self {
             Change::Added(..) => None,
@@ -6956,6 +6985,7 @@ impl<K, V> Change<K, V> {
     }
 
     /// The value in the newer map, or `None` for a key it lacks.
+    #[must_use]
     pub fn after(&self) -> Option<&Val<V>> {
         match self {
             Change::Removed(..) => None,
@@ -7010,11 +7040,13 @@ pub struct Conflict<K, V> {
 
 impl<K, V: Clone> Conflict<K, V> {
     /// Resolves the conflict by keeping our side, removing the key if ours lacks it.
+    #[must_use]
     pub fn keep_ours(self) -> Option<V> {
         self.ours.map(Val::into_owned)
     }
 
     /// Resolves the conflict by taking their side, removing the key if theirs lacks it.
+    #[must_use]
     pub fn keep_theirs(self) -> Option<V> {
         self.theirs.map(Val::into_owned)
     }

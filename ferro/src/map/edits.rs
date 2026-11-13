@@ -78,6 +78,7 @@ impl<K, V, S> Default for Edits<K, V, S> {
 
 impl<K: Data + Ord, V: Data, S: Summary<K, V>> Edits<K, V, S> {
     /// No edits.
+    #[must_use]
     pub fn new() -> Self {
         Edits::default()
     }

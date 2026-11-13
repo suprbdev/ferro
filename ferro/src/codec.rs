@@ -473,6 +473,7 @@ fn leading_of<const N: usize>(platform: &Platform, bytes: &[u8], stride: usize, 
 impl Object {
     /// The object's [`Hash`](type@Hash): BLAKE3 over the body length, the link count, the body
     /// and the hashes of the links, cut to [`HASH_BYTES`]. The links' offsets take no part.
+    #[must_use]
     pub fn hash(&self) -> Hash {
         hash_parts(&self.body, self.links.iter().map(|link| &link.hash))
     }
@@ -856,6 +857,7 @@ pub trait Data: Clone + Send + Sync + 'static {
     /// An index holds this value for the rows that lack the field, so it must be rebuilt when the
     /// value changes. The default [`describe`](Data::describe) describes it; an impl that
     /// overrides both must describe it too.
+    #[must_use]
     fn missing() -> Option<Self> {
         None
     }
@@ -989,6 +991,7 @@ const FINGERPRINT_CONTEXT: &str = "ferro 2026-11-04 index fingerprint";
 
 impl Description {
     /// Creates an empty description.
+    #[must_use]
     pub fn new() -> Self {
         Description::default()
     }
@@ -1040,6 +1043,7 @@ impl Description {
     }
 
     /// The description as written so far.
+    #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -1047,6 +1051,7 @@ impl Description {
     /// A 64-bit fingerprint of the description: the first eight bytes of a BLAKE3 hash in key
     /// derivation mode, under a context string kept for index fingerprints, read as a
     /// little-endian integer.
+    #[must_use]
     pub fn fingerprint(&self) -> u64 {
         let mut hasher = blake3::Hasher::new_derive_key(FINGERPRINT_CONTEXT);
         hasher.update(&self.bytes);
@@ -1121,6 +1126,7 @@ fn encodings_match<D: Data>(a: &D, b: &D) -> bool {
 
 /// The 16-bit tag that [`#[derive(Data)]`](derive@crate::Data) stores a field or an enum variant
 /// under: an FNV-1a hash of its stored name, folded to 16 bits.
+#[must_use]
 pub const fn field_tag(name: &str) -> u16 {
     let bytes = name.as_bytes();
     let mut hash: u32 = 0x811c9dc5;
@@ -1192,6 +1198,7 @@ fn varint_into(out: &mut [u8], mut value: u64) -> usize {
 
 impl<'a> Encoder<'a> {
     /// Creates an encoder of an empty object, which hands what it finishes to `sink`.
+    #[must_use]
     pub fn new(sink: &'a mut dyn Sink) -> Self {
         Encoder {
             buf: Vec::new(),
@@ -1204,6 +1211,7 @@ impl<'a> Encoder<'a> {
     }
 
     /// Creates an encoder with room for `bytes` bytes and `links` links before it reallocates.
+    #[must_use]
     pub fn with_capacity(sink: &'a mut dyn Sink, bytes: usize, links: usize) -> Self {
         Encoder {
             buf: Vec::with_capacity(bytes),
@@ -1306,22 +1314,26 @@ impl<'a> Encoder<'a> {
     }
 
     /// The bytes written so far.
+    #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.buf
     }
 
     /// The links written so far.
+    #[must_use]
     pub fn links(&self) -> &[Ptr] {
         &self.links
     }
 
     /// The current position, as counts of bytes and links written, for
     /// [`since`](Encoder::since) and [`rewind`](Encoder::rewind).
+    #[must_use]
     pub fn mark(&self) -> (usize, usize) {
         (self.buf.len(), self.links.len())
     }
 
     /// How many bytes were written since `mark`.
+    #[must_use]
     pub fn since(&self, mark: (usize, usize)) -> usize {
         self.buf.len() - mark.0
     }
@@ -1489,6 +1501,7 @@ impl<'a> Encoder<'a> {
     }
 
     /// The object written, without hashing it or handing it to the sink.
+    #[must_use]
     pub fn into_object(self) -> Object {
         Object {
             body: self.buf,
@@ -2699,6 +2712,7 @@ impl<'a> Decoder<'a> {
     ///
     /// The decoder reads from memory, with no file behind it, so a collection decoded from the
     /// object fails with [`Error::Detached`] once it needs one of its nodes.
+    #[must_use]
     pub fn new(buf: &'a [u8], links: &'a [Ptr]) -> Self {
         Decoder::with_store(buf, links, None)
     }
@@ -2707,6 +2721,7 @@ impl<'a> Decoder<'a> {
     /// tests that decode what they read from a store of their own.
     #[cfg(feature = "testing")]
     #[doc(hidden)]
+    #[must_use]
     pub fn in_store(buf: &'a [u8], links: &'a [Ptr], store: &'a Store) -> Self {
         Decoder::with_store(buf, links, Some(store))
     }
@@ -2974,6 +2989,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// The number of body bytes not yet read.
+    #[must_use]
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
@@ -3863,6 +3879,7 @@ pub struct Bytes(Arc<[u8]>);
 
 impl Bytes {
     /// Creates an empty buffer.
+    #[must_use]
     pub fn new() -> Self {
         Bytes::default()
     }

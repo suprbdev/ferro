@@ -1224,7 +1224,7 @@ fn a_chain_of_nodes_at_one_level_is_rejected_before_it_overflows_the_stack() {
         .spawn(move || {
             fails_as_corrupt(|| map.for_each(|_, _| {}));
             fails_as_corrupt(|| {
-                map.range_summary(1..DEPTH - 1);
+                let _ = map.range_summary(1..DEPTH - 1);
             });
         })
         .unwrap()

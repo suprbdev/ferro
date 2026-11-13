@@ -526,6 +526,7 @@ impl<const N: usize> Fingerprints<N> {
     /// # Panics
     ///
     /// Panics, naming `table`, if two indexes have the same fingerprint.
+    #[must_use]
     pub fn new(table: &str, values: [u64; N]) -> Self {
         let mut order: [usize; N] = std::array::from_fn(|slot| slot);
         order.sort_unstable_by_key(|slot| values[*slot]);
@@ -543,12 +544,14 @@ impl<const N: usize> Fingerprints<N> {
     /// # Panics
     ///
     /// Panics if `slot` is not below `N`.
+    #[must_use]
     pub fn get(&self, slot: usize) -> u64 {
         self.values[slot]
     }
 
     /// The slots in ascending order of fingerprint, which is the order a table encodes its
     /// indexes in.
+    #[must_use]
     pub fn order(&self) -> &[usize; N] {
         &self.order
     }

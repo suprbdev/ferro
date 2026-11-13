@@ -775,6 +775,7 @@ impl<T> Watcher<T> {
     }
 
     /// A [`Closer`] that ends this watcher and its clones.
+    #[must_use]
     pub fn closer(&self) -> Closer<T> {
         Closer {
             feed: self.feed.clone(),
@@ -787,6 +788,7 @@ impl<T> Watcher<T> {
     ///
     /// That is the snapshot it handed out last, or the one current when it was made, so a
     /// consumer that starts from it misses nothing that lands meanwhile.
+    #[must_use]
     pub fn seen(&self) -> Option<Snapshot<T>> {
         self.gate.seen.lock().as_ref().map(|(_, seen)| seen.clone())
     }

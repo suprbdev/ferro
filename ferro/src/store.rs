@@ -1722,6 +1722,7 @@ fn append_link(buf: &mut Vec<u8>, offset: u64, link: &Ptr) {
 
 /// The length in bytes of the record that `object` would take at `offset` in the log.
 #[cfg(feature = "testing")]
+#[must_use]
 pub fn record_len(offset: u64, object: &Object) -> usize {
     let mut buf = Vec::new();
     append_record(&mut buf, offset, &object.body, &object.links);
@@ -3474,17 +3475,20 @@ impl Store {
 
     /// The store's id, which no other store this process opens shares, so that a collection can
     /// tell whether it was read from this store.
+    #[must_use]
     pub fn id(&self) -> u64 {
         self.inner.id
     }
 
     /// The database's path, as the store was opened by, or made canonical for a shared writer.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
 
     /// The end of the log as of the last published frame, in bytes, which leaves out any zeroes
     /// preallocated past it.
+    #[must_use]
     pub fn size(&self) -> u64 {
         self.inner.tail.load(Ordering::Acquire)
     }
@@ -3496,6 +3500,7 @@ impl Store {
     }
 
     /// Whether the store was opened read-only.
+    #[must_use]
     pub fn is_read_only(&self) -> bool {
         self.inner.options.read_only
     }

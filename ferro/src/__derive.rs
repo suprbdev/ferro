@@ -58,6 +58,7 @@ pub fn visit_field<T: Data>(r: &mut Decoder<'_>) -> Result<()> {
 /// Whether a table that `r` decodes rebuilds the indexes it does not store, as [`Data::decode`]
 /// does unless the decoder belongs to the check that a table's indexes agree with its rows.
 #[inline]
+#[must_use]
 pub fn rebuilds(r: &Decoder<'_>) -> bool {
     r.rebuilds()
 }

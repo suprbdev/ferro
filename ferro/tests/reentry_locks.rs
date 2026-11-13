@@ -205,7 +205,7 @@ fn fill(db: &Db<Probed>) {
     for version in 1..=SMALL {
         drop(db.at(version).unwrap());
     }
-    db.branches();
+    let _ = db.branches();
 }
 
 struct Files {
@@ -270,13 +270,13 @@ fn inner(
 ) -> ferro::Result<()> {
     match inner {
         Inner::Branches => {
-            on.branches();
+            let _ = on.branches();
             Ok(())
         }
         Inner::Verify => on.verify().map(drop),
         Inner::Have => on.have().map(drop),
         Inner::Read => {
-            on.read().rows.get(&0);
+            let _ = on.read().rows.get(&0);
             for version in [1, 2, 3, 50, 100, 150, 199, 200] {
                 drop(on.at(version)?);
             }

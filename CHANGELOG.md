@@ -40,6 +40,11 @@ says so under **Format**, and a build refuses a file of another format with `Err
   `each_values`, the lookup helpers such as `index_eq` and `unique_some`, and the rest, and so are
   `Decoder::rebuilds` and `Decoder::fields_sharing_tags`. A hand-written `Data` impl that overrides
   `tables` or `pair` imports `Tabled` and `Pairing` from `ferro::__derive`.
+- Pure getters and constructors are `#[must_use]`, as in std: `len`, `is_empty`, `get`, `first`,
+  `last`, `contains_key`, `root_hash`, the summaries and cursors of the collections, `version`,
+  `commit`, `head_hash`, `log` and `branches` of `Db` and `Snapshot`, the `new` constructors, and
+  the rest. `take_range` and `split_off` are too, and point to `remove_range` for a caller that
+  drops what they return. Discarding one of these results is now a warning.
 
 ## [0.1.0] - 2026-11-13
 

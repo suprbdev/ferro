@@ -304,6 +304,7 @@ pub trait TableData<T: Record>: Data + Default {
     /// Whether working out the entries a row gives reads the file, as an `each` index over a
     /// [`Set`](crate::Set) does. The default, for a table without such an index, is `false`.
     #[doc(hidden)]
+    #[must_use]
     fn indexing_reads() -> bool {
         false
     }
@@ -544,12 +545,14 @@ impl<T: Record> Deref for Table<T> {
 
 impl<T: Record> Table<T> {
     /// Creates an empty table.
+    #[must_use]
     pub fn new() -> Self {
         Table::default()
     }
 
     /// The rows as a [`Map`] from key to row, for `(key, row)` pairs, cursors, folds, diffs and
     /// the other reads a map has.
+    #[must_use]
     pub fn rows(&self) -> &Map<T::Key, T> {
         self.0.rows()
     }
@@ -559,21 +562,25 @@ impl<T: Record> Table<T> {
     /// Two tables with the same rows have the same root hash, whatever order the rows went in,
     /// so it can serve as an HTTP `ETag` for the whole table. The indexes are left out, since
     /// they follow from the rows.
+    #[must_use]
     pub fn root_hash(&self) -> Option<Hash> {
         self.0.rows().root_hash()
     }
 
     /// The number of rows, in O(1).
+    #[must_use]
     pub fn len(&self) -> usize {
         self.0.rows().len()
     }
 
     /// Whether the table has no rows.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.rows().is_empty()
     }
 
     /// The row with primary key `key`, in O(log n).
+    #[must_use]
     pub fn get<Q>(&self, key: &Q) -> Option<Val<T>>
     where
         T::Key: Borrow<Q>,
@@ -583,6 +590,7 @@ impl<T: Record> Table<T> {
     }
 
     /// Whether a row has primary key `key`, in O(log n).
+    #[must_use]
     pub fn contains<Q>(&self, key: &Q) -> bool
     where
         T::Key: Borrow<Q>,
@@ -663,11 +671,13 @@ impl<T: Record> Table<T> {
     }
 
     /// The row with the smallest key.
+    #[must_use]
     pub fn first(&self) -> Option<Val<T>> {
         self.0.rows().first().map(|(_, row)| row)
     }
 
     /// The row with the largest key.
+    #[must_use]
     pub fn last(&self) -> Option<Val<T>> {
         self.0.rows().last().map(|(_, row)| row)
     }
@@ -984,6 +994,7 @@ impl<T: Record> Table<T> {
     /// assert_eq!(events.remove_range(4..), 2);
     /// assert_eq!(events.keys().collect::<Vec<_>>(), [3]);
     /// ```
+    #[must_use = "use `remove_range` if the removed entries are not needed"]
     pub fn take_range<Q, R>(&mut self, range: R) -> Table<T>
     where
         T::Key: Borrow<Q>,
@@ -2734,6 +2745,7 @@ impl<T: Record, C> Matches<T, C> {
     /// );
     /// assert_eq!(late.keys().collect::<Vec<_>>(), [100, 200, 400]);
     /// ```
+    #[must_use]
     pub fn explain(&self) -> Explain {
         self.stream.explain(Role::Walked, false)
     }

@@ -75,6 +75,7 @@
 
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations)]
+#![warn(clippy::must_use_candidate, clippy::return_self_not_must_use)]
 
 extern crate self as ferro;
 

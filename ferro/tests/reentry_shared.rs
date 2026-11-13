@@ -252,7 +252,7 @@ fn inner(on: &Handles, inner: Inner) -> ferro::Result<()> {
         Inner::Fork => on.main.fork("inner").map(drop),
         Inner::DropBranch => on.main.drop_branch("victim"),
         Inner::Read => {
-            on.main.read().rows.get(&0);
+            let _ = on.main.read().rows.get(&0);
             Ok(())
         }
     }
