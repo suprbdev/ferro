@@ -117,8 +117,8 @@ fn load_refs(store: &Store, head: Option<Ptr>) -> Result<Refs> {
 ///
 /// # Errors
 ///
-/// [`Error::NoDatabase`] if there is no file, [`Error::NotFerro`] if it is not a database, and
-/// read errors such as [`Error::Corrupt`].
+/// [`Error::NoDatabase`] if there is no file, [`Error::NotFerro`] if it is not a database,
+/// [`Error::Format`] if it is one of another format, and read errors such as [`Error::Corrupt`].
 ///
 /// # Examples
 ///
@@ -859,7 +859,8 @@ fn pruned(store: &Store, refs: &Refs, keep: Keep) -> Result<(Refs, u64)> {
 /// [`Error::Locked`] while a writer has the file open, [`Error::NotFerro`] if the file is not a
 /// database, which includes an empty file and one of only zeroes, as for [`info`], since a
 /// compaction does not make a database of one as a writable [`Db::open`](crate::Db::open) does,
-/// and [`Error::Corrupt`] or [`Error::Io`] if the file cannot be read or the copy written. A copy
+/// [`Error::Format`] if it is a database of another format, and [`Error::Corrupt`] or
+/// [`Error::Io`] if the file cannot be read or the copy written. A copy
 /// that fails is removed, and the file is left as it was.
 ///
 /// # Examples

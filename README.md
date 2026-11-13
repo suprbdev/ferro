@@ -6,7 +6,8 @@ There is no query language, no schema file and no mapping layer. You define a st
 it in one file, and you read it with ordinary Rust. Every commit creates a new immutable version of
 that value, and earlier versions stay readable.
 
-ferro is an experiment, not a production database. Its file format is not stable.
+ferro is an experiment, not a production database. Its file format may change between minor
+releases, though never in a patch release, as [Limitations](docs/guide/limitations.md) describes.
 
 ## Key features
 
@@ -58,8 +59,8 @@ explained or undone from the history, and corruption surfaces as an error rather
 
 ## Not a good fit (yet)
 
-- **Data you cannot afford to lose.** It is an experiment, and the file format may change without
-  migration. Power loss was modelled, never tested on real hardware.
+- **Data you cannot afford to lose.** It is an experiment, and the file format may change in a
+  minor release without migration. Power loss was modelled, never tested on real hardware.
 - **Many tiny independent writes.** A single-key commit writes about 3.5 KB at 1M keys, and each
   branch runs one closure at a time. Batch related changes, or use `coalesce`.
 - **Many processes on one branch without fsync.** With `Options::shared` several processes commit to

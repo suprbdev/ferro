@@ -816,7 +816,7 @@ fn foreign_files_are_rejected_and_left_alone() {
 }
 
 #[test]
-fn a_file_of_an_earlier_format_is_not_ferro_and_left_alone() {
+fn a_file_of_another_format_names_it_and_is_left_alone() {
     let built = build(3, 3);
     let path = built.target();
     let sealed = |magic: &[u8; MAGIC]| {
@@ -828,18 +828,46 @@ fn a_file_of_an_earlier_format_is_not_ferro_and_left_alone() {
         }
         image
     };
+    assert_eq!(ferro::FILE_FORMAT, 7);
     fs::write(&path, sealed(b"FERRODB7")).unwrap();
     fast().open::<Root>(&path).unwrap().verify().unwrap();
-    for magic in [b"FERRODB5", b"FERRODB6"] {
-        let old = sealed(magic);
-        fs::write(&path, &old).unwrap();
-        for options in [fast(), fast().read_only(true)] {
-            let opened = options.open::<Root>(&path).map(|_| ());
-            assert!(matches!(opened, Err(Error::NotFerro(_))), "{opened:?}");
+    for (magic, format) in [(b"FERRODB5", 5), (b"FERRODB6", 6), (b"FERRODB8", 8)] {
+        let other = sealed(magic);
+        fs::write(&path, &other).unwrap();
+        let named = |result: Result<(), Error>, call: &str| match result {
+            Err(Error::Format { path: named, found }) => {
+                assert_eq!((named.as_str(), found), (path.to_str().unwrap(), format));
+                let message = Error::Format { path: named, found }.to_string();
+                assert!(
+                    message.ends_with(&format!("format {format}, and this build reads format 7")),
+                    "{message}"
+                );
+            }
+            other => panic!("format {format}, {call}: {other:?}"),
+        };
+        for (options, call) in [(fast(), "writable"), (fast().read_only(true), "read-only")] {
+            named(options.open::<Root>(&path).map(drop), call);
         }
-        let verified = admin::verify(&path).map(|_| ());
-        assert!(matches!(verified, Err(Error::NotFerro(_))), "{verified:?}");
-        assert_eq!(fs::read(&path).unwrap(), old);
+        named(admin::verify(&path).map(drop), "verify");
+        named(admin::info(&path).map(drop), "info");
+        named(admin::compact(&path, Keep::All).map(drop), "compact");
+        assert_eq!(fs::read(&path).unwrap(), other);
+    }
+    let mut lone = sealed(b"FERRODB6");
+    lone[..MAGIC].copy_from_slice(b"FERRODBX");
+    fs::write(&path, &lone).unwrap();
+    match fast().read_only(true).open::<Root>(&path).map(drop) {
+        Err(Error::Format { found: 6, .. }) => {}
+        other => panic!("one slot of format 6: {other:?}"),
+    }
+    let mut unchecked = sealed(b"FERRODB6");
+    for slot in [0, SLOT] {
+        unchecked[slot + SUPER - 1] ^= 1;
+    }
+    fs::write(&path, &unchecked).unwrap();
+    match fast().read_only(true).open::<Root>(&path).map(drop) {
+        Err(Error::NotFerro(_)) => {}
+        other => panic!("format 6 failing its checks: {other:?}"),
     }
 }
 

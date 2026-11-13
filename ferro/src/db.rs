@@ -1826,8 +1826,9 @@ impl Options {
     ///
     /// - [`Error::Locked`] if another writer has the file open and does not close it within
     ///   [`Options::lock_wait`].
-    /// - [`Error::NoDatabase`] for a read-only open of a missing file, and [`Error::NotFerro`] for
-    ///   a file that is not a ferro database.
+    /// - [`Error::NoDatabase`] for a read-only open of a missing file, [`Error::NotFerro`] for a
+    ///   file that is not a ferro database, and [`Error::Format`] for one of a format other than
+    ///   [`FILE_FORMAT`](crate::FILE_FORMAT).
     /// - [`Error::Corrupt`] or [`Error::Decode`] if what open reads of the file is damaged.
     /// - [`Error::Io`] if the file cannot be created, opened or read, or [`Options::shared`] is not
     ///   supported here.
@@ -4279,8 +4280,8 @@ impl<T: Data + Default> Db<T> {
     /// # Errors
     ///
     /// As for [`Options::open`]: [`Error::Locked`] while another writer has the file open, and
-    /// [`Error::NotFerro`], [`Error::Corrupt`] or [`Error::Io`] for a file it cannot open as a
-    /// database.
+    /// [`Error::NotFerro`], [`Error::Format`], [`Error::Corrupt`] or [`Error::Io`] for a file it
+    /// cannot open as a database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Options::new().open(path)
     }

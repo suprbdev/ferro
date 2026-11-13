@@ -44,6 +44,23 @@ pub enum Error {
     /// starts either one with ferro's magic is [`Error::Corrupt`] instead.
     #[error("not a ferro database: {0}")]
     NotFerro(String),
+    /// The file is a ferro database of a format this build does not read.
+    ///
+    /// Every open of the file returns it, as do the [`admin`](crate::admin) functions, and the
+    /// file is left as it was. A build reads files of [`FILE_FORMAT`](crate::FILE_FORMAT) alone,
+    /// which changes only in a minor release, so the release that wrote the file, or another of
+    /// its minor version, reads it. It names a format only from a superblock whose check holds,
+    /// so damage to the magic of this build's format is [`Error::NotFerro`] instead.
+    #[error(
+        "{path} is a ferro database of format {found}, and this build reads format {}",
+        crate::FILE_FORMAT
+    )]
+    Format {
+        /// The path of the file.
+        path: String,
+        /// The format its superblocks name.
+        found: u8,
+    },
     /// The file is damaged, or holds something no file ferro wrote can hold.
     ///
     /// An object whose bytes do not match its hash, a commit log whose versions do not descend, a

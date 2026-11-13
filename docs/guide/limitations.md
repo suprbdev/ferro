@@ -2,9 +2,14 @@
 
 This is an experiment, not a production database.
 
-- The file format is not stable and may change without migration. It is now format 7, whose branch
-  table names the stored version 0: a file of format 6 does not open in this build, nor one of
-  format 7 in an earlier build, and both report `Error::NotFerro`.
+- The file format may change between minor releases, with no migration. A build reads one format,
+  `ferro::FILE_FORMAT`, now 7, and its sync messages have their own, `ferro::SYNC_FORMAT`, now 2.
+  Neither changes in a patch release, so every `0.1.x` reads the files and the sync messages every
+  other `0.1.x` writes. A file of another format fails to open with `Error::Format`, which names
+  the format it holds, and is left as it was, and a sync message of another format is refused with
+  `Error::Bundle`. Builds before format 7 report a file they cannot read as `Error::NotFerro`. Two
+  builds of different formats cannot sync, so data moves across a format change only through your
+  own code, reading with the old build and writing with the new one.
 - It runs on Unix and Windows. On Windows the file must be on NTFS: a reclamation cycle renames the
   new file over one that snapshots still hold open, which needs POSIX rename semantics, and Windows
   cannot sync a directory, so the rename is made durable by flushing the renamed file, which relies

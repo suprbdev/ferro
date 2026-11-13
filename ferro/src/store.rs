@@ -87,8 +87,18 @@ pub(crate) fn fresh_reads() -> u64 {
     FRESH.with(Cell::get)
 }
 
+/// The format of the database files this build reads and writes.
+///
+/// It is the last byte of the magic each superblock starts with, `FERRODB7`, as an ASCII digit.
+/// The format changes only in a minor release, never in a patch one, so every `0.1.x` reads the
+/// files every other `0.1.x` writes. A file of another format fails to open with
+/// [`Error::Format`], which names the format it holds, and is left as it was.
+pub const FILE_FORMAT: u8 = 7;
 /// The magic at the start of a superblock, which names the format of the file.
 const MAGIC: &[u8; 8] = b"FERRODB7";
+/// The start of the magic of every format, before the digit that names it.
+const MAGIC_STEM: &[u8; 7] = b"FERRODB";
+const _: () = assert!(MAGIC[7] == b'0' + FILE_FORMAT);
 /// The magic at the start of a frame's header.
 const FRAME_MAGIC: &[u8; 8] = b"FERROFRM";
 /// The magic at the start of a staging frame's header, whose records no check covers.
@@ -1458,6 +1468,16 @@ fn recover(file: &File, sb: Super, slot: u64, len: u64, live: bool) -> Result<(S
         file.sync_all()?;
     }
     Ok((tip, if moved { other } else { slot }))
+}
+
+/// The format a superblock slot's magic names, when it names one other than [`FILE_FORMAT`] and
+/// the slot's check holds, so that a damaged superblock of this format is never taken for one of
+/// another.
+fn other_format(slot: &[u8]) -> Option<u8> {
+    let digit = *slot.strip_prefix(MAGIC_STEM)?.first()?;
+    let checked = slot.get(..SUPER_BYTES)?;
+    let holds = blake3::hash(&checked[..SUPER_CHECKED]).as_bytes() == &checked[SUPER_CHECKED..];
+    (holds && digit.is_ascii_digit() && digit != MAGIC[7]).then(|| digit - b'0')
 }
 
 /// The superblock a read-only open trusts, given `sb`, the newest it read from a file `len` bytes
@@ -3048,6 +3068,8 @@ impl Store {
     /// - [`Error::NotFerro`] if the file holds something else, or, opened read-only, is empty or
     ///   holds only zeroes, as a creation cut short leaves it. A writable open creates a database
     ///   in such a file of at most 8 KiB.
+    /// - [`Error::Format`] if neither superblock is of [`FILE_FORMAT`] and one names another
+    ///   format and passes its check.
     /// - [`Error::Corrupt`] if both superblocks are invalid, the newest names a log the file does
     ///   not hold, or a frame past its anchor reached the disk whole and was damaged since, or,
     ///   for a shared writer that opens beside another, any frame the newest superblock names
@@ -3161,6 +3183,12 @@ impl Store {
                 let second = probe.get(SLOT_BYTES as usize..).unwrap_or_default();
                 if probe.starts_with(MAGIC) || second.starts_with(MAGIC) {
                     return Err(Error::Corrupt("both superblocks are invalid".into()));
+                }
+                if let Some(found) = other_format(&probe).or_else(|| other_format(second)) {
+                    return Err(Error::Format {
+                        path: path.display().to_string(),
+                        found,
+                    });
                 }
                 if options.read_only || !create || len > LOG_START || probe.iter().any(|b| *b != 0)
                 {

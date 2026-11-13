@@ -900,9 +900,28 @@ fn truncated_extended_and_foreign_bundles_are_rejected() {
     ));
     let have: Vec<u8> = b.have().unwrap().into();
     assert!(matches!(
-        b.receive("a", &Bundle::from(have), theirs_win),
+        b.receive("a", &Bundle::from(have.clone()), theirs_win),
         Err(Error::Bundle(_))
     ));
+    assert_eq!(
+        (bytes[8], have[8]),
+        (ferro::SYNC_FORMAT, ferro::SYNC_FORMAT)
+    );
+    for format in [1, 3] {
+        let named = format!("sync format {format}, and this build reads format 2");
+        let mut other = bytes.clone();
+        other[8] = format;
+        match b.receive("a", &Bundle::from(other), theirs_win) {
+            Err(Error::Bundle(message)) => assert!(message.contains(&named), "{message}"),
+            other => panic!("bundle of sync format {format}: {:?}", other.map(drop)),
+        }
+        let mut other = have.clone();
+        other[8] = format;
+        match b.bundle(&Have::from(other)) {
+            Err(Error::Bundle(message)) => assert!(message.contains(&named), "{message}"),
+            other => panic!("have of sync format {format}: {:?}", other.map(drop)),
+        }
+    }
     assert_eq!(b.version(), 2);
 }
 

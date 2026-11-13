@@ -44,7 +44,12 @@ use crate::store::{
 
 const HAVE_MAGIC: &[u8; 8] = b"FERROHAV";
 const BUNDLE_MAGIC: &[u8; 8] = b"FERROBDL";
-const FORMAT: u8 = 2;
+/// The format of the sync messages, [`Have`] and [`Bundle`], this build sends and reads.
+///
+/// It is the byte after each message's magic. It changes only in a minor release, never in a
+/// patch one, so every `0.1.x` reads what every other `0.1.x` sends. A message of another format
+/// is refused with [`Error::Bundle`], which names the format it holds.
+pub const SYNC_FORMAT: u8 = 2;
 const COMPRESS_MIN: usize = 96;
 const MAX_RATIO: usize = 255;
 const RECHECK_SLACK: usize = 16 << 20;
@@ -275,9 +280,9 @@ impl<R: Read> Input<R> {
         if &head[..magic.len()] != magic {
             return Err(bad("not a ferro sync message"));
         }
-        if head[magic.len()] != FORMAT {
+        if head[magic.len()] != SYNC_FORMAT {
             return Err(bad(format!(
-                "format {} is not supported",
+                "sync format {}, and this build reads format {SYNC_FORMAT}",
                 head[magic.len()]
             )));
         }
@@ -453,7 +458,7 @@ fn put_body(
 impl Marks {
     fn encode(&self) -> Vec<u8> {
         let mut out = HAVE_MAGIC.to_vec();
-        out.push(FORMAT);
+        out.push(SYNC_FORMAT);
         push_varint(&mut out, self.tips as u64);
         push_varint(&mut out, self.marks.len() as u64);
         for mark in &self.marks {
@@ -481,7 +486,7 @@ impl Marks {
 impl Header {
     fn encode(&self) -> Vec<u8> {
         let mut out = BUNDLE_MAGIC.to_vec();
-        out.push(FORMAT);
+        out.push(SYNC_FORMAT);
         match self.tip {
             Some(tip) => {
                 out.push(1);
