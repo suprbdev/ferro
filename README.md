@@ -75,8 +75,9 @@ explained or undone from the history, and corruption surfaces as an error rather
   threads, the default on eight cores or more, and 990 MB/s to 3.6 GB/s on four, and needs that much
   free disk, and a first sync keeps about 5 bytes per object in memory to receive and 7 to send,
   about 250 and 340 MiB for 50 million objects.
-- **Windows beyond NTFS.** Other file systems are not supported, performance on Windows was never
-  measured, and failed syncs and process death are tested on Unix only.
+- **Platforms other than Linux.** Each change is tested on Linux. The tests last ran on Windows on
+  2026-11-03 and never on macOS. Windows needs NTFS, performance there was never measured, and
+  failed syncs and process death are tested on Unix only.
 - **Adversaries.** Hashes are 160-bit and unkeyed, so collision resistance is 2^80, and `head_hash`
   is not a signature.
 

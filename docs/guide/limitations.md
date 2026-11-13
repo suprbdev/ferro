@@ -16,7 +16,8 @@ This is an experiment, not a production database.
   on the NTFS journal. Every sync is a `FlushFileBuffers`, which flushes metadata too, like fsync
   rather than fdatasync. Performance on Windows was never measured, and CI skips the tests that
   intercept libc calls or kill processes there, so failed syncs and process death are tested on Unix
-  only.
+  only. Each change is tested on Linux alone, with clippy checking that the Windows build compiles:
+  the tests last ran on Windows on 2026-11-03, and never on macOS or the BSDs.
 - A single-key commit writes about 3.5 KB at 1M keys, so batch related changes into one commit.
   Secondary indexes add to that: a row inserted into a table of 200,000 rows with two indexes writes
   8.2 KB. The largest part is the hashes of the children of every node on the changed path, which
