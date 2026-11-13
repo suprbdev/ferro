@@ -441,7 +441,7 @@ fn encoded<T: Data>(value: &T) -> Vec<u8> {
     let mut sink = HashSink;
     let mut encoder = Encoder::new(&mut sink);
     value.encode(&mut encoder).unwrap();
-    encoder.into_buf()
+    encoder.into_object().body
 }
 
 fn list_bench(dir: &Path) {

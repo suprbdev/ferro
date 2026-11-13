@@ -27,7 +27,7 @@
 //! let object = encoder.into_object();
 //! assert_eq!(object.hash(), hash_of(&value));
 //!
-//! let mut decoder = Decoder::new(&object.body, &object.links, None);
+//! let mut decoder = Decoder::new(&object.body, &object.links);
 //! assert_eq!(<(u32, String, Vec<u8>)>::decode(&mut decoder)?, value);
 //! # Ok::<(), ferro::Error>(())
 //! ```
@@ -53,7 +53,6 @@ use parking_lot::Mutex;
 use crate::error::{Error, Result};
 use crate::map::unwound;
 use crate::pool::{self, Pool};
-use crate::shared::Erased;
 use crate::stack;
 use crate::store::{StagedLinks, Store};
 
@@ -476,98 +475,20 @@ impl Object {
     }
 }
 
-/// An object already hashed, and compressed if that made it smaller, ready for a [`Sink`] to
-/// store.
-///
-/// A commit that writes a large tree encodes and compresses its new nodes on several threads, then
-/// hands them to [`Sink::put_staged`] in order, borrowing their bytes from one buffer.
-#[derive(Clone, Copy)]
-pub struct Staged<'a> {
-    /// The length of the body before compression.
-    pub raw: usize,
-    /// The body as it is to be stored: LZ4 compressed if `packed`, as is otherwise.
-    pub payload: &'a [u8],
-    /// Whether `payload` is compressed.
-    pub packed: bool,
-    /// The object's links, in order.
-    pub links: &'a [Ptr],
-}
-
-impl fmt::Debug for Staged<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Staged")
-            .field("raw", &self.raw)
-            .field("packed", &self.packed)
-            .field("links", &self.links.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Staged<'_> {
-    /// The body before compression.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Corrupt`] if a compressed payload does not decompress to `raw` bytes.
-    pub fn body(&self) -> Result<Vec<u8>> {
-        if !self.packed {
-            return Ok(self.payload.to_vec());
-        }
-        lz4_flex::block::decompress(self.payload, self.raw)
-            .map_err(|error| Error::Corrupt(format!("bad staged body: {error}")))
-    }
-}
-
 /// A value that a store's cache can hold: every [`Data`] type, and the store's own records.
 pub(crate) trait Cached: Any + Send + Sync {}
 
 impl<T: Data> Cached for T {}
-
-#[doc(hidden)]
-pub struct Moves {
-    from: u64,
-    old: Vec<u64>,
-    new: Vec<u64>,
-}
-
-impl fmt::Debug for Moves {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Moves").finish_non_exhaustive()
-    }
-}
-
-impl Moves {
-    pub(crate) fn new(from: u64, old: Vec<u64>, new: Vec<u64>) -> Moves {
-        Moves { from, old, new }
-    }
-
-    pub(crate) fn offset(&self, offset: u64) -> Option<u64> {
-        if offset < self.from {
-            return Some(offset);
-        }
-        self.old.binary_search(&offset).ok().map(|at| self.new[at])
-    }
-
-    pub(crate) fn ptr(&self, ptr: Ptr) -> Option<Ptr> {
-        Some(Ptr {
-            hash: ptr.hash,
-            offset: self.offset(ptr.offset)?,
-        })
-    }
-}
-
-#[doc(hidden)]
-pub type Moved = HashMap<usize, Erased>;
-
-#[doc(hidden)]
-pub type Relocate = fn(&Erased, usize, &Moves, &Moved) -> Option<Erased>;
 
 /// Where an [`Encoder`] puts the objects it finishes.
 ///
 /// A commit writes into a sink that appends each object to the file, a reclamation cycle into one
 /// that copies into a new file, and [`HashSink`] keeps nothing but the hashes, for
 /// [`hash_of`] and for comparing encodings.
-pub trait Sink {
+///
+/// The trait is sealed: only ferro implements it, and [`HashSink`] is the sink to encode into
+/// outside a commit.
+pub trait Sink: Sealed {
     /// Stores `object`, whose hash is `hash`, and returns the link to it.
     ///
     /// # Errors
@@ -575,62 +496,159 @@ pub trait Sink {
     /// Returns the error that stopped the object being stored, such as [`Error::Io`] or
     /// [`Error::TooLarge`].
     fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr>;
-    /// Whether the sink stores bodies compressed, so that a staged object should be compressed
-    /// before it is handed over. The default is `false`.
-    fn packs(&self) -> bool {
-        false
+}
+
+pub(crate) use sealed::{Moved, Moves, Relocate, Sealed, Staged};
+
+mod sealed {
+    use std::collections::HashMap;
+    use std::fmt;
+
+    use super::{Hash, Object, Ptr};
+    use crate::error::{Error, Result};
+    use crate::shared::Erased;
+    use crate::store::Store;
+
+    /// An object already hashed, and compressed if that made it smaller, ready for a sink to
+    /// store.
+    ///
+    /// A commit that writes a large tree encodes and compresses its new nodes on several threads,
+    /// then hands them to [`Sealed::put_staged`] in order, borrowing their bytes from one buffer.
+    #[derive(Clone, Copy)]
+    pub struct Staged<'a> {
+        /// The length of the body before compression.
+        pub raw: usize,
+        /// The body as it is to be stored: LZ4 compressed if `packed`, as is otherwise.
+        pub payload: &'a [u8],
+        /// Whether `payload` is compressed.
+        pub packed: bool,
+        /// The object's links, in order.
+        pub links: &'a [Ptr],
     }
-    /// Stores an object that was hashed, and maybe compressed, ahead of time, and returns the link
-    /// to it.
-    ///
-    /// The default decompresses the body and calls [`put`](Sink::put).
-    ///
-    /// # Errors
-    ///
-    /// As for [`put`](Sink::put), and [`Error::Corrupt`] if the body does not decompress.
-    fn put_staged(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
-        let object = Object {
-            body: staged.body()?,
-            links: staged.links.to_vec(),
-        };
-        self.put(object, hash)
+
+    impl fmt::Debug for Staged<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Staged")
+                .field("raw", &self.raw)
+                .field("packed", &self.packed)
+                .field("links", &self.links.len())
+                .finish_non_exhaustive()
+        }
     }
-    /// Hints that an object whose hash is `hash` is about to be stored, so that the sink can
-    /// start fetching what it looks the hash up in. The default does nothing.
-    fn prefetch(&self, _hash: &Hash) {}
-    /// Checks that `ptr`, which a value being encoded holds, names an object in the sink's file.
-    /// The default accepts every link.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::StalePointer`] for a link that names no object in the file, such as one
-    /// into an earlier generation of it, and the error of reading the file if that fails.
-    fn check_link(&self, _ptr: Ptr) -> Result<()> {
-        Ok(())
+
+    impl Staged<'_> {
+        /// The object, with its body decompressed, as [`Sink::put`](super::Sink::put) takes it.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::Corrupt`] if a compressed payload does not decompress to `raw` bytes.
+        pub fn object(&self) -> Result<Object> {
+            let body = match self.packed {
+                false => self.payload.to_vec(),
+                true => lz4_flex::block::decompress(self.payload, self.raw)
+                    .map_err(|error| Error::Corrupt(format!("bad staged body: {error}")))?,
+            };
+            Ok(Object {
+                body,
+                links: self.links.to_vec(),
+            })
+        }
     }
-    /// Offers the sink the in-memory node it has just stored at `ptr`, with its weight in the
-    /// cache, so that a store can keep it cached rather than read it back. The default drops it.
-    fn remember(&mut self, _ptr: Ptr, _value: Erased, _weight: u32) {}
-    #[doc(hidden)]
-    fn remember_moving(
-        &mut self,
-        ptr: Ptr,
-        value: Erased,
-        weight: u32,
-        _relocate: (Relocate, usize),
-    ) {
-        self.remember(ptr, value, weight);
+
+    pub struct Moves {
+        from: u64,
+        old: Vec<u64>,
+        new: Vec<u64>,
     }
-    /// The id of the store the sink writes into, or 0 for a sink with none.
+
+    impl fmt::Debug for Moves {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Moves").finish_non_exhaustive()
+        }
+    }
+
+    impl Moves {
+        pub(crate) fn new(from: u64, old: Vec<u64>, new: Vec<u64>) -> Moves {
+            Moves { from, old, new }
+        }
+
+        pub(crate) fn offset(&self, offset: u64) -> Option<u64> {
+            if offset < self.from {
+                return Some(offset);
+            }
+            self.old.binary_search(&offset).ok().map(|at| self.new[at])
+        }
+
+        pub(crate) fn ptr(&self, ptr: Ptr) -> Option<Ptr> {
+            Some(Ptr {
+                hash: ptr.hash,
+                offset: self.offset(ptr.offset)?,
+            })
+        }
+    }
+
+    pub type Moved = HashMap<usize, Erased>;
+
+    pub type Relocate = fn(&Erased, usize, &Moves, &Moved) -> Option<Erased>;
+
+    /// What a [`Sink`](super::Sink) does beyond storing objects, for commits and reclamation.
     ///
-    /// A collection compares it with the id of the store its own nodes come from, and copies
-    /// itself entry by entry into a sink of another store, since a link means something only
-    /// inside its own file.
-    fn store_id(&self) -> u64;
-    /// The store the sink writes into, if any, through which nodes it stores can be decoded
-    /// again. The default is `None`.
-    fn store(&self) -> Option<Store> {
-        None
+    /// It is a supertrait of [`Sink`](super::Sink) that no code outside ferro can name, so only
+    /// ferro implements a sink, and only ferro calls these.
+    pub trait Sealed {
+        /// Whether the sink stores bodies compressed, so that a staged object should be compressed
+        /// before it is handed over. The default is `false`.
+        fn packs(&self) -> bool {
+            false
+        }
+        /// Stores an object that was hashed, and maybe compressed, ahead of time, and returns the
+        /// link to it. A sink with no shortcut for it puts [`Staged::object`].
+        ///
+        /// # Errors
+        ///
+        /// As for [`Sink::put`](super::Sink::put), and [`Error::Corrupt`] if the body does not
+        /// decompress.
+        fn put_staged(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr>;
+        /// Hints that an object whose hash is `hash` is about to be stored, so that the sink can
+        /// start fetching what it looks the hash up in. The default does nothing.
+        fn prefetch(&self, _hash: &Hash) {}
+        /// Checks that `ptr`, which a value being encoded holds, names an object in the sink's
+        /// file. The default accepts every link.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`Error::StalePointer`] for a link that names no object in the file, such as
+        /// one into an earlier generation of it, and the error of reading the file if that fails.
+        fn check_link(&self, _ptr: Ptr) -> Result<()> {
+            Ok(())
+        }
+        /// Offers the sink the in-memory node it has just stored at `ptr`, with its weight in the
+        /// cache, so that a store can keep it cached rather than read it back. The default drops
+        /// it.
+        fn remember(&mut self, _ptr: Ptr, _value: Erased, _weight: u32) {}
+        /// Offers the sink a node as [`remember`](Sealed::remember) does, with the function and
+        /// link count that move it into a new file if the store's file is replaced while it is
+        /// cached. The default calls [`remember`](Sealed::remember).
+        fn remember_moving(
+            &mut self,
+            ptr: Ptr,
+            value: Erased,
+            weight: u32,
+            _relocate: (Relocate, usize),
+        ) {
+            self.remember(ptr, value, weight);
+        }
+        /// The id of the store the sink writes into, or 0 for a sink with none.
+        ///
+        /// A collection compares it with the id of the store its own nodes come from, and copies
+        /// itself entry by entry into a sink of another store, since a link means something only
+        /// inside its own file.
+        fn store_id(&self) -> u64;
+        /// The store the sink writes into, if any, through which nodes it stores can be decoded
+        /// again. The default is `None`.
+        fn store(&self) -> Option<Store> {
+            None
+        }
     }
 }
 
@@ -645,7 +663,9 @@ impl Sink for HashSink {
     fn put(&mut self, _object: Object, hash: Hash) -> Result<Ptr> {
         Ok(Ptr { hash, offset: 0 })
     }
+}
 
+impl Sealed for HashSink {
     fn put_staged(&mut self, hash: Hash, _staged: Staged<'_>) -> Result<Ptr> {
         Ok(Ptr { hash, offset: 0 })
     }
@@ -1219,7 +1239,7 @@ impl<'a> Encoder<'a> {
 
     /// Creates an encoder that writes into `buf`, cleared first, to reuse its allocation;
     /// [`into_buf`](Encoder::into_buf) gives it back.
-    pub fn reusing(sink: &'a mut dyn Sink, mut buf: Vec<u8>) -> Self {
+    pub(crate) fn reusing(sink: &'a mut dyn Sink, mut buf: Vec<u8>) -> Self {
         buf.clear();
         Encoder {
             buf,
@@ -1232,7 +1252,7 @@ impl<'a> Encoder<'a> {
     }
 
     /// The bytes written, dropping the links, for reuse by [`reusing`](Encoder::reusing).
-    pub fn into_buf(self) -> Vec<u8> {
+    pub(crate) fn into_buf(self) -> Vec<u8> {
         self.buf
     }
 
@@ -1242,13 +1262,22 @@ impl<'a> Encoder<'a> {
     /// A map node holding such a value is then decoded from what was written before it is cached,
     /// rather than kept as it was, so that the collections inside it come back clean and read
     /// from this file. [`child`](Encoder::child) passes the mark up.
+    #[cfg(not(feature = "testing"))]
+    pub(crate) fn mark_unsettled(&mut self) {
+        self.unsettled = true;
+    }
+
+    /// Records that the value written holds something not yet stored in the sink's file, as a
+    /// collection with uncommitted changes does, for tests that write such a value by hand.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
     pub fn mark_unsettled(&mut self) {
         self.unsettled = true;
     }
 
     /// Whether [`mark_unsettled`](Encoder::mark_unsettled) was called on this encoder or a child
     /// of it.
-    pub fn is_unsettled(&self) -> bool {
+    pub(crate) fn is_unsettled(&self) -> bool {
         self.unsettled
     }
 
@@ -1280,12 +1309,21 @@ impl<'a> Encoder<'a> {
     }
 
     /// The sink this encoder hands its objects to.
+    #[cfg(not(feature = "testing"))]
+    pub(crate) fn sink(&mut self) -> &mut dyn Sink {
+        &mut *self.sink
+    }
+
+    /// The sink this encoder hands its objects to, for tests that encode part of a value into an
+    /// encoder of their own.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
     pub fn sink(&mut self) -> &mut dyn Sink {
         &mut *self.sink
     }
 
-    /// The id of the sink's store, as [`Sink::store_id`] gives it.
-    pub fn store_id(&self) -> u64 {
+    /// The id of the sink's store, as [`Sealed::store_id`] gives it.
+    pub(crate) fn store_id(&self) -> u64 {
         self.sink.store_id()
     }
 
@@ -2673,8 +2711,8 @@ pub(crate) fn pair_roots<D: Data>(pairing: &mut Pairing<'_>, old: Ptr, new: Ptr)
     let store = pairing.store();
     let (old, old_charged) = store.read_fresh(old)?;
     let (new, new_charged) = store.read_fresh(new)?;
-    let mut old = Decoder::new(&old.body, &old.links, Some(store));
-    let mut new = Decoder::new(&new.body, &new.links, Some(store));
+    let mut old = Decoder::with_store(&old.body, &old.links, Some(store));
+    let mut new = Decoder::with_store(&new.body, &new.links, Some(store));
     D::pair(&mut old, &mut new, pairing)?;
     for (charged, read) in [(old_charged, &old), (new_charged, &new)] {
         if charged {
@@ -2797,7 +2835,7 @@ impl Kind {
         tables: Option<&RefCell<Vec<FoundTable>>>,
     ) -> Result<(Shape, Found, u64)> {
         let found = Finding::new();
-        let mut decoder = Decoder::new(body, links, store);
+        let mut decoder = Decoder::with_store(body, links, store);
         decoder.found = Some(&found);
         decoder.tables = tables;
         let shape = (self.check)(self, &mut decoder)?;
@@ -2864,7 +2902,7 @@ impl Kind {
         store: &Store,
         recalled: Option<&Recalled>,
     ) -> Result<(Shape, u64)> {
-        let mut decoder = Decoder::new(body, links, Some(store));
+        let mut decoder = Decoder::with_store(body, links, Some(store));
         decoder.recalled = recalled;
         let shape = (self.check)(self, &mut decoder)?;
         decoder.end()?;
@@ -2987,10 +3025,26 @@ impl fmt::Debug for Decoder<'_> {
 impl<'a> Decoder<'a> {
     /// Creates a decoder of the object with body `buf` and links `links`.
     ///
+    /// The decoder reads from memory, with no file behind it, so a collection decoded from the
+    /// object fails with [`Error::Detached`] once it needs one of its nodes.
+    pub fn new(buf: &'a [u8], links: &'a [Ptr]) -> Self {
+        Decoder::with_store(buf, links, None)
+    }
+
+    /// Creates a decoder of the object with body `buf` and links `links`, read from `store`, for
+    /// tests that decode what they read from a store of their own.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn in_store(buf: &'a [u8], links: &'a [Ptr], store: &'a Store) -> Self {
+        Decoder::with_store(buf, links, Some(store))
+    }
+
+    /// Creates a decoder of the object with body `buf` and links `links`, read from `store`.
+    ///
     /// `store` is the store the object was read from, which the collections inside it read their
     /// nodes from. With `None`, a collection decoded from the object fails with
     /// [`Error::Detached`] once it needs one of its nodes.
-    pub fn new(buf: &'a [u8], links: &'a [Ptr], store: Option<&'a Store>) -> Self {
+    pub(crate) fn with_store(buf: &'a [u8], links: &'a [Ptr], store: Option<&'a Store>) -> Self {
         Decoder {
             buf,
             pos: 0,
@@ -3011,7 +3065,7 @@ impl<'a> Decoder<'a> {
     /// Creates a decoder of the object with body `buf` whose links it reads from the
     /// [`StagedLinks`] that `found` was made with as it comes to each, rather than holding them
     /// resolved, putting the typed links it finds in `found`, with `store` as for
-    /// [`new`](Decoder::new).
+    /// [`with_store`](Decoder::with_store).
     ///
     /// Such a decoder, and each one it makes for a field, holds a list of no links whose address
     /// carries how many it stands for, and counts its links from one, so that every place that
@@ -3031,7 +3085,7 @@ impl<'a> Decoder<'a> {
             cursor: 1,
             base: usize::MAX,
             found: Some(found),
-            ..Decoder::new(buf, &[], store)
+            ..Decoder::with_store(buf, &[], store)
         }
     }
 
@@ -3128,7 +3182,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// The bytes and the links read since `checkpoint`, by a decoder that holds its links, as one
-    /// made by [`new`](Decoder::new) does.
+    /// made by [`with_store`](Decoder::with_store) does.
     pub(crate) fn read_since(&self, checkpoint: Checkpoint) -> (&'a [u8], &'a [Ptr]) {
         (
             &self.buf[checkpoint.pos..self.pos],
@@ -3554,7 +3608,7 @@ impl<'a> Decoder<'a> {
 
     /// A handle on the store the object was read from, for a collection to read its nodes from,
     /// or `None` for an object decoded from memory.
-    pub fn store(&self) -> Option<Store> {
+    pub(crate) fn store(&self) -> Option<Store> {
         self.store.map(Store::share)
     }
 
@@ -3639,7 +3693,7 @@ impl<'a> Decoder<'a> {
     /// Returns [`Error::Decode`] for a field that runs past the end of the object.
     pub(crate) fn next_field(&mut self) -> Result<(u16, Decoder<'a>)> {
         let (tag, body, part) = self.field_parts()?;
-        let mut field = Decoder::new(body, part.links, self.store);
+        let mut field = Decoder::with_store(body, part.links, self.store);
         field.rebuilds = self.rebuilds;
         field.depth = self.depth;
         Ok((tag, field))

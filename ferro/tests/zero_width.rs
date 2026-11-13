@@ -60,7 +60,7 @@ fn hand_made(write: impl FnOnce(&mut Encoder<'_>)) -> Object {
 }
 
 fn decodes<D: Data>(object: &Object) -> ferro::Result<D> {
-    D::decode(&mut Decoder::new(&object.body, &object.links, None))
+    D::decode(&mut Decoder::new(&object.body, &object.links))
 }
 
 fn fits<D: Data + PartialEq + Debug>(value: D) {

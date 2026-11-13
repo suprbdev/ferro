@@ -1489,7 +1489,7 @@ fn locate(store: &Store, refs: &Refs, mark: Mark) -> Result<Option<(Ptr, Chain)>
 }
 
 fn read_entry(object: &Object) -> Result<Entry> {
-    Entry::decode(&mut Decoder::new(&object.body, &object.links, None))
+    Entry::decode(&mut Decoder::new(&object.body, &object.links))
 }
 
 #[derive(Clone, Copy)]
@@ -2322,7 +2322,7 @@ impl Commits {
 }
 
 fn decode_commit(object: &Object) -> Result<Entry> {
-    let mut decoder = Decoder::new(&object.body, &object.links, None);
+    let mut decoder = Decoder::new(&object.body, &object.links);
     let entry = Entry::decode(&mut decoder).map_err(|error| {
         bad(format!(
             "an object it links as a commit is not one: {error}"

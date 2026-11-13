@@ -434,7 +434,7 @@ fn encoded<T: Data>(value: &T) -> Vec<u8> {
 }
 
 fn decoded<T: Data>(bytes: &[u8]) -> ferro::Result<T> {
-    T::decode(&mut Decoder::new(bytes, &[], None))
+    T::decode(&mut Decoder::new(bytes, &[]))
 }
 
 #[test]

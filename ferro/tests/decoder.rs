@@ -71,12 +71,12 @@ fn fake_links(count: usize) -> Vec<Ptr> {
 }
 
 fn decode_any<T: Data>(bytes: &[u8], links: &[Ptr]) {
-    let mut decoder = Decoder::new(bytes, links, None);
+    let mut decoder = Decoder::new(bytes, links);
     let _ = T::decode(&mut decoder);
 }
 
 fn decode_fields(bytes: &[u8], links: &[Ptr]) {
-    let mut decoder = Decoder::new(bytes, links, None);
+    let mut decoder = Decoder::new(bytes, links);
     let _ = decoder.fields(|tag, field| match tag % 4 {
         0 => u64::decode(field).map(|_| ()),
         1 => String::decode(field).map(|_| ()),
@@ -163,11 +163,11 @@ fn roundtrip<T: Data + PartialEq + Debug>(value: T) {
     let mut encoder = Encoder::new(&mut sink);
     value.encode(&mut encoder).unwrap();
     let object = encoder.into_object();
-    let mut decoder = Decoder::new(&object.body, &object.links, None);
+    let mut decoder = Decoder::new(&object.body, &object.links);
     assert_eq!(T::decode(&mut decoder).unwrap(), value);
     assert_eq!(decoder.remaining(), 0);
     for cut in 0..object.body.len() {
-        let mut short = Decoder::new(&object.body[..cut], &object.links, None);
+        let mut short = Decoder::new(&object.body[..cut], &object.links);
         let _ = T::decode(&mut short);
     }
 }
@@ -265,13 +265,12 @@ fn overlong_varints_are_rejected() {
         &[0x80, 0x80, 0x00],
     ];
     for bytes in cases {
-        let mut decoder = Decoder::new(bytes, &[], None);
+        let mut decoder = Decoder::new(bytes, &[]);
         assert!(decoder.varint().is_err(), "{bytes:?}");
     }
     let mut decoder = Decoder::new(
         &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01],
         &[],
-        None,
     );
     assert_eq!(decoder.varint().unwrap(), u64::MAX);
     let mut decoder = Decoder::new(
@@ -279,7 +278,6 @@ fn overlong_varints_are_rejected() {
             0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x80, 0x01, 0x00,
         ],
         &[],
-        None,
     );
     assert_eq!(decoder.varint().unwrap(), 1 << 63);
     assert_eq!(decoder.varint().unwrap(), 128);
@@ -301,7 +299,7 @@ fn varint_as_written(bytes: &[u8]) -> Option<(u64, usize)> {
 }
 
 fn agrees_with_written_form(bytes: &[u8]) {
-    let mut decoder = Decoder::new(bytes, &[], None);
+    let mut decoder = Decoder::new(bytes, &[]);
     match (decoder.varint(), varint_as_written(bytes)) {
         (Ok(value), Some((wanted, len))) => {
             assert_eq!(value, wanted, "{bytes:02x?}");
@@ -357,7 +355,7 @@ fn varints_of_nine_and_ten_bytes_read_only_their_shortest_form() {
     ] {
         let bytes = varint_bytes(value);
         assert!(bytes.len() >= 9);
-        let mut decoder = Decoder::new(&bytes, &[], None);
+        let mut decoder = Decoder::new(&bytes, &[]);
         assert_eq!(decoder.varint().unwrap(), value);
         assert_eq!(decoder.remaining(), 0);
     }
@@ -369,17 +367,17 @@ fn out_of_range_narrow_integers_are_rejected() {
     let mut encoder = Encoder::new(&mut sink);
     70_000u32.encode(&mut encoder).unwrap();
     let bytes = encoder.bytes().to_vec();
-    assert!(u16::decode(&mut Decoder::new(&bytes, &[], None)).is_err());
+    assert!(u16::decode(&mut Decoder::new(&bytes, &[])).is_err());
     let mut sink = HashSink;
     let mut encoder = Encoder::new(&mut sink);
     70_000i32.encode(&mut encoder).unwrap();
     let bytes = encoder.bytes().to_vec();
-    assert!(i16::decode(&mut Decoder::new(&bytes, &[], None)).is_err());
-    assert!(i8::decode(&mut Decoder::new(&bytes, &[], None)).is_err());
-    assert!(char::decode(&mut Decoder::new(&[0x80, 0x80, 0x80, 0x10], &[], None)).is_err());
-    assert!(bool::decode(&mut Decoder::new(&[2], &[], None)).is_err());
-    assert!(Option::<u8>::decode(&mut Decoder::new(&[2], &[], None)).is_err());
-    assert!(String::decode(&mut Decoder::new(&[2, 0xFF, 0xFF], &[], None)).is_err());
+    assert!(i16::decode(&mut Decoder::new(&bytes, &[])).is_err());
+    assert!(i8::decode(&mut Decoder::new(&bytes, &[])).is_err());
+    assert!(char::decode(&mut Decoder::new(&[0x80, 0x80, 0x80, 0x10], &[])).is_err());
+    assert!(bool::decode(&mut Decoder::new(&[2], &[])).is_err());
+    assert!(Option::<u8>::decode(&mut Decoder::new(&[2], &[])).is_err());
+    assert!(String::decode(&mut Decoder::new(&[2, 0xFF, 0xFF], &[])).is_err());
 }
 
 fn huge_length() -> Vec<u8> {
@@ -401,19 +399,19 @@ fn finishes_quickly(label: &str, work: impl FnOnce() + Send + 'static) {
 #[test]
 fn zero_width_items_cannot_stall_the_decoder() {
     finishes_quickly("Vec<()>", || {
-        assert!(Vec::<()>::decode(&mut Decoder::new(&huge_length(), &[], None)).is_err());
+        assert!(Vec::<()>::decode(&mut Decoder::new(&huge_length(), &[])).is_err());
     });
     finishes_quickly("Vec<[u8; 0]>", || {
-        assert!(Vec::<[u8; 0]>::decode(&mut Decoder::new(&huge_length(), &[], None)).is_err());
+        assert!(Vec::<[u8; 0]>::decode(&mut Decoder::new(&huge_length(), &[])).is_err());
     });
     finishes_quickly("Vec<Box<()>>", || {
-        assert!(Vec::<Box<()>>::decode(&mut Decoder::new(&huge_length(), &[], None)).is_err());
+        assert!(Vec::<Box<()>>::decode(&mut Decoder::new(&huge_length(), &[])).is_err());
     });
     finishes_quickly("BTreeSet<()>", || {
-        assert!(BTreeSet::<()>::decode(&mut Decoder::new(&huge_length(), &[], None)).is_err());
+        assert!(BTreeSet::<()>::decode(&mut Decoder::new(&huge_length(), &[])).is_err());
     });
     finishes_quickly("BTreeMap<(), ()>", || {
-        assert!(BTreeMap::<(), ()>::decode(&mut Decoder::new(&huge_length(), &[], None)).is_err());
+        assert!(BTreeMap::<(), ()>::decode(&mut Decoder::new(&huge_length(), &[])).is_err());
     });
 }
 
@@ -431,7 +429,7 @@ fn large_declared_lengths_do_not_allocate_ahead_of_input() {
     bytes.resize(4096, 0);
     let limit = 1 << 22;
     LARGEST.set(0);
-    let mut decoder = Decoder::new(&bytes, &[], None);
+    let mut decoder = Decoder::new(&bytes, &[]);
     let result = Vec::<[u64; 512]>::decode(&mut decoder);
     assert!(result.is_err());
     let peak = LARGEST.get();
@@ -450,7 +448,7 @@ fn field_records_with_bad_lengths_are_rejected() {
         &[2, 1, 0, 0],
     ];
     for bytes in cases {
-        let mut decoder = Decoder::new(bytes, &[], None);
+        let mut decoder = Decoder::new(bytes, &[]);
         assert!(decoder.fields(|_, _| Ok(())).is_err(), "{bytes:?}");
     }
 }
@@ -478,7 +476,7 @@ fn field_links_stay_within_their_field() {
         .unwrap();
     let object = encoder.into_object();
     assert_eq!(object.links.len(), 3);
-    let mut decoder = Decoder::new(&object.body, &object.links, None);
+    let mut decoder = Decoder::new(&object.body, &object.links);
     let mut seen = Vec::new();
     decoder
         .fields(|tag, field| {
@@ -502,7 +500,7 @@ fn field_links_stay_within_their_field() {
 fn map_decoded_without_a_store_fails_with_a_ferro_panic() {
     quiet_ferro_panics();
     let links = fake_links(1);
-    let mut decoder = Decoder::new(&[5], &links, None);
+    let mut decoder = Decoder::new(&[5], &links);
     let map = Map::<u64, String>::decode(&mut decoder).unwrap();
     assert_eq!(map.len(), 5);
     assert!(matches!(map.try_get(&1), Err(ferro::Error::Detached)));
@@ -530,14 +528,14 @@ fn body_of<T: Data>(value: &T) -> Vec<u8> {
 }
 
 fn refused<T: Data + Debug>(bytes: &[u8]) {
-    let mut decoder = Decoder::new(bytes, &[], None);
+    let mut decoder = Decoder::new(bytes, &[]);
     let decoded = T::decode(&mut decoder);
     assert!(
         matches!(decoded, Err(ferro::Error::Decode(_))),
         "{} decoded {bytes:02x?} as {decoded:?}",
         std::any::type_name::<T>()
     );
-    let mut visitor = Decoder::new(bytes, &[], None);
+    let mut visitor = Decoder::new(bytes, &[]);
     assert!(
         matches!(T::visit(&mut visitor), Err(ferro::Error::Decode(_))),
         "{} visited {bytes:02x?}",
@@ -569,16 +567,16 @@ fn a_value_is_read_only_from_the_bytes_its_encoder_writes() {
 }
 
 fn reads_sorted<T: Data + Debug + PartialEq>(bytes: &[u8], expected: T) {
-    let mut decoder = Decoder::new(bytes, &[], None);
+    let mut decoder = Decoder::new(bytes, &[]);
     assert_eq!(T::decode(&mut decoder).unwrap(), expected);
     assert_eq!(decoder.remaining(), 0);
-    let mut visitor = Decoder::new(bytes, &[], None);
+    let mut visitor = Decoder::new(bytes, &[]);
     T::visit(&mut visitor).unwrap();
     assert_eq!(visitor.remaining(), 0);
     let canonical = body_of(&expected);
     assert_ne!(canonical, bytes);
     assert_eq!(
-        T::decode(&mut Decoder::new(&canonical, &[], None)).unwrap(),
+        T::decode(&mut Decoder::new(&canonical, &[])).unwrap(),
         expected
     );
 }
@@ -665,15 +663,15 @@ proptest! {
                 _ => bytes.insert(at, rng.next() as u8),
             }
         }
-        let mut decoder = Decoder::new(&bytes, &[], None);
+        let mut decoder = Decoder::new(&bytes, &[]);
         let decoded = Mixed::decode(&mut decoder).map(|value| (value, decoder.remaining()));
-        let mut visitor = Decoder::new(&bytes, &[], None);
+        let mut visitor = Decoder::new(&bytes, &[]);
         let visited = Mixed::visit(&mut visitor).map(|()| visitor.remaining());
         prop_assert_eq!(decoded.is_ok(), visited.is_ok());
         if let (Ok((value, rest)), Ok(left)) = (decoded, visited) {
             prop_assert_eq!(rest, left);
             if rest == 0 {
-                let mut stored = Stored::decode(&mut Decoder::new(&bytes, &[], None)).unwrap();
+                let mut stored = Stored::decode(&mut Decoder::new(&bytes, &[])).unwrap();
                 stored.1.sort_by_key(|(key, _)| *key);
                 stored.2.sort_unstable();
                 prop_assert_eq!(body_of(&value), body_of(&stored));
@@ -1459,7 +1457,7 @@ fn descending(depth: u32) -> Descending {
 
 fn key_reads(read: impl FnOnce(&mut Decoder<'_>), bytes: &[u8]) -> u64 {
     KEY_READS.set(0);
-    let mut decoder = Decoder::new(bytes, &[], None);
+    let mut decoder = Decoder::new(bytes, &[]);
     read(&mut decoder);
     decoder.end().unwrap();
     KEY_READS.get()
@@ -1553,9 +1551,9 @@ fn random_outer(rng: &mut common::Rng) -> Outer {
 }
 
 fn read_both_ways<T: Data>(bytes: &[u8]) -> Result<Option<T>, String> {
-    let mut decoder = Decoder::new(bytes, &[], None);
+    let mut decoder = Decoder::new(bytes, &[]);
     let decoded = T::decode(&mut decoder);
-    let mut visitor = Decoder::new(bytes, &[], None);
+    let mut visitor = Decoder::new(bytes, &[]);
     let visited = T::visit(&mut visitor);
     match (decoded, visited) {
         (Ok(value), Ok(())) if decoder.remaining() == visitor.remaining() => Ok(Some(value)),

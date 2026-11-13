@@ -240,7 +240,7 @@ impl NodeParts {
 }
 
 fn parse_node<K: Data + 'static, V: Data>(body: &[u8], links: &[Ptr]) -> Option<NodeParts> {
-    let mut r = Decoder::new(body, links, None);
+    let mut r = Decoder::new(body, links);
     let at = |r: &Decoder<'_>| body.len() - r.remaining();
     let level = r.u8().ok()?;
     let n = usize::try_from(r.varint().ok()?).ok()?;

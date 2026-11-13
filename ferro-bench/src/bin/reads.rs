@@ -561,7 +561,7 @@ fn decoded<T: Data>(report: &mut Report, name: &str, items: Vec<T>) {
     items.encode(&mut encoder).unwrap();
     let body = encoder.into_object().body;
     report.timed(name, items.len() as u64, || {
-        let mut decoder = Decoder::new(&body, &[], None);
+        let mut decoder = Decoder::new(&body, &[]);
         Vec::<T>::decode(&mut decoder).unwrap()
     });
 }
@@ -601,14 +601,14 @@ fn decoded_whole<T: Data>(report: &mut Report, name: &str, count: u64, value: &i
     let mut encoder = Encoder::new(&mut sink);
     value.encode(&mut encoder).unwrap();
     let body = encoder.into_object().body;
-    if T::decode(&mut Decoder::new(&body, &[], None)).is_err() {
+    if T::decode(&mut Decoder::new(&body, &[])).is_err() {
         return;
     }
     report.timed(&format!("decode_{name}"), count, || {
-        T::decode(&mut Decoder::new(&body, &[], None)).unwrap()
+        T::decode(&mut Decoder::new(&body, &[])).unwrap()
     });
     report.timed(&format!("visit_{name}"), count, || {
-        T::visit(&mut Decoder::new(&body, &[], None)).unwrap()
+        T::visit(&mut Decoder::new(&body, &[])).unwrap()
     });
 }
 

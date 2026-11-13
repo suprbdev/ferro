@@ -49,7 +49,7 @@ impl Data for Spliced {
             whole.into_object()
         };
         let mut fields = Vec::new();
-        Decoder::new(&whole.body, &whole.links, None).fields_sharing_tags(|tag, r| {
+        Decoder::new(&whole.body, &whole.links).fields_sharing_tags(|tag, r| {
             let bytes = r.take(r.remaining())?.to_vec();
             let mut links = Vec::new();
             while let Ok(link) = r.link() {

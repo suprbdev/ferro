@@ -49,8 +49,9 @@ library's tests on `windows-latest`.
 
 The hooks that tests reach the library through are behind its `testing` cargo feature:
 `Options::hook`, `clock`, `trace` and `follow_polling`, `Db::trace_op`, `db::Hook` and
-`db::Clock`, the `store` module, and `admin::layout`. A build without the feature, as an
-application that depends on `ferro` gets, does not have them, and its commits call no hook.
+`db::Clock`, the `store` module, `admin::layout`, `Encoder::sink` and `mark_unsettled`, and
+`Decoder::in_store`. A build without the feature, as an application that depends on `ferro` gets,
+does not have them, and its commits call no hook.
 [Test hooks](../internals/testing.md#test-hooks) describes what each does.
 
 The tests turn it on themselves:

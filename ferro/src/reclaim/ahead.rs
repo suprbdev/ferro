@@ -209,7 +209,7 @@ impl Ahead {
                 bytes.truncate(from);
                 break;
             };
-            let decoded = Entry::decode(&mut Decoder::new(&object.body, &object.links, None));
+            let decoded = Entry::decode(&mut Decoder::new(&object.body, &object.links));
             let Ok(entry) = decoded else {
                 break;
             };
@@ -291,7 +291,7 @@ fn find(source: &Store, chain: &Chain, version: u64) -> Option<Ptr> {
             return None;
         }
         let (object, _) = source.read_record(ptr).ok()?;
-        let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links, None)).ok()?;
+        let entry = Entry::decode(&mut Decoder::new(&object.body, &object.links)).ok()?;
         let at = entry.commit.version;
         if at == version {
             return Some(ptr);

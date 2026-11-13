@@ -94,7 +94,8 @@ use std::vec;
 
 use crate::codec::{
     Claim, Data, Decoder, Description, Encoder, Hash, HashSink, Kind, MAX_DEPTH, Moved, Moves,
-    Object, Pairing, Ptr, Shape, Sink, Staged, Tabled, hash_parts, holds_tables, try_hash_of,
+    Object, Pairing, Ptr, Sealed, Shape, Sink, Staged, Tabled, hash_parts, holds_tables,
+    try_hash_of,
 };
 use crate::epoch::{self, Guard, HAZARDS, Hazards, ROOT, STORE};
 use crate::error::{Error, Result};
@@ -2533,7 +2534,7 @@ fn read_slot<V: Data, S>(store: Option<&Store>, slot: &Slot<V, S>) -> Result<Val
 }
 
 fn verify<T: Data>(encoder: &Encoder<'_>, mark: (usize, usize), store: &Store) -> Result<T> {
-    let mut decoder = Decoder::new(
+    let mut decoder = Decoder::with_store(
         &encoder.bytes()[mark.0..],
         &encoder.links()[mark.1..],
         Some(store),
@@ -2546,6 +2547,12 @@ struct Probe(u64);
 impl Sink for Probe {
     fn put(&mut self, _object: Object, _hash: Hash) -> Result<Ptr> {
         Err(Error::Detached)
+    }
+}
+
+impl Sealed for Probe {
+    fn put_staged(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+        self.put(staged.object()?, hash)
     }
 
     fn check_link(&self, _ptr: Ptr) -> Result<()> {
@@ -2773,7 +2780,7 @@ fn prepare<K: Data, V: Data, S: Summary<K, V>>(
     let cached = match &store {
         None => None,
         Some(store) if unsettled || decoding => {
-            let mut decoder = Decoder::new(&object.body, &object.links, Some(store));
+            let mut decoder = Decoder::with_store(&object.body, &object.links, Some(store));
             let mut decoded = Node::<K, V, S>::decode(&mut decoder, Ptr { hash, offset: 0 })?;
             if branching && !unsettled {
                 decoded.children = stored;
@@ -3095,7 +3102,11 @@ fn seal<'a, K: Data, V: Data, S: Summary<K, V>>(
             value.encode(&mut spill)?;
             let object = spill.into_object();
             if let (true, Some(store)) = (node.is_fresh(index), &stager.store) {
-                V::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
+                V::decode(&mut Decoder::with_store(
+                    &object.body,
+                    &object.links,
+                    Some(store),
+                ))?;
             }
             let placed = arena.place(&object, stager.pack);
             encoder.u8(1);
@@ -3424,7 +3435,7 @@ fn decoded<K: Data, V: Data, S: Data>(
     } else {
         payload
     };
-    let mut decoder = Decoder::new(body, &arena.links[placed.links.clone()], Some(store));
+    let mut decoder = Decoder::with_store(body, &arena.links[placed.links.clone()], Some(store));
     let node = Node::<K, V, S>::decode(&mut decoder, deferred.ptr)?;
     if below.len() > 1 && depth + 1 >= PIN_DEPTH {
         for (position, child) in below {
@@ -7609,7 +7620,7 @@ impl Bare {
     fn value<V: Data>(&self, store: &Store) -> Result<V> {
         match self {
             Bare::Inline(object, bytes, links) => {
-                let mut r = Decoder::new(
+                let mut r = Decoder::with_store(
                     &object.body[bytes.clone()],
                     &object.links[links.clone()],
                     Some(store),
@@ -7656,7 +7667,7 @@ enum Bared<K> {
 fn bare<K: Data, V: Data, S: Data>(store: &Store, ptr: Ptr) -> Result<Vec<Bared<K>>> {
     let (object, charged) = store.read_fresh(ptr)?;
     let object = Arc::new(object);
-    let mut r = Decoder::new(&object.body, &object.links, Some(store));
+    let mut r = Decoder::with_store(&object.body, &object.links, Some(store));
     r.u8()?;
     let n = r.varint()? as usize;
     if n > r.remaining() {
@@ -8331,8 +8342,8 @@ fn pair_values<V: Data>(pairing: &mut Pairing<'_>, before: &Bare, after: &Bare) 
     let store = pairing.store();
     let (old, old_bytes, old_links, old_charged) = before.object(store)?;
     let (new, new_bytes, new_links, new_charged) = after.object(store)?;
-    let mut old = Decoder::new(&old.body[old_bytes], &old.links[old_links], Some(store));
-    let mut new = Decoder::new(&new.body[new_bytes], &new.links[new_links], Some(store));
+    let mut old = Decoder::with_store(&old.body[old_bytes], &old.links[old_links], Some(store));
+    let mut new = Decoder::with_store(&new.body[new_bytes], &new.links[new_links], Some(store));
     V::pair(&mut old, &mut new, pairing)?;
     for (charged, read) in [(old_charged, &old), (new_charged, &new)] {
         if charged {

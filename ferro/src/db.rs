@@ -2000,7 +2000,7 @@ fn write_decoded<D: Data>(value: &D, txn: &mut Txn, store: &Store) -> Result<(Pt
     let mut encoder = Encoder::new(txn);
     value.encode(&mut encoder)?;
     let object = encoder.into_object();
-    let mut decoder = Decoder::new(&object.body, &object.links, Some(store));
+    let mut decoder = Decoder::with_store(&object.body, &object.links, Some(store));
     let decoded = D::decode(&mut decoder)?;
     let hash = object.hash();
     Ok((txn.put(object, hash)?, decoded))
@@ -2013,7 +2013,7 @@ fn decode_moved<T: Data>(object: &Object, settling: &Settling, store: &Store) ->
     let links = links
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| Error::Corrupt("a drafted root links a record its frame lost".into()))?;
-    T::decode(&mut Decoder::new(&object.body, &links, Some(store)))
+    T::decode(&mut Decoder::with_store(&object.body, &links, Some(store)))
 }
 
 type Placed<T> = (u64, u64, Option<Unsettled<T>>);
@@ -2073,7 +2073,11 @@ fn write_draft<T: Data>(working: &T, store: Store) -> Result<Draft<T>> {
     let mut encoder = Encoder::new(&mut txn);
     working.encode(&mut encoder)?;
     let object = encoder.into_object();
-    let value = T::decode(&mut Decoder::new(&object.body, &object.links, Some(&store)))?;
+    let value = T::decode(&mut Decoder::with_store(
+        &object.body,
+        &object.links,
+        Some(&store),
+    ))?;
     let root = txn.put_ref(&object, object.hash())?;
     Ok(Draft {
         txn,

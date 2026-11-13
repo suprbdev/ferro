@@ -914,7 +914,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///     let mut encoder = Encoder::new(&mut sink);
 ///     value.encode(&mut encoder).unwrap();
 ///     let body = encoder.into_object().body;
-///     B::decode(&mut Decoder::new(&body, &[], None)).unwrap()
+///     B::decode(&mut Decoder::new(&body, &[])).unwrap()
 /// }
 ///
 /// #[derive(Data, Clone)]

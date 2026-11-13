@@ -290,7 +290,7 @@ fn main() {
     for _ in 0..9 {
         let began = Instant::now();
         for _ in 0..decodes {
-            let mut decoder = Decoder::new(&object.body, &object.links, None);
+            let mut decoder = Decoder::new(&object.body, &object.links);
             std::hint::black_box(Hotels::decode(&mut decoder).unwrap());
         }
         samples.push(began.elapsed().as_nanos() as u64 * 1000 / u64::from(decodes));

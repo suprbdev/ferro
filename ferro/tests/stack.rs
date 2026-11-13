@@ -252,20 +252,20 @@ fn memory() {
     let deep = {
         let chain = chain.clone();
         parked_threads(THREADS, 2 << 20, move || {
-            drop(Hand::decode(&mut Decoder::new(&chain, &[], None)).unwrap())
+            drop(Hand::decode(&mut Decoder::new(&chain, &[])).unwrap())
         })
     };
     let heavy = Arc::new(heavy_chain(MAX_DEPTH - 1));
     let heavier = {
         let heavy = heavy.clone();
         parked_threads(THREADS, 2 << 20, move || {
-            drop(Heavy::decode(&mut Decoder::new(&heavy, &[], None)).unwrap())
+            drop(Heavy::decode(&mut Decoder::new(&heavy, &[])).unwrap())
         })
     };
     let used = {
         let heavy = heavy.clone();
         parked_threads(THREADS, 64 << 20, move || {
-            drop(Heavy::decode(&mut Decoder::new(&heavy, &[], None)).unwrap())
+            drop(Heavy::decode(&mut Decoder::new(&heavy, &[])).unwrap())
         })
     };
     let per = |(rss, thp): (u64, u64)| (rss / THREADS as u64, thp / THREADS as u64);
@@ -302,7 +302,7 @@ struct Late;
 impl Drop for Late {
     fn drop(&mut self) {
         let chain = hand_chain(MAX_DEPTH);
-        let read = Hand::decode(&mut Decoder::new(&chain, &[], None)).map(drop);
+        let read = Hand::decode(&mut Decoder::new(&chain, &[])).map(drop);
         println!("decode in a thread-local destructor: {read:?}");
     }
 }
@@ -315,7 +315,7 @@ fn tls_destructor(late_first: bool) {
             if late_first {
                 LATE.with(|_| {});
             }
-            Hand::decode(&mut Decoder::new(&chain, &[], None)).unwrap();
+            Hand::decode(&mut Decoder::new(&chain, &[])).unwrap();
             if !late_first {
                 LATE.with(|_| {});
             }
@@ -338,7 +338,7 @@ fn reentrant_commits() {
                     .update(|value| {
                         inner
                             .update(|value| {
-                                Hand::decode(&mut Decoder::new(&chain, &[], None)).unwrap();
+                                Hand::decode(&mut Decoder::new(&chain, &[])).unwrap();
                                 *value += 1
                             })
                             .unwrap();
@@ -362,7 +362,7 @@ fn reentrant_commits() {
             }
             let over = hand_chain(MAX_DEPTH + 1);
             assert!(matches!(
-                Hand::decode(&mut Decoder::new(&over, &[], None)),
+                Hand::decode(&mut Decoder::new(&over, &[])),
                 Err(Error::Decode(_))
             ));
         })
@@ -455,5 +455,5 @@ fn commits_nest_and_panics_cross_the_segments() {
 #[test]
 fn a_shallow_box_decodes() {
     let bytes = hand_chain(1);
-    assert!(Hand::decode(&mut Decoder::new(&bytes, &[], None)).is_ok());
+    assert!(Hand::decode(&mut Decoder::new(&bytes, &[])).is_ok());
 }

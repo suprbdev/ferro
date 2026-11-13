@@ -605,10 +605,10 @@ fn over_and_at_the_limit<S: Shape>() {
         Err(Error::TooDeep)
     ));
     let over = forged::<S>(most + 1);
-    let decoded = S::decode(&mut Decoder::new(&over, &[], None)).map(drop);
+    let decoded = S::decode(&mut Decoder::new(&over, &[])).map(drop);
     assert!(matches!(decoded, Err(Error::Decode(_))), "{}", S::NAME);
     assert!(matches!(
-        S::visit(&mut Decoder::new(&over, &[], None)),
+        S::visit(&mut Decoder::new(&over, &[])),
         Err(Error::Decode(_))
     ));
 
@@ -993,15 +993,15 @@ fn hand_written() {
     let bytes = hand_chain(HOSTILE);
     on_small_stack(move || {
         assert!(matches!(
-            Hand::decode(&mut Decoder::new(&bytes, &[], None)),
+            Hand::decode(&mut Decoder::new(&bytes, &[])),
             Err(Error::Decode(_))
         ));
         assert!(matches!(
-            Through::decode(&mut Decoder::new(&bytes, &[], None)),
+            Through::decode(&mut Decoder::new(&bytes, &[])),
             Err(Error::Decode(_))
         ));
         assert!(matches!(
-            Through::visit(&mut Decoder::new(&bytes, &[], None)),
+            Through::visit(&mut Decoder::new(&bytes, &[])),
             Err(Error::Decode(_))
         ));
     });
@@ -1013,13 +1013,13 @@ fn at_the_limit_on_a_tiny_stack<S: Shape>() {
         let value = S::chain(most, None);
         let bytes = encoded(&value);
         assert_eq!(bytes, forged::<S>(most), "{}", S::NAME);
-        let decoded = S::decode(&mut Decoder::new(&bytes, &[], None)).unwrap();
+        let decoded = S::decode(&mut Decoder::new(&bytes, &[])).unwrap();
         assert!(decoded.same_encoding(&value), "{}", S::NAME);
         assert_eq!(encoded(&decoded), bytes, "{}", S::NAME);
-        S::visit(&mut Decoder::new(&bytes, &[], None)).unwrap();
+        S::visit(&mut Decoder::new(&bytes, &[])).unwrap();
         let over = forged::<S>(most + 1);
         assert!(matches!(
-            S::decode(&mut Decoder::new(&over, &[], None)),
+            S::decode(&mut Decoder::new(&over, &[])),
             Err(Error::Decode(_))
         ));
     });
@@ -1034,9 +1034,9 @@ fn tiny_stacks() {
     at_the_limit_on_a_tiny_stack::<Wide>();
     let at = hand_chain(MAX_DEPTH);
     on_stack(TINY_STACK, move || {
-        let value = Hand::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+        let value = Hand::decode(&mut Decoder::new(&at, &[])).unwrap();
         assert_eq!(encoded(&value), at);
-        let again = Hand::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+        let again = Hand::decode(&mut Decoder::new(&at, &[])).unwrap();
         assert!(value.same_encoding(&again));
     });
 }
@@ -1077,9 +1077,9 @@ fn bushy_trees() {
         let read = writer.read();
         let bytes = encoded(&*read);
         for _ in 0..4 {
-            let decoded = Tree::decode(&mut Decoder::new(&bytes, &[], None)).unwrap();
+            let decoded = Tree::decode(&mut Decoder::new(&bytes, &[])).unwrap();
             assert!(decoded.same_encoding(&read));
-            Tree::visit(&mut Decoder::new(&bytes, &[], None)).unwrap();
+            Tree::visit(&mut Decoder::new(&bytes, &[])).unwrap();
         }
         writer.verify_typed().unwrap();
         assert!(
@@ -1101,15 +1101,15 @@ fn extreme_hostile() {
     on_stack(TINY_STACK, move || {
         let start = Instant::now();
         for _ in 0..8 {
-            let decoded = Hand::decode(&mut Decoder::new(&chain, &[], None)).map(drop);
+            let decoded = Hand::decode(&mut Decoder::new(&chain, &[])).map(drop);
             match decoded {
                 Err(Error::Decode(message)) => {
                     assert!(message.contains("nests deeper"), "{message}")
                 }
                 other => panic!("expected the chain to be refused, got {other:?}"),
             }
-            assert!(Hand::visit(&mut Decoder::new(&chain, &[], None)).is_err());
-            assert!(Through::visit(&mut Decoder::new(&chain, &[], None)).is_err());
+            assert!(Hand::visit(&mut Decoder::new(&chain, &[])).is_err());
+            assert!(Through::visit(&mut Decoder::new(&chain, &[])).is_err());
         }
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -1165,7 +1165,7 @@ fn deep_panics() {
     on_stack(TINY_STACK, move || {
         for _ in 0..3 {
             let caught = catch_unwind(AssertUnwindSafe(|| {
-                Fuse::decode(&mut Decoder::new(&fused, &[], None)).map(drop)
+                Fuse::decode(&mut Decoder::new(&fused, &[])).map(drop)
             }));
             let payload = caught.expect_err("the decode should have panicked");
             assert_eq!(
@@ -1174,7 +1174,7 @@ fn deep_panics() {
             );
         }
         let at = hand_chain(MAX_DEPTH);
-        let value = Hand::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+        let value = Hand::decode(&mut Decoder::new(&at, &[])).unwrap();
         assert_eq!(encoded(&value), at);
     });
 }
@@ -1182,19 +1182,19 @@ fn deep_panics() {
 #[test]
 fn hand_written_and_transparent_types_count_their_levels() {
     let at = hand_chain(MAX_DEPTH);
-    assert!(Hand::decode(&mut Decoder::new(&at, &[], None)).is_ok());
-    assert!(Through::decode(&mut Decoder::new(&at, &[], None)).is_ok());
+    assert!(Hand::decode(&mut Decoder::new(&at, &[])).is_ok());
+    assert!(Through::decode(&mut Decoder::new(&at, &[])).is_ok());
     let over = hand_chain(MAX_DEPTH + 1);
-    assert!(Hand::decode(&mut Decoder::new(&over, &[], None)).is_err());
-    assert!(Through::decode(&mut Decoder::new(&over, &[], None)).is_err());
-    let value = Through::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+    assert!(Hand::decode(&mut Decoder::new(&over, &[])).is_err());
+    assert!(Through::decode(&mut Decoder::new(&over, &[])).is_err());
+    let value = Through::decode(&mut Decoder::new(&at, &[])).unwrap();
     assert_eq!(encoded(&value), at);
     let deeper = Through(Some(Box::new(value)));
     assert!(matches!(
         ferro::codec::try_hash_of(&deeper),
         Err(Error::TooDeep)
     ));
-    let value = Hand::decode(&mut Decoder::new(&at, &[], None)).unwrap();
+    let value = Hand::decode(&mut Decoder::new(&at, &[])).unwrap();
     assert_eq!(encoded(&value), at);
     let deeper = Hand(Some(Box::new(value)));
     assert!(matches!(

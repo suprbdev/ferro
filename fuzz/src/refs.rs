@@ -116,7 +116,7 @@ fn parse_step(store: &Store, ptr: Ptr) -> Option<(Ptr, Vec<u8>, Head)> {
     if lone_varint(&object.body) {
         return None;
     }
-    let mut r = Decoder::new(&object.body, &object.links, Some(store));
+    let mut r = Decoder::in_store(&object.body, &object.links, store);
     if r.u8().ok()? != STEP {
         return None;
     }

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sink, Staged};
+use crate::codec::{Data, Decoder, Encoder, Hash, Object, Ptr, Sealed, Sink, Staged};
 use crate::db::{Head, Refs};
 use crate::error::{Error, Result};
 use crate::log::{Chain, Closures, Entry, skip_version};
@@ -497,7 +497,7 @@ struct Rungs {
 
 impl Rungs {
     fn of(body: &[u8], links: &[Ptr]) -> Result<Rungs> {
-        let entry = Entry::decode(&mut Decoder::new(body, links, None))?;
+        let entry = Entry::decode(&mut Decoder::new(body, links))?;
         Ok(Rungs::from_entry(&entry))
     }
 
@@ -1191,6 +1191,12 @@ impl Sink for CopySink<'_> {
         let packed = compressed(&object.body);
         let staged = staged(&object.body, packed.as_deref(), &links);
         self.emit(Ptr { hash, offset: 0 }, staged, None)
+    }
+}
+
+impl Sealed for CopySink<'_> {
+    fn put_staged(&mut self, hash: Hash, staged: Staged<'_>) -> Result<Ptr> {
+        self.put(staged.object()?, hash)
     }
 
     fn store_id(&self) -> u64 {

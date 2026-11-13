@@ -604,7 +604,7 @@ impl Closures {
 }
 
 fn decode(object: &Object) -> Result<Entry> {
-    Entry::decode(&mut Decoder::new(&object.body, &object.links, None))
+    Entry::decode(&mut Decoder::new(&object.body, &object.links))
 }
 
 /// An entry a walk has passed, waiting for the walk to read the one its `prev` link reaches.

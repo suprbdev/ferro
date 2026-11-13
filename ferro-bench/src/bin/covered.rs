@@ -258,7 +258,7 @@ impl<B: Bank> Subject for Opened<B> {
         for _ in 0..rounds {
             let started = Instant::now();
             for _ in 0..DECODES {
-                let mut decoder = Decoder::new(&object.body, &object.links, None);
+                let mut decoder = Decoder::new(&object.body, &object.links);
                 std::hint::black_box(B::decode(&mut decoder).unwrap());
             }
             samples.push(started.elapsed().as_nanos() as f64 / f64::from(DECODES));

@@ -53,7 +53,7 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::codec::{
     ARC_HEADER, Cached, Decoder, HASH_BYTES, Hash, HashBatch, Hashing, Moved, Moves, Object, Ptr,
-    Relocate, Sink, Staged, hash_filled, hash_parts, push_varint,
+    Relocate, Sealed, Sink, Staged, hash_filled, hash_parts, push_varint,
 };
 use crate::dense::{Ascending, Column};
 use crate::error::{Error, Result};
@@ -5175,7 +5175,7 @@ impl Store {
             if body.len() >= SPILL_BYTES && !self.inner.options.read_only {
                 self.inner.dedupe.insert(ptr.hash, ptr.offset);
             }
-            let mut decoder = Decoder::new(body, links, Some(self));
+            let mut decoder = Decoder::with_store(body, links, Some(self));
             let value = decode(&mut decoder)?;
             if charged {
                 self.count_zero_width(decoder.zero_width())?;
@@ -5328,7 +5328,7 @@ impl Store {
         decode: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
     ) -> Result<T> {
         let decoded = |body: &[u8], links: &[Ptr], charged: bool| {
-            let mut decoder = Decoder::new(body, links, Some(self));
+            let mut decoder = Decoder::with_store(body, links, Some(self));
             let value = decode(&mut decoder)?;
             if charged {
                 self.count_zero_width(decoder.zero_width())?;
@@ -5805,6 +5805,12 @@ impl Drop for Txn {
 }
 
 impl Sink for Txn {
+    fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
+        self.put_ref(&object, hash)
+    }
+}
+
+impl Sealed for Txn {
     fn check_link(&self, ptr: Ptr) -> Result<()> {
         if self.seen.get(&ptr.hash).map(|offset| self.moved(*offset)) == Some(ptr.offset) {
             return Ok(());
@@ -5814,10 +5820,6 @@ impl Sink for Txn {
             Err(Error::Corrupt(_)) => Err(Error::StalePointer(ptr.offset)),
             Err(error) => Err(error),
         }
-    }
-
-    fn put(&mut self, object: Object, hash: Hash) -> Result<Ptr> {
-        self.put_ref(&object, hash)
     }
 
     fn packs(&self) -> bool {

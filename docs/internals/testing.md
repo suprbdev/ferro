@@ -787,6 +787,12 @@ a build with its `testing` cargo feature has, as
   of changes.
 - The `store` module, public only with the feature, opens a `Store` and writes `Txn`s outside a
   database, and `admin::layout` lists where the records a compaction would copy lie in a file.
+- `Decoder::in_store` decodes an object with the store it was read from behind it, so that the
+  collections in it can read their nodes, as the `refs` fuzz target does with the heads it reads.
+  `Encoder::sink` hands out an encoder's sink and `Encoder::mark_unsettled` marks what it wrote as
+  not yet in the file, for a hand-written `Data` impl in a test that writes another value's
+  encoding, as `index_agreement` splices one table's indexes onto another's rows. Without the
+  feature those two are private to the crate, whose collections call them as they encode.
 
 Without the feature none of these exist. `Options` and a database's shared state hold an empty
 `Hooks`, whose step is an empty function and whose clock is the system's, and the store's file

@@ -21,6 +21,12 @@ says so under **Format**, and a build refuses a file of another format with `Err
 - **Breaking:** the test hooks are behind a new `testing` cargo feature: `Options::hook`, `clock`,
   `trace` and `follow_polling`, `Db::trace_op`, `db::Hook` and `db::Clock`, the `store` module and
   `admin::layout`. A build without it does not have them, and its commits call no hook.
+- **Breaking:** `codec` offers only what a hand-written `Data` impl needs. `Decoder::new` takes the
+  body and links alone, with no store. `Sink` is sealed and has only `put`, and `HashSink` is the
+  sink to encode into. `Sink`'s `packs`, `put_staged`, `prefetch`, `check_link`, `remember`,
+  `store_id` and `store`, `Decoder::store`, `Encoder::reusing`, `into_buf`, `is_unsettled` and
+  `store_id`, and `Staged` are gone from the API. `Encoder::sink` and `mark_unsettled` need the
+  `testing` feature, which also adds `Decoder::in_store` to decode with a store behind it.
 
 ## [0.1.0] - 2026-11-13
 

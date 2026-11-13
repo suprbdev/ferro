@@ -723,7 +723,11 @@ fn agree<'p, T: Record>(
     strict: bool,
 ) -> Result<()> {
     let read = |found: &FoundTable| {
-        T::Table::decode_stored(&mut Decoder::new(&found.body, &found.links, Some(store)))
+        T::Table::decode_stored(&mut Decoder::with_store(
+            &found.body,
+            &found.links,
+            Some(store),
+        ))
     };
     let Stored {
         table,
@@ -6334,8 +6338,8 @@ mod tests {
     fn paired<D: Data>(store: &Store, old: &Object, new: &Object) -> Result<Paired> {
         let mut pairing = Pairing::new(store, true);
         D::pair(
-            &mut Decoder::new(&old.body, &old.links, Some(store)),
-            &mut Decoder::new(&new.body, &new.links, Some(store)),
+            &mut Decoder::with_store(&old.body, &old.links, Some(store)),
+            &mut Decoder::with_store(&new.body, &new.links, Some(store)),
             &mut pairing,
         )?;
         pairing.settle()?;
@@ -6368,12 +6372,11 @@ mod tests {
         let (none, half, over) = (wides(0), wides(1 << 23), wides(1 << 24));
         assert!(wide(Wides::visit(&mut Decoder::new(
             &over.body,
-            &over.links,
-            None
+            &over.links
         ))));
         assert!(wide(paired::<Wides>(&store, &none, &over).map(drop)));
         assert!(wide(paired::<Wides>(&store, &over, &none).map(drop)));
-        Wides::visit(&mut Decoder::new(&half.body, &half.links, None)).unwrap();
+        Wides::visit(&mut Decoder::new(&half.body, &half.links)).unwrap();
         paired::<Wides>(&store, &none, &half).unwrap();
     }
 

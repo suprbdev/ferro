@@ -170,8 +170,11 @@ pub(crate) fn write_step(
     let head = match head.merged.is_empty() {
         true => head,
         false => {
-            let decoded =
-                Root::decode(&mut Decoder::new(&object.body, &object.links, Some(store)))?;
+            let decoded = Root::decode(&mut Decoder::with_store(
+                &object.body,
+                &object.links,
+                Some(store),
+            ))?;
             let Root::Step(step) = decoded else {
                 return Err(Error::Corrupt(
                     "a branch table step decoded as a table".into(),

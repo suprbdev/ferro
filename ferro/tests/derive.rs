@@ -14,7 +14,7 @@ fn bytes<T: Data>(value: &T) -> Vec<u8> {
 
 fn roundtrip<T: Data + PartialEq + std::fmt::Debug>(value: T) {
     let body = bytes(&value);
-    let mut decoder = Decoder::new(&body, &[], None);
+    let mut decoder = Decoder::new(&body, &[]);
     let back = T::decode(&mut decoder).unwrap();
     assert_eq!(back, value);
     assert_eq!(decoder.remaining(), 0);
@@ -151,7 +151,7 @@ fn transparent_newtypes_encode_as_their_field() {
         HoldsBlob { kept: 7 }.encode(&mut w).unwrap();
         encoded.extend_from_slice(w.bytes());
     }
-    let mut r = Decoder::new(&encoded, &[], None);
+    let mut r = Decoder::new(&encoded, &[]);
     let grown = GrewBlob::decode(&mut r).unwrap();
     assert_eq!(grown.kept, 7);
     assert_eq!(grown.blob, Blob::default());
@@ -189,7 +189,7 @@ fn enums() {
     roundtrip(Shape::Circle(1.5));
     roundtrip(Shape::Pair(3, "p".into()));
     roundtrip(Shape::Rect { w: 2, h: 3 });
-    let mut decoder = Decoder::new(&[0xff, 0xff, 0], &[], None);
+    let mut decoder = Decoder::new(&[0xff, 0xff, 0], &[]);
     assert!(matches!(
         Shape::decode(&mut decoder),
         Err(ferro::Error::Decode(_))
@@ -215,14 +215,14 @@ fn generics() {
 fn rename_keeps_old_tag() {
     assert_eq!(bytes(&Renamed { new: 5 }), bytes(&Old { old: 5 }));
     let body = bytes(&Old { old: 42 });
-    let mut decoder = Decoder::new(&body, &[], None);
+    let mut decoder = Decoder::new(&body, &[]);
     assert_eq!(Renamed::decode(&mut decoder).unwrap(), Renamed { new: 42 });
 }
 
 #[test]
 fn default_and_skip() {
     let body = bytes(&JustA { a: 1 });
-    let mut decoder = Decoder::new(&body, &[], None);
+    let mut decoder = Decoder::new(&body, &[]);
     let decoded = Defaults::decode(&mut decoder).unwrap();
     assert_eq!(
         decoded,
@@ -240,7 +240,7 @@ fn default_and_skip() {
         d: 100,
     };
     let body = bytes(&full);
-    let mut decoder = Decoder::new(&body, &[], None);
+    let mut decoder = Decoder::new(&body, &[]);
     let back = Defaults::decode(&mut decoder).unwrap();
     assert_eq!(back, Defaults { d: 0, ..full });
     assert_eq!(
@@ -256,7 +256,7 @@ fn default_and_skip() {
 #[test]
 fn missing_required_field_errors() {
     let body = bytes(&Unit);
-    let mut decoder = Decoder::new(&body, &[], None);
+    let mut decoder = Decoder::new(&body, &[]);
     assert!(matches!(
         JustA::decode(&mut decoder),
         Err(ferro::Error::MissingField("a"))
@@ -570,7 +570,7 @@ enum Taxed {
 
 fn reread<A: Data, B: Data>(value: &A) -> ferro::Result<B> {
     let body = bytes(value);
-    B::decode(&mut Decoder::new(&body, &[], None))
+    B::decode(&mut Decoder::new(&body, &[]))
 }
 
 #[test]
@@ -683,12 +683,12 @@ fn field_record(out: &mut Vec<u8>, tag: u16, value: &[u8]) {
 }
 
 fn refused_as<T: Data + std::fmt::Debug>(stored: &[u8]) {
-    let decoded = T::decode(&mut Decoder::new(stored, &[], None));
+    let decoded = T::decode(&mut Decoder::new(stored, &[]));
     assert!(
         matches!(decoded, Err(ferro::Error::Decode(_))),
         "{stored:02x?} decoded as {decoded:?}"
     );
-    let visited = T::visit(&mut Decoder::new(stored, &[], None));
+    let visited = T::visit(&mut Decoder::new(stored, &[]));
     assert!(
         matches!(visited, Err(ferro::Error::Decode(_))),
         "{stored:02x?} passed a visit"
@@ -732,10 +732,10 @@ fn fields_stored_out_of_order_twice_or_with_bytes_left_over_are_refused() {
     field_record(&mut unknown, x + 1, &[0xEE, 0xEE]);
     field_record(&mut unknown, y, &[2]);
     assert_eq!(
-        Point::decode(&mut Decoder::new(&unknown, &[], None)).unwrap(),
+        Point::decode(&mut Decoder::new(&unknown, &[])).unwrap(),
         Point { x: 1, y: 2 }
     );
-    Point::visit(&mut Decoder::new(&unknown, &[], None)).unwrap();
+    Point::visit(&mut Decoder::new(&unknown, &[])).unwrap();
 }
 
 #[derive(Data, Clone, Debug, PartialEq)]
@@ -811,7 +811,7 @@ fn every_documented_evolution_step_still_reads_old_data() {
         tag: 300,
     };
     let stored = bytes(&old);
-    Post2::visit(&mut Decoder::new(&stored, &[], None)).unwrap();
+    Post2::visit(&mut Decoder::new(&stored, &[])).unwrap();
     let new: Post2 = reread(&old).unwrap();
     assert_eq!(new.kind, Kind2::Fancy { extra: 0, level: 3 });
     assert_eq!(new.heading, "hello");
@@ -826,7 +826,7 @@ fn every_documented_evolution_step_still_reads_old_data() {
     assert_eq!((new.count, new.lucky, new.cached), (0, 7, 0));
     for kind in [Kind1::Plain, Kind1::Fancy { level: 1 }] {
         let stored = bytes(&kind);
-        Kind2::visit(&mut Decoder::new(&stored, &[], None)).unwrap();
+        Kind2::visit(&mut Decoder::new(&stored, &[])).unwrap();
         reread::<_, Kind2>(&kind).unwrap();
     }
     assert!(matches!(
@@ -834,7 +834,7 @@ fn every_documented_evolution_step_still_reads_old_data() {
         Err(ferro::Error::Decode(_))
     ));
     let again = bytes(&new);
-    let back = Post2::decode(&mut Decoder::new(&again, &[], None)).unwrap();
+    let back = Post2::decode(&mut Decoder::new(&again, &[])).unwrap();
     assert_eq!(bytes(&back), again);
 }
 
