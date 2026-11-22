@@ -496,7 +496,7 @@ const FINGERPRINT_BYTES: usize = 8;
 /// the stored names and types of the fields it is keyed on and of the fields it stores, and the
 /// defaults of those fields. A stored index whose fingerprint differs from the struct's is rebuilt
 /// from the rows when the table is read, as
-/// [the schema evolution guide](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+/// [the schema evolution guide](https://github.com/suprbdev/ferro/blob/main/docs/guide/schema-evolution.md)
 /// describes.
 pub fn index_fingerprint(describe: impl FnOnce(&mut Description)) -> u64 {
     let mut d = Description::new();

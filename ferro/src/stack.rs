@@ -34,7 +34,7 @@
 //! known and there are no segments, as on the BSDs and under Miri, nothing is checked, and
 //! [`CHECKED`] keeps the limit at 128 levels there.
 //!
-//! [Nesting depth](https://github.com/archlemon/ferro/blob/main/docs/internals/storage.md#nesting-depth)
+//! [Nesting depth](https://github.com/suprbdev/ferro/blob/main/docs/internals/storage.md#nesting-depth)
 //! describes what each level takes.
 
 use std::cell::Cell;

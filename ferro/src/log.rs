@@ -4,7 +4,7 @@
 //! the entry before it, to one further back so that any version is a few steps away, and for a
 //! merge to the head it merged. [`Log`] is the public view of one branch's retained entries, which
 //! [`Db::log`](crate::Db::log) returns.
-//! [History and the commit log](https://github.com/archlemon/ferro/blob/main/docs/internals/history.md)
+//! [History and the commit log](https://github.com/suprbdev/ferro/blob/main/docs/internals/history.md)
 //! describes the chain.
 
 use std::cmp::Reverse;

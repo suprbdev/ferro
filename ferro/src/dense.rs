@@ -5,7 +5,7 @@
 //! a few dozen bytes rather than a map entry per fact. [`Ascending`] keeps offsets that only grow in
 //! about four bytes each and finds an offset's position without a table, and [`Marked`] keeps a set
 //! of a file's objects by their offsets, finding each by its hash without holding it.
-//! [The sync internals](https://github.com/archlemon/ferro/blob/main/docs/internals/sync.md) have
+//! [The sync internals](https://github.com/suprbdev/ferro/blob/main/docs/internals/sync.md) have
 //! the sizes.
 
 use hashbrown::HashTable;

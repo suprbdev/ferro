@@ -7,7 +7,7 @@
 //! cycles that [`Options::history`](crate::Options::history) starts, and
 //! [`admin::compact`](crate::admin::compact) share the copy. [`Reclaim`] says when background
 //! cycles run, [`Space`] reports how they have gone, and [`Compacted`] reports one cycle.
-//! [Reclamation](https://github.com/archlemon/ferro/blob/main/docs/internals/reclamation.md)
+//! [Reclamation](https://github.com/suprbdev/ferro/blob/main/docs/internals/reclamation.md)
 //! describes cycles, generations and crashes.
 
 use std::cell::RefCell;

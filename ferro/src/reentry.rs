@@ -6,7 +6,7 @@
 //! hanging. A thread that writes into one file while it holds locks in another records the
 //! crossing, so that two threads crossing between the same files in opposite directions are
 //! refused as well.
-//! [Writes from inside a closure](https://github.com/archlemon/ferro/blob/main/docs/internals/reentrancy.md)
+//! [Writes from inside a closure](https://github.com/suprbdev/ferro/blob/main/docs/internals/reentrancy.md)
 //! describes the rules.
 
 use std::cell::RefCell;

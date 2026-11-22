@@ -53,24 +53,24 @@
 //!
 //! The guides in the repository's `docs` directory are the long form:
 //!
-//! - [Getting started](https://github.com/archlemon/ferro/blob/main/docs/guide/getting-started.md):
+//! - [Getting started](https://github.com/suprbdev/ferro/blob/main/docs/guide/getting-started.md):
 //!   a first database, reading, writing and [`Options`].
-//! - [Collections](https://github.com/archlemon/ferro/blob/main/docs/guide/collections.md) and
-//!   [Tables and indexes](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md): what
+//! - [Collections](https://github.com/suprbdev/ferro/blob/main/docs/guide/collections.md) and
+//!   [Tables and indexes](https://github.com/suprbdev/ferro/blob/main/docs/guide/tables.md): what
 //!   goes inside your type.
-//! - [History, versions and branches](https://github.com/archlemon/ferro/blob/main/docs/guide/history.md)
-//!   and [Merging](https://github.com/archlemon/ferro/blob/main/docs/guide/merging.md).
-//! - [Watchers](https://github.com/archlemon/ferro/blob/main/docs/guide/watchers.md) and
-//!   [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
-//! - [Durability and crash safety](https://github.com/archlemon/ferro/blob/main/docs/guide/durability.md)
+//! - [History, versions and branches](https://github.com/suprbdev/ferro/blob/main/docs/guide/history.md)
+//!   and [Merging](https://github.com/suprbdev/ferro/blob/main/docs/guide/merging.md).
+//! - [Watchers](https://github.com/suprbdev/ferro/blob/main/docs/guide/watchers.md) and
+//!   [Sync between files](https://github.com/suprbdev/ferro/blob/main/docs/guide/sync.md).
+//! - [Durability and crash safety](https://github.com/suprbdev/ferro/blob/main/docs/guide/durability.md)
 //!   and
-//!   [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
-//! - [Writers and concurrency](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md):
+//!   [Retention and reclamation](https://github.com/suprbdev/ferro/blob/main/docs/guide/retention.md).
+//! - [Writers and concurrency](https://github.com/suprbdev/ferro/blob/main/docs/guide/concurrency.md):
 //!   branch locks, awaited writes, coalescing and several processes.
-//! - [Changing your types](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
-//!   and [Limitations](https://github.com/archlemon/ferro/blob/main/docs/guide/limitations.md).
+//! - [Changing your types](https://github.com/suprbdev/ferro/blob/main/docs/guide/schema-evolution.md)
+//!   and [Limitations](https://github.com/suprbdev/ferro/blob/main/docs/guide/limitations.md).
 //!
-//! [The documentation index](https://github.com/archlemon/ferro/blob/main/docs/README.md) lists the
+//! [The documentation index](https://github.com/suprbdev/ferro/blob/main/docs/README.md) lists the
 //! internals, which describe how each part works and what it costs.
 
 #![warn(missing_docs)]

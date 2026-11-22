@@ -1,7 +1,7 @@
 //! Working on a database file by its path, without its types.
 //!
 //! These functions serve tools such as the
-//! [`ferro` tool](https://github.com/archlemon/ferro/blob/main/docs/guide/cli.md) and scripts that
+//! [`ferro` tool](https://github.com/suprbdev/ferro/blob/main/docs/guide/cli.md) and scripts that
 //! inspect a file another program owns. All but [`compact`] open the file read-only, so they run
 //! beside a writer. [`Keep`], which says how much history to retain, is here too.
 
@@ -53,7 +53,7 @@ type ByHash = BuildHasherDefault<Prehashed>;
 /// [`Db::compact`](crate::Db::compact) and [`compact`] apply one for a single cycle. Every form
 /// keeps at least each branch's newest commit. A pruned version is gone, whether or not a cycle has
 /// reclaimed its bytes yet, and version 0 goes when version 1 does. See
-/// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
+/// [Retention and reclamation](https://github.com/suprbdev/ferro/blob/main/docs/guide/retention.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Keep {

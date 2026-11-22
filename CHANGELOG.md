@@ -103,6 +103,6 @@ is one of your own types, persisted in one file, with every commit kept as an im
 Each change is tested on Linux. The tests last ran on Windows on 2026-11-03, before this release,
 and never on macOS. Windows needs NTFS. See [Limitations](docs/guide/limitations.md) for the rest.
 
-[Unreleased]: https://github.com/archlemon/ferro/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/archlemon/ferro/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/archlemon/ferro/releases/tag/v0.1.0
+[Unreleased]: https://github.com/suprbdev/ferro/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/suprbdev/ferro/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/suprbdev/ferro/releases/tag/v0.1.0

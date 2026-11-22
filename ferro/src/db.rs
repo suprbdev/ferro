@@ -69,7 +69,7 @@ pub struct Commit {
     ///
     /// Times never go back along a branch: a commit's time is the later of the clock and a floor
     /// set by the commit before it, as
-    /// [History](https://github.com/archlemon/ferro/blob/main/docs/guide/history.md#reading-old-versions)
+    /// [History](https://github.com/suprbdev/ferro/blob/main/docs/guide/history.md#reading-old-versions)
     /// describes.
     pub time_ms: u64,
     /// The message given to the commit.
@@ -1597,7 +1597,7 @@ impl Hooks {
 ///
 /// [`Options::new`] starts from the defaults that [`Db::open`] uses, each method changes one
 /// setting, and [`Options::open`] or [`Options::open_with`] opens the file.
-/// [Getting started](https://github.com/archlemon/ferro/blob/main/docs/guide/getting-started.md#options)
+/// [Getting started](https://github.com/suprbdev/ferro/blob/main/docs/guide/getting-started.md#options)
 /// lists the defaults in a table.
 ///
 /// # Examples
@@ -1649,7 +1649,7 @@ impl Options {
     /// fsync covering every commit queued meanwhile. [`Durability::Buffered`] skips that sync, so a
     /// power cut can lose recent commits, back to the last checkpoint at worst, but never the whole
     /// file. See
-    /// [Durability and crash safety](https://github.com/archlemon/ferro/blob/main/docs/guide/durability.md).
+    /// [Durability and crash safety](https://github.com/suprbdev/ferro/blob/main/docs/guide/durability.md).
     pub fn durability(mut self, durability: Durability) -> Self {
         self.store.durability = durability;
         self
@@ -1658,7 +1658,7 @@ impl Options {
     /// An approximate bound, in bytes, on the decoded nodes and values the cache holds.
     ///
     /// The default is 1 GiB.
-    /// [Cache weight](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#cache-weight)
+    /// [Cache weight](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-scaling.md#cache-weight)
     /// describes what counts against it.
     pub fn cache_bytes(mut self, bytes: u64) -> Self {
         self.store.cache_bytes = bytes;
@@ -1693,7 +1693,7 @@ impl Options {
     /// at each reclamation cycle. A writer that keeps less than everything also runs
     /// cycles on a background thread, as [`Options::reclaim`] sets, to give the space back. A
     /// pruned version is gone, whether or not a cycle has reclaimed its bytes yet. See
-    /// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
+    /// [Retention and reclamation](https://github.com/suprbdev/ferro/blob/main/docs/guide/retention.md).
     ///
     /// # Examples
     ///
@@ -1747,7 +1747,7 @@ impl Options {
     /// [`Stamp::version`] are the group's, [`Db::at`] cannot show the state between two of them,
     /// and if the group cannot be written every closure in it gets [`Error::GroupFailed`].
     /// [`Db::restore`] and the merges always commit alone. Off by default. See
-    /// [Sharing a version between writers](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#sharing-a-version-between-writers).
+    /// [Sharing a version between writers](https://github.com/suprbdev/ferro/blob/main/docs/guide/concurrency.md#sharing-a-version-between-writers).
     pub fn coalesce(mut self, coalesce: bool) -> Self {
         self.coalesce = coalesce;
         self
@@ -1765,7 +1765,7 @@ impl Options {
     /// It needs open file description locks, so it works on 64-bit Linux only, on one machine and a
     /// local file system. Elsewhere the open fails with an
     /// [`io::ErrorKind::Unsupported`](std::io::ErrorKind::Unsupported) error. See
-    /// [Several processes](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#several-processes).
+    /// [Several processes](https://github.com/suprbdev/ferro/blob/main/docs/guide/concurrency.md#several-processes).
     pub fn shared(mut self, shared: bool) -> Self {
         self.store.shared = shared;
         self
@@ -1804,7 +1804,7 @@ impl Options {
     /// removed or is damaged, changes nothing: reads show what was seen last, the thread looks
     /// again at the next change, and [`Db::following`] reports the error. A shared writer whose
     /// writes failed reports [`Error::Poisoned`] and stops following. See
-    /// [Following other processes](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#following-other-processes).
+    /// [Following other processes](https://github.com/suprbdev/ferro/blob/main/docs/guide/concurrency.md#following-other-processes).
     ///
     /// # Examples
     ///
@@ -4411,7 +4411,7 @@ impl<T: Data> Db<T> {
     /// and swap the new file in. Readers do not wait at all, and snapshots held from before keep
     /// reading the old file. `keep` takes the place of [`Options::history`] for this cycle, and
     /// nothing already pruned comes back. A cycle needs free disk for everything retained. See
-    /// [Retention and reclamation](https://github.com/archlemon/ferro/blob/main/docs/guide/retention.md).
+    /// [Retention and reclamation](https://github.com/suprbdev/ferro/blob/main/docs/guide/retention.md).
     ///
     /// # Errors
     ///
@@ -4486,7 +4486,7 @@ impl<T: Data> Db<T> {
     /// [`Db::verify`], and a match shows that version and everything before it are unchanged. It is
     /// not a signature and says nothing about later commits, other branches or whether the times
     /// were true. See
-    /// [`head_hash` and tamper evidence](https://github.com/archlemon/ferro/blob/main/docs/internals/history.md#head_hash-and-tamper-evidence).
+    /// [`head_hash` and tamper evidence](https://github.com/suprbdev/ferro/blob/main/docs/internals/history.md#head_hash-and-tamper-evidence).
     ///
     /// # Examples
     ///
@@ -4555,7 +4555,7 @@ impl<T: Data> Db<T> {
     ///   dropped.
     /// - [`Error::Reentrant`] from inside a closure on this file, where waiting for this branch's
     ///   writer lock could deadlock, as
-    ///   [Writing from inside a closure](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#writing-from-inside-a-closure)
+    ///   [Writing from inside a closure](https://github.com/suprbdev/ferro/blob/main/docs/guide/concurrency.md#writing-from-inside-a-closure)
     ///   lists.
     /// - [`Error::Poisoned`] after an earlier write or sync failed, and [`Error::GroupFailed`] if
     ///   the coalesced group this closure joined could not be written.
@@ -4817,7 +4817,7 @@ impl<T: Data> Db<T> {
     /// Dropping the future before the closure ran writes nothing. Once the closure has run, the
     /// commit lands as if awaited, and dropping the future gives up only the answer, so whether a
     /// dropped write landed is exactly whether its closure ran. See
-    /// [Awaited writes](https://github.com/archlemon/ferro/blob/main/docs/guide/concurrency.md#awaited-writes).
+    /// [Awaited writes](https://github.com/suprbdev/ferro/blob/main/docs/guide/concurrency.md#awaited-writes).
     ///
     /// # Errors
     ///
@@ -5507,7 +5507,7 @@ impl<T: Data> Db<T> {
     /// merges them into a virtual base, once for each after the first and likewise for their own
     /// bases where those are several, each built once, and what it returns from those runs is
     /// dropped; that is why it is [`FnMut`]. Branches that share no commit merge against version
-    /// 0. See [Merging](https://github.com/archlemon/ferro/blob/main/docs/guide/merging.md).
+    /// 0. See [Merging](https://github.com/suprbdev/ferro/blob/main/docs/guide/merging.md).
     ///
     /// # Errors
     ///
@@ -6079,7 +6079,7 @@ impl<T: Data> Db<T> {
     /// receive that finds a new snapshot already there runs it on the receiving thread. Tests run
     /// under no lock, so a test may read, commit or refresh, but it must not wait for a watcher,
     /// and a slow one delays the branch's other watchers. See
-    /// [Where tests run](https://github.com/archlemon/ferro/blob/main/docs/guide/watchers.md#where-tests-run).
+    /// [Where tests run](https://github.com/suprbdev/ferro/blob/main/docs/guide/watchers.md#where-tests-run).
     ///
     /// # Examples
     ///

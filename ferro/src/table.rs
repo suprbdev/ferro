@@ -139,9 +139,9 @@
 //! others, and [`insert`](Table::insert) or [`update`](Table::update) can panic on a value that
 //! no row holds, as they do on a clash, where `try_insert` returns that clash as a [`Taken`].
 //!
-//! [The tables guide](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md) describes
+//! [The tables guide](https://github.com/suprbdev/ferro/blob/main/docs/guide/tables.md) describes
 //! tables and indexes at more length, and
-//! [the schema and unique index internals](https://github.com/archlemon/ferro/blob/main/docs/internals/schema-and-unique-indexes.md)
+//! [the schema and unique index internals](https://github.com/suprbdev/ferro/blob/main/docs/internals/schema-and-unique-indexes.md)
 //! how they are stored.
 
 use std::any::{TypeId, type_name};
@@ -1408,7 +1408,7 @@ where
 /// It knows its length from the start, and holds the table as it was when it was made, so
 /// changes to the table afterwards do not reach it. Each row comes as a [`Val`], and
 /// [`next_ref`](Iter::next_ref) and [`visit`](Iter::visit) lend it instead, as [Reading rows in
-/// place](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md#reading-rows-in-place)
+/// place](https://github.com/suprbdev/ferro/blob/main/docs/guide/tables.md#reading-rows-in-place)
 /// describes.
 ///
 /// # Panics

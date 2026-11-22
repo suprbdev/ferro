@@ -20,11 +20,11 @@
 //! With [`StoreOptions::shared`], several processes write one file under byte-range locks past its
 //! end.
 //!
-//! [Storage](https://github.com/archlemon/ferro/blob/main/docs/internals/storage.md) describes the
+//! [Storage](https://github.com/suprbdev/ferro/blob/main/docs/internals/storage.md) describes the
 //! format and recovery,
-//! [Writers and the commit path](https://github.com/archlemon/ferro/blob/main/docs/internals/commit-path.md)
+//! [Writers and the commit path](https://github.com/suprbdev/ferro/blob/main/docs/internals/commit-path.md)
 //! how a frame is placed, written and synced, and
-//! [Writers in several processes](https://github.com/archlemon/ferro/blob/main/docs/internals/processes.md)
+//! [Writers in several processes](https://github.com/suprbdev/ferro/blob/main/docs/internals/processes.md)
 //! the locks.
 
 use std::any::Any;
@@ -317,7 +317,7 @@ static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
 /// How a commit reaches the disk.
 ///
 /// [`Options::durability`](crate::Options::durability) sets it, and
-/// [Durability and crash safety](https://github.com/archlemon/ferro/blob/main/docs/guide/durability.md)
+/// [Durability and crash safety](https://github.com/suprbdev/ferro/blob/main/docs/guide/durability.md)
 /// describes what each promises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]

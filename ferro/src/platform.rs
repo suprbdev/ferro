@@ -7,8 +7,8 @@
 //! refused receive staged its records exist only on 64-bit Linux, and [`RANGES`] says whether the
 //! locks do. So does the inotify [`Watch`] that a follower waits on, whose [`Watch::new`] fails
 //! with `Unsupported` elsewhere.
-//! [Windows](https://github.com/archlemon/ferro/blob/main/docs/internals/windows.md) and
-//! [Writers in several processes](https://github.com/archlemon/ferro/blob/main/docs/internals/processes.md)
+//! [Windows](https://github.com/suprbdev/ferro/blob/main/docs/internals/windows.md) and
+//! [Writers in several processes](https://github.com/suprbdev/ferro/blob/main/docs/internals/processes.md)
 //! describe both sides.
 
 #[cfg(unix)]

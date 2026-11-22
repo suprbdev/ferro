@@ -32,9 +32,9 @@
 //! # Ok::<(), ferro::Error>(())
 //! ```
 //!
-//! [Changing your types](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+//! [Changing your types](https://github.com/suprbdev/ferro/blob/main/docs/guide/schema-evolution.md)
 //! has the rules for evolving a stored type, and
-//! [the storage internals](https://github.com/archlemon/ferro/blob/main/docs/internals/storage.md)
+//! [the storage internals](https://github.com/suprbdev/ferro/blob/main/docs/internals/storage.md)
 //! describe objects, hashes and how they are laid out in the file.
 
 use std::any::{Any, TypeId, type_name};
@@ -760,7 +760,7 @@ impl Sealed for HashSink {
 /// thread's 2 MiB stack, but a debug build can take more, and so can a derived `Clone` of a large
 /// struct. A type meant to hold long chains can drop them in a loop, and a deep value can be
 /// cloned on a thread with a larger stack.
-/// [Nesting depth](https://github.com/archlemon/ferro/blob/main/docs/internals/storage.md#nesting-depth)
+/// [Nesting depth](https://github.com/suprbdev/ferro/blob/main/docs/internals/storage.md#nesting-depth)
 /// gives the stack each shape takes.
 ///
 /// # Examples

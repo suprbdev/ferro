@@ -834,7 +834,7 @@ fn expand_data(input: DeriveInput) -> syn::Result<TokenStream2> {
 ///
 /// Do not change the encoding or `Ord` of a type used as a key or an indexed value on existing
 /// data.
-/// [The schema evolution guide](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+/// [The schema evolution guide](https://github.com/suprbdev/ferro/blob/main/docs/guide/schema-evolution.md)
 /// has the rules.
 ///
 /// # Attributes
@@ -2752,7 +2752,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// table. Every write through `Table` keeps every index in step with the rows. With at least one
 /// non-unique index it also generates `{Name}Find`, the view `find()` returns.
 ///
-/// [The tables guide](https://github.com/archlemon/ferro/blob/main/docs/guide/tables.md) describes
+/// [The tables guide](https://github.com/suprbdev/ferro/blob/main/docs/guide/tables.md) describes
 /// tables and indexes at more length, and the docs of `ferro::table` cover `IndexIter`, `Matches`
 /// and the rest of what the lookups return.
 ///
@@ -2786,7 +2786,7 @@ fn expand_record(input: DeriveInput) -> syn::Result<TokenStream2> {
 /// attribute, its cover list, or the stored name, type or default of one of its fields, or a default
 /// nested in its type, rebuilds that index. Turning an `#[index]` into a `#[unique]` fails to open
 /// with `Error::Decode` if two rows share a value.
-/// [The schema evolution guide](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+/// [The schema evolution guide](https://github.com/suprbdev/ferro/blob/main/docs/guide/schema-evolution.md)
 /// lists what rebuilds and what does not.
 ///
 /// # Lookups

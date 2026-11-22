@@ -9,7 +9,7 @@
 //! it by a fast-forward or a merge, as the [`Outcome`] in the returned [`Synced`] says. Every
 //! object received is checked by hash, and as the type that will read it, before any of it can be
 //! reached from the file. See
-//! [Sync between files](https://github.com/archlemon/ferro/blob/main/docs/guide/sync.md).
+//! [Sync between files](https://github.com/suprbdev/ferro/blob/main/docs/guide/sync.md).
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, OnceCell, RefCell};

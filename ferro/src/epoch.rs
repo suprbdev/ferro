@@ -34,10 +34,10 @@
 //! So a value retired while a thread is pinned is not let go until that thread unpins, a value
 //! lent into a slot is not let go while the slot holds it, and every value is let go once, by
 //! whichever thread finds both done. Slots and records live as long as the process and are reused.
-//! [Guarded gets and the epoch scheme](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#guarded-gets-and-the-epoch-scheme)
-//! and [Iterators under hazards](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#iterators-under-hazards)
+//! [Guarded gets and the epoch scheme](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-scaling.md#guarded-gets-and-the-epoch-scheme)
+//! and [Iterators under hazards](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-scaling.md#iterators-under-hazards)
 //! describe the protocol, and
-//! [How the protocol is checked](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#how-the-protocol-is-checked)
+//! [How the protocol is checked](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-scaling.md#how-the-protocol-is-checked)
 //! how it is tested.
 
 use std::cell::{Cell, RefCell};

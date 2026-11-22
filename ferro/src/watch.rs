@@ -6,7 +6,7 @@
 //! thread, so it costs the same with no watchers or ten thousand and never waits for a filter. A
 //! watcher receives by blocking, with a timeout, without waiting, or by awaiting [`Changed`], and a
 //! [`Closer`] ends it from any thread.
-//! [Watchers](https://github.com/archlemon/ferro/blob/main/docs/internals/watchers.md) in the
+//! [Watchers](https://github.com/suprbdev/ferro/blob/main/docs/internals/watchers.md) in the
 //! internals describes the feed and the watch thread.
 
 use std::collections::HashMap;

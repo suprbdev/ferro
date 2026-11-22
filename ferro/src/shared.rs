@@ -25,8 +25,8 @@
 //! find out, and clear `lent` once none does. [`Erased`] is a `Shared` whose type is erased, as the
 //! cache holds nodes, and [`Dead`] and [`Parked`] are what the epoch holds of a lent value at and
 //! after its last count.
-//! [Where the flags live](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#where-the-flags-live)
-//! and [Iterators under hazards](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#iterators-under-hazards)
+//! [Where the flags live](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-scaling.md#where-the-flags-live)
+//! and [Iterators under hazards](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-scaling.md#iterators-under-hazards)
 //! describe the protocol and why the flags sit outside the value.
 
 use std::alloc::{Layout, dealloc};

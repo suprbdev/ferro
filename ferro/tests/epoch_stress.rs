@@ -11,7 +11,7 @@
 //! 12 KiB cache edit values, rows and the nested maps, with a reclamation cycle every 96 KiB and
 //! compactions, and the writer's `Db` is dropped between four phases and opened again. At the end
 //! a fresh handle checks the last version.
-//! [How the protocol is checked](https://github.com/archlemon/ferro/blob/main/docs/internals/read-scaling.md#how-the-protocol-is-checked)
+//! [How the protocol is checked](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-scaling.md#how-the-protocol-is-checked)
 //! describes the runs under AddressSanitizer and ThreadSanitizer. `FERRO_STRESS_SEED` sets the
 //! seed, 40 by default, and `FERRO_STRESS_MS` how many milliseconds it runs, 4,000 by default.
 //!

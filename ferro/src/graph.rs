@@ -7,7 +7,7 @@
 //! hangs below the retained commit the record vouches for, so it turns stale with it even where the
 //! merge that brought it in is pruned. The search refuses to answer where pruned history could
 //! change the answer.
-//! [Finding the base](https://github.com/archlemon/ferro/blob/main/docs/internals/merging.md#finding-the-base)
+//! [Finding the base](https://github.com/suprbdev/ferro/blob/main/docs/internals/merging.md#finding-the-base)
 //! describes it.
 
 use std::cmp::Reverse;

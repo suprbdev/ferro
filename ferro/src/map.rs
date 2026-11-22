@@ -69,11 +69,11 @@
 //! A read that cannot load a node from the file, or finds one damaged, panics, and so does a write
 //! that has to load one. [`try_get`](Map::try_get) returns that failure as an [`Error`] instead.
 //!
-//! [The collections guide](https://github.com/archlemon/ferro/blob/main/docs/guide/collections.md)
+//! [The collections guide](https://github.com/suprbdev/ferro/blob/main/docs/guide/collections.md)
 //! describes maps and summaries at more length,
-//! [the tree internals](https://github.com/archlemon/ferro/blob/main/docs/internals/tree.md) how
+//! [the tree internals](https://github.com/suprbdev/ferro/blob/main/docs/internals/tree.md) how
 //! the tree is shaped, edited and written, and
-//! [the read path](https://github.com/archlemon/ferro/blob/main/docs/internals/read-path.md) how
+//! [the read path](https://github.com/suprbdev/ferro/blob/main/docs/internals/read-path.md) how
 //! it is read.
 
 use std::any::{Any, TypeId, type_name};
@@ -214,7 +214,7 @@ impl Drop for Alone {
 /// changed, returns the old folds from [`Map::summary`] and from range summaries that take a
 /// stored fold, with no error, until `verify_typed` reports them. Give the map's field a new
 /// stored name whenever its summary changes, as
-/// [Changing your types](https://github.com/archlemon/ferro/blob/main/docs/guide/schema-evolution.md)
+/// [Changing your types](https://github.com/suprbdev/ferro/blob/main/docs/guide/schema-evolution.md)
 /// describes. `of` may read a collection the value holds, on any thread: such a value
 /// is summarized once what is checked below it has passed, and reads the collection as a local
 /// read does. The summary may hold a collection too, such as a [`Set`](crate::Set) of the values
@@ -253,7 +253,7 @@ impl Drop for Alone {
 /// assert_eq!(ledger.range_summary(4..9), None);
 /// ```
 ///
-/// [The summaries internals](https://github.com/archlemon/ferro/blob/main/docs/internals/summaries.md)
+/// [The summaries internals](https://github.com/suprbdev/ferro/blob/main/docs/internals/summaries.md)
 /// describe how the fold is kept and what it costs.
 pub trait Summary<K, V>: Data {
     /// The summary of the one entry `key` and `value`.

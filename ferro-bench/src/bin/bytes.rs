@@ -18,7 +18,7 @@
 //! bytes each would save, and the time a read would spend on a whole frame to hash the records
 //! that other records in it link, or to decompress the frame compressed as one block.
 //!
-//! [Bytes of a small commit](https://github.com/archlemon/ferro/blob/main/docs/internals/commit-bytes.md)
+//! [Bytes of a small commit](https://github.com/suprbdev/ferro/blob/main/docs/internals/commit-bytes.md)
 //! has the results.
 //!
 //! ```sh

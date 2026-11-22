@@ -7,7 +7,7 @@
 //! handle's watchers. On 64-bit Linux it waits on inotify; elsewhere, or where inotify cannot be
 //! had, it looks every 10 ms.
 //! [`Db::following`](crate::Db::following) returns a [`Following`] that says how it has gone.
-//! [Followers](https://github.com/archlemon/ferro/blob/main/docs/internals/processes.md#followers)
+//! [Followers](https://github.com/suprbdev/ferro/blob/main/docs/internals/processes.md#followers)
 //! in the internals describes the thread and what it costs.
 
 use std::io;
